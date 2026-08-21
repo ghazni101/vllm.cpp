@@ -1588,7 +1588,8 @@ if(VLLM_CPP_HIP)
     src/vt/rocm/rocm_gdn_postconv.hip
     src/vt/rocm/rocm_gdn_scan.hip
     src/vt/rocm/rocm_gdn_fused.hip
-    src/vt/rocm/rocm_ops.hip)
+    src/vt/rocm/rocm_ops.hip
+    src/vt/rocm/rocm_quant_dot.hip)
   if(VLLM_CPP_HIP_ARCHITECTURES)
     set_source_files_properties(
       src/vt/rocm/rocm_backend.hip
@@ -1609,6 +1610,7 @@ if(VLLM_CPP_HIP)
       src/vt/rocm/rocm_gdn_scan.hip
       src/vt/rocm/rocm_gdn_fused.hip
       src/vt/rocm/rocm_ops.hip
+      src/vt/rocm/rocm_quant_dot.hip
       PROPERTIES HIP_ARCHITECTURES "${VLLM_CPP_HIP_ARCHITECTURES}")
   endif()
   # Prefer the absolute path inside ${ROCM_PATH}/lib, fall back to the bare name,
