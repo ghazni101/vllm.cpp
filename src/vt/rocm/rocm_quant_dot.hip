@@ -21,11 +21,9 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
-#include <map>
 #include <mutex>
 #include <stdexcept>
 #include <string>
-#include <array>
 #include <unordered_map>
 
 #include "vt/cpu/cpu_quant_blocks.h"         // vt::cpu::Block* struct mirror
@@ -236,15 +234,29 @@ __device__ inline float DotQ2K(const BlockQ2_K* xb, const BlockQ8_K* yb) {
 }
 
 __device__ inline float DotQ3K(const BlockQ3_K* xb, const BlockQ8_K* yb) {
-  // Decode fused into the dot: no aux8[] array. The CPU body materializes
-  // aux8 then multiplies by q8 in the same element order, so decoding each
-  // weight nibble inline and multiplying immediately is the same integer
-  // arithmetic with identical accumulation order.
   const uint32_t kmask1 = 0x03030303;
   const uint32_t kmask2 = 0x0f0f0f0f;
   const uint8_t* hm = xb->hmask;
   const int8_t* q8 = yb->qs;
+  int8_t aux8[kQK_K];
+  int8_t* a = aux8;
   const uint8_t* q3 = xb->qs;
+  uint8_t m = 1;
+  for (int jj = 0; jj < kQK_K; jj += 128) {
+    for (int l = 0; l < 32; ++l) a[l] = q3[l] & 3;
+    for (int l = 0; l < 32; ++l) a[l] = static_cast<int8_t>(a[l] - ((hm[l] & m) ? 0 : 4));
+    a += 32; m = static_cast<uint8_t>(m << 1);
+    for (int l = 0; l < 32; ++l) a[l] = (q3[l] >> 2) & 3;
+    for (int l = 0; l < 32; ++l) a[l] = static_cast<int8_t>(a[l] - ((hm[l] & m) ? 0 : 4));
+    a += 32; m = static_cast<uint8_t>(m << 1);
+    for (int l = 0; l < 32; ++l) a[l] = (q3[l] >> 4) & 3;
+    for (int l = 0; l < 32; ++l) a[l] = static_cast<int8_t>(a[l] - ((hm[l] & m) ? 0 : 4));
+    a += 32; m = static_cast<uint8_t>(m << 1);
+    for (int l = 0; l < 32; ++l) a[l] = (q3[l] >> 6) & 3;
+    for (int l = 0; l < 32; ++l) a[l] = static_cast<int8_t>(a[l] - ((hm[l] & m) ? 0 : 4));
+    a += 32; m = static_cast<uint8_t>(m << 1);
+    q3 += 32;
+  }
   uint32_t auxs[4];
   memcpy(auxs, xb->scales, 12);
   const int8_t* scales = reinterpret_cast<const int8_t*>(auxs);
@@ -253,21 +265,14 @@ __device__ inline float DotQ3K(const BlockQ3_K* xb, const BlockQ8_K* yb) {
   auxs[3] = ((auxs[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
   auxs[0] = (auxs[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
   auxs[1] = (auxs[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
+  a = aux8;
+  const int8_t* q8p = q8;
   int32_t aux32[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-  // Element e of the super-block (proven equivalent to the CPU aux8 fill,
-  // see the host-side static proof in tests): q3 byte (e&31)+32*(e>>7),
-  // nibble shift 2*((e>>5)&3), hmask bit (e>>5) on byte (e&31).
-  int e = 0;
   for (int j = 0; j < kQK_K / 16; ++j) {
-    const int scale = scales[j] - 32;
-#pragma unroll
-    for (int l = 0; l < 16; ++l, ++e) {
-      const int v = static_cast<int8_t>(
-          ((q3[(e & 31) + 32 * (e >> 7)] >> (2 * ((e >> 5) & 3))) & 3) -
-          ((xb->hmask[e & 31] & (1 << (e >> 5))) ? 0 : 4));
-      aux32[l & 7] += scale * (q8[l] * v);
-    }
-    q8 += 16;
+    for (int l = 0; l < 8; ++l) aux32[l] += (scales[j] - 32) * (q8p[l] * a[l]);
+    q8p += 8; a += 8;
+    for (int l = 0; l < 8; ++l) aux32[l] += (scales[j] - 32) * (q8p[l] * a[l]);
+    q8p += 8; a += 8;
   }
   const float d = DF16ToF32(xb->d) * yb->d;
   int isum = 0;
@@ -276,9 +281,6 @@ __device__ inline float DotQ3K(const BlockQ3_K* xb, const BlockQ8_K* yb) {
 }
 
 __device__ inline float DotQ4K(const BlockQ4_K* xb, const BlockQ8_K* yb) {
-  // Decode fused into the dot: no aux8[] array. CPU order: 64-element chunks
-  // of low nibble then high nibble over the same 32 bytes; element e ->
-  // byte 32*(e>>6)+(e&31), low/high by bit 5, scale group e>>5.
   const uint32_t kmask1 = 0x3f3f3f3f;
   const uint32_t kmask2 = 0x0f0f0f0f;
   const uint32_t kmask3 = 0x03030303;
@@ -295,17 +297,29 @@ __device__ inline float DotQ4K(const BlockQ4_K* xb, const BlockQ8_K* yb) {
   const uint8_t* mins = reinterpret_cast<const uint8_t*>(&utmp[2]);
   int sumi = 0;
   for (int j = 0; j < kQK_K / 16; ++j) sumi += yb->bsums[j] * mins[j / 2];
+  // Portable nibble walk in the CPU body's order: 64-element groups decode
+  // low nibble then high nibble into aux8, then the per-32 scale groups.
+  int8_t aux8[kQK_K];
+  int8_t* a = aux8;
+  for (int j = 0; j < kQK_K / 64; ++j) {
+    for (int l = 0; l < 32; ++l) a[l] = static_cast<int8_t>(q4[l] & 0xF);
+    a += 32;
+    for (int l = 0; l < 32; ++l) a[l] = static_cast<int8_t>(q4[l] >> 4);
+    a += 32;
+    q4 += 32;
+  }
+  a = aux8;
   int32_t aux32[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-  int e = 0;
   for (int j = 0; j < kQK_K / 32; ++j) {
     const int32_t scale = scales[j];
-#pragma unroll
-    for (int l = 0; l < 32; ++l, ++e) {
-      const int b = 32 * (e >> 6) + (e & 31);
-      const int v = static_cast<int8_t>((q4[b] >> ((e >> 5 & 1) * 4)) & 0xF);
-      aux32[l & 7] += scale * (q8[l] * v);
-    }
-    q8 += 32;
+    for (int l = 0; l < 8; ++l) aux32[l] += scale * (q8[l] * a[l]);
+    q8 += 8; a += 8;
+    for (int l = 0; l < 8; ++l) aux32[l] += scale * (q8[l] * a[l]);
+    q8 += 8; a += 8;
+    for (int l = 0; l < 8; ++l) aux32[l] += scale * (q8[l] * a[l]);
+    q8 += 8; a += 8;
+    for (int l = 0; l < 8; ++l) aux32[l] += scale * (q8[l] * a[l]);
+    q8 += 8; a += 8;
   }
   const float d = DF16ToF32(xb->d) * yb->d;
   const float dmin = DF16ToF32(xb->dmin) * yb->d;
@@ -315,14 +329,11 @@ __device__ inline float DotQ4K(const BlockQ4_K* xb, const BlockQ8_K* yb) {
 }
 
 __device__ inline float DotQ5K(const BlockQ5_K* xb, const BlockQ8_K* yb) {
-  // Decode fused into the dot: no aux8[] array. CPU order: 64-element chunks
-  // of low nibble (+ high bit m) then high nibble (+ next high bit) over the
-  // same 32 bytes. Element e -> byte 32*(e>>6)+(e&31); nibble by bit 5;
-  // high bit index e>>5 into qh byte (e&31).
   const uint32_t kmask1 = 0x3f3f3f3f;
   const uint32_t kmask2 = 0x0f0f0f0f;
   const uint32_t kmask3 = 0x03030303;
   const uint8_t* q4 = xb->qs;
+  const uint8_t* hm = xb->qh;
   const int8_t* q8 = yb->qs;
   uint32_t utmp[4];
   memcpy(utmp, xb->scales, 12);
@@ -335,19 +346,30 @@ __device__ inline float DotQ5K(const BlockQ5_K* xb, const BlockQ8_K* yb) {
   const uint8_t* mins = reinterpret_cast<const uint8_t*>(&utmp[2]);
   int sumi = 0;
   for (int j = 0; j < kQK_K / 16; ++j) sumi += yb->bsums[j] * mins[j / 2];
+  int8_t aux8[kQK_K];
+  int8_t* a = aux8;
+  uint8_t m = 1;
+  for (int j = 0; j < kQK_K / 64; ++j) {
+    for (int l = 0; l < 32; ++l) a[l] = static_cast<int8_t>(q4[l] & 0xF);
+    for (int l = 0; l < 32; ++l)
+      a[l] = static_cast<int8_t>(a[l] + ((hm[l] & m) ? 16 : 0));
+    a += 32;
+    m = static_cast<uint8_t>(m << 1);
+    for (int l = 0; l < 32; ++l) a[l] = static_cast<int8_t>(q4[l] >> 4);
+    for (int l = 0; l < 32; ++l)
+      a[l] = static_cast<int8_t>(a[l] + ((hm[l] & m) ? 16 : 0));
+    a += 32;
+    m = static_cast<uint8_t>(m << 1);
+    q4 += 32;
+  }
+  a = aux8;
   int32_t aux32[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-  int e = 0;
   for (int j = 0; j < kQK_K / 32; ++j) {
     const int32_t scale = scales[j];
-#pragma unroll
-    for (int l = 0; l < 32; ++l, ++e) {
-      const int b = 32 * (e >> 6) + (e & 31);
-      const int v = static_cast<int8_t>(
-          ((q4[b] >> (((e >> 5) & 1) * 4)) & 0xF) +
-          ((xb->qh[e & 31] & (1 << (e >> 5))) ? 16 : 0));
-      aux32[l & 7] += scale * (q8[l] * v);
+    for (int r = 0; r < 4; ++r) {
+      for (int l = 0; l < 8; ++l) aux32[l] += scale * (q8[l] * a[l]);
+      q8 += 8; a += 8;
     }
-    q8 += 32;
   }
   const float d = DF16ToF32(xb->d) * yb->d;
   const float dmin = DF16ToF32(xb->dmin) * yb->d;
@@ -357,46 +379,33 @@ __device__ inline float DotQ5K(const BlockQ5_K* xb, const BlockQ8_K* yb) {
 }
 
 __device__ inline float DotQ6K(const BlockQ6_K* xb, const BlockQ8_K* yb) {
-  // Decode fused into the dot: no aux8[] array. CPU layout (proven equivalent
-  // in the tests): element e = 128*bh + 32*q + r with bh = e>>7 (0..3),
-  // q = (e>>5)&3, r = e&31:
-  //   ql byte = ql[64*bh + 32*(q&1) + r], nibble shift = 4*(q>>1)
-  //   qh bits = 2*q .. 2*q+1 of qh[32*bh + r]; value - 32.
-  //   scale index = e>>4.
-  // The scalar body is the HOT path for decode shapes with nsb >= 32
-  // (ffn_down K=9216 -> nsb=36: each lane decodes a whole super-block here),
-  // where the old switch + per-element size_t form measured ~1507us/call on
-  // gfx1100. Quadrants are unrolled so every address is loop-invariant int
-  // math; group order (and therefore accumulation order) matches the CPU
-  // reference exactly, so the integer core stays bit-exact.
-  const uint8_t* ql = xb->ql;
+  const uint8_t* q4 = xb->ql;
   const uint8_t* qh = xb->qh;
   const int8_t* q8 = yb->qs;
-  int32_t aux32[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-#pragma unroll
-  for (int bh = 0; bh < kQK_K / 128; ++bh) {
-    const uint8_t* ql_lo = ql + 64 * bh;
-    const uint8_t* ql_hi = ql_lo + 32;
-    const uint8_t* qh_b = qh + 32 * bh;
-    const int8_t* q8_b = q8 + 128 * bh;
-    const int8_t* sc_b = xb->scales + 8 * bh;
-    // Quadrant q covers elements [128bh+32q, 128bh+32q+32):
-    //   q0: ql_lo low nibble,   qh bits 0-1
-    //   q1: ql_hi low nibble,   qh bits 2-3
-    //   q2: ql_lo high nibble,  qh bits 4-5
-    //   q3: ql_hi high nibble,  qh bits 6-7
-    // Scale index within the chunk = (32q+l)>>4 = 2q + l/16.
+  int8_t aux8[kQK_K];
+  int8_t* a = aux8;
+  for (int j = 0; j < kQK_K; j += 128) {
     for (int l = 0; l < 32; ++l) {
-      const uint8_t qhv = qh_b[l];
-      const int v0 = static_cast<int8_t>((ql_lo[l] & 0xF) | ((qhv & 3) << 4)) - 32;
-      aux32[l & 7] += sc_b[2 * 0 + (l >> 4)] * (q8_b[l] * v0);
-      const int v1 = static_cast<int8_t>((ql_hi[l] & 0xF) | (((qhv >> 2) & 3) << 4)) - 32;
-      aux32[l & 7] += sc_b[2 * 1 + (l >> 4)] * (q8_b[l + 32] * v1);
-      const int v2 = static_cast<int8_t>((ql_lo[l] >> 4) | (((qhv >> 4) & 3) << 4)) - 32;
-      aux32[l & 7] += sc_b[2 * 2 + (l >> 4)] * (q8_b[l + 64] * v2);
-      const int v3 = static_cast<int8_t>((ql_hi[l] >> 4) | (((qhv >> 6) & 3) << 4)) - 32;
-      aux32[l & 7] += sc_b[2 * 3 + (l >> 4)] * (q8_b[l + 96] * v3);
+      a[l + 0] = static_cast<int8_t>(
+          static_cast<int8_t>((q4[l + 0] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32);
+      a[l + 32] = static_cast<int8_t>(
+          static_cast<int8_t>((q4[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32);
+      a[l + 64] = static_cast<int8_t>(
+          static_cast<int8_t>((q4[l + 0] >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32);
+      a[l + 96] = static_cast<int8_t>(
+          static_cast<int8_t>((q4[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32);
     }
+    a += 128; q4 += 64; qh += 32;
+  }
+  a = aux8;
+  const int8_t* q8p = q8;
+  int32_t aux32[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+  for (int j = 0; j < kQK_K / 16; ++j) {
+    const int scale = xb->scales[j];
+    for (int l = 0; l < 8; ++l) aux32[l] += scale * (q8p[l] * a[l]);
+    q8p += 8; a += 8;
+    for (int l = 0; l < 8; ++l) aux32[l] += scale * (q8p[l] * a[l]);
+    q8p += 8; a += 8;
   }
   const float d = DF16ToF32(xb->d) * yb->d;
   int isum = 0;
@@ -600,223 +609,6 @@ __device__ inline float DotSuperblock<WType::kIQ1_XXXS>(const void* w, const Blo
   return DotIQ1XXXS(static_cast<const BlockIQ1_XXXS*>(w), a);
 }
 
-// ---------------------------------------------------------------------------
-// WARP-COOPERATIVE super-block dots. Lane L owns elements {32j + L} for the
-// integer partials (int32 sums are associative, so the lane split of the
-// reference's element order is bit-exact); scales apply AFTER the integer
-// sums, exactly as in the scalar bodies. The bsums/mins correction terms are
-// computed redundantly per lane from cached values (bsums is 16 int16 = one
-// vector load; mins/scales live in registers already).
-// Each lane handles elements e = lane + 32*t for t in 0..7.
-// ---------------------------------------------------------------------------
-template <WType W>
-__device__ inline float DotSuperblockWarp(const void* w_sb,
-                                           const BlockQ8_K* a_sb, int lane);
-
-template <>
-__device__ inline float DotSuperblockWarp<WType::kIQ2_XXS>(const void* w,
-                                                            const BlockQ8_K* a,
-                                                            int lane) {
-  return DotIQ2XXS(static_cast<const BlockIQ2_XXS*>(w), a) *
-         (lane == 0 ? 1.0f : 0.0f);
-}
-template <>
-__device__ inline float DotSuperblockWarp<WType::kIQ3_XXS>(const void* w,
-                                                            const BlockQ8_K* a,
-                                                            int lane) {
-  return DotIQ3XXS(static_cast<const BlockIQ3_XXS*>(w), a) *
-         (lane == 0 ? 1.0f : 0.0f);
-}
-template <>
-__device__ inline float DotSuperblockWarp<WType::kIQ2_S>(const void* w,
-                                                          const BlockQ8_K* a,
-                                                          int lane) {
-  return DotIQ2S(static_cast<const BlockIQ2_S*>(w), a) *
-         (lane == 0 ? 1.0f : 0.0f);
-}
-template <>
-__device__ inline float DotSuperblockWarp<WType::kIQ1_S>(const void* w,
-                                                          const BlockQ8_K* a,
-                                                          int lane) {
-  return DotIQ1S(static_cast<const BlockIQ1_S*>(w), a) *
-         (lane == 0 ? 1.0f : 0.0f);
-}
-template <>
-__device__ inline float DotSuperblockWarp<WType::kIQ1_XXXS>(const void* w,
-                                                             const BlockQ8_K* a,
-                                                             int lane) {
-  return DotIQ1XXXS(static_cast<const BlockIQ1_XXXS*>(w), a) *
-         (lane == 0 ? 1.0f : 0.0f);
-}
-
-template <>
-__device__ inline float DotSuperblockWarp<WType::kQ2_K>(const void* w,
-                                                         const BlockQ8_K* a,
-                                                         int lane) {
-  const BlockQ2_K* xb = static_cast<const BlockQ2_K*>(w);
-  const uint8_t* q2 = xb->qs;
-  const int8_t* q8 = a->qs;
-  // Element e -> (validated vs the CPU body): block k=e>>7, group j=(e>>5)&3,
-  // half h=(e>>4)&1; q2 byte 32*k+(e&31) is re-read by all four j groups of a
-  // block with shift 2*j; scale idx k*8+j*2+h. scales[16] low nibble = scale.
-  int summs = 0;
-  for (int j = 0; j < 16; ++j) summs += a->bsums[j] * (xb->scales[j] >> 4);
-  int acc = 0;
-#pragma unroll
-  for (int t = 0; t < 8; ++t) {
-    const int e = lane + 32 * t;
-    const int kb = e >> 7;
-    const int jg = (e >> 5) & 3;
-    const int hh = (e >> 4) & 1;
-    const int v = (q2[32 * kb + (e & 31)] >> (2 * jg)) & 3;
-    acc += (xb->scales[kb * 8 + jg * 2 + hh] & 0xF) * (q8[e] * v);
-  }
-  if (lane != 0) summs = 0;  // min-correction once per block (lane 0)
-  const float dall = a->d * DF16ToF32(xb->d);
-  const float dmin = a->d * DF16ToF32(xb->dmin);
-  return dall * static_cast<float>(acc) - dmin * static_cast<float>(summs);
-}
-
-template <>
-__device__ inline float DotSuperblockWarp<WType::kQ3_K>(const void* w,
-                                                         const BlockQ8_K* a,
-                                                         int lane) {
-  const BlockQ3_K* xb = static_cast<const BlockQ3_K*>(w);
-  const uint32_t kmask1 = 0x03030303;
-  const uint32_t kmask2 = 0x0f0f0f0f;
-  const uint8_t* q3 = xb->qs;
-  const int8_t* q8 = a->qs;
-  uint32_t auxs[4];
-  memcpy(auxs, xb->scales, 12);
-  const int8_t* scales = reinterpret_cast<const int8_t*>(auxs);
-  uint32_t tmp = auxs[2];
-  auxs[2] = ((auxs[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
-  auxs[3] = ((auxs[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
-  auxs[0] = (auxs[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
-  auxs[1] = (auxs[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
-  int acc = 0;
-#pragma unroll
-  for (int t = 0; t < 8; ++t) {
-    const int e = lane + 32 * t;
-    const int byte = (e & 31) + 32 * (e >> 7);
-    const int sh = 2 * ((e >> 5) & 3);
-    const int hb = (xb->hmask[e & 31] >> (e >> 5)) & 1;
-    const int v = static_cast<int8_t>(((q3[byte] >> sh) & 3) -
-                                       (hb ? 0 : 4));
-    acc += (scales[e >> 4] - 32) * (q8[e] * v);
-  }
-  return DF16ToF32(xb->d) * a->d * static_cast<float>(acc);
-}
-
-template <>
-__device__ inline float DotSuperblockWarp<WType::kQ4_K>(const void* w,
-                                                         const BlockQ8_K* a,
-                                                         int lane) {
-  const BlockQ4_K* xb = static_cast<const BlockQ4_K*>(w);
-  const uint32_t kmask1 = 0x3f3f3f3f;
-  const uint32_t kmask2 = 0x0f0f0f0f;
-  const uint32_t kmask3 = 0x03030303;
-  const uint8_t* q4 = xb->qs;
-  const int8_t* q8 = a->qs;
-  uint32_t utmp[4];
-  memcpy(utmp, xb->scales, 12);
-  utmp[3] = ((utmp[2] >> 4) & kmask2) | (((utmp[1] >> 6) & kmask3) << 4);
-  const uint32_t uaux = utmp[1] & kmask1;
-  utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & kmask3) << 4);
-  utmp[2] = uaux;
-  utmp[0] &= kmask1;
-  const uint8_t* scales = reinterpret_cast<const uint8_t*>(&utmp[0]);
-  const uint8_t* mins = reinterpret_cast<const uint8_t*>(&utmp[2]);
-  int sumi = 0;
-  for (int j = 0; j < kQK_K / 16; ++j) sumi += a->bsums[j] * mins[j / 2];
-  // Lane L covers elements {L, 32+L, 64+L, ...}: scale group g = (e>>5),
-  // byte 32*(e>>6)+(e&31), nibble by bit 5 — all pure arithmetic on e.
-  int acc = 0;
-#pragma unroll
-  for (int t = 0; t < 8; ++t) {
-    const int e = lane + 32 * t;
-    const int b = 32 * (e >> 6) + (e & 31);
-    const int v = static_cast<int8_t>((q4[b] >> (((e >> 5) & 1) * 4)) & 0xF);
-    acc += scales[e >> 5] * (q8[e] * v);
-  }
-  if (lane != 0) sumi = 0;  // min-correction once per block (lane 0)
-  const float d = DF16ToF32(xb->d) * a->d;
-  const float dmin = DF16ToF32(xb->dmin) * a->d;
-  return d * static_cast<float>(acc) - dmin * static_cast<float>(sumi);
-}
-
-template <>
-__device__ inline float DotSuperblockWarp<WType::kQ6_K>(const void* w,
-                                                         const BlockQ8_K* a,
-                                                         int lane) {
-  const BlockQ6_K* xb = static_cast<const BlockQ6_K*>(w);
-  const uint8_t* ql = xb->ql;
-  const uint8_t* qh = xb->qh;
-  const int8_t* q8 = a->qs;
-  int acc = 0;
-#pragma unroll
-  for (int t = 0; t < 8; ++t) {
-    const int e = lane + 32 * t;
-    // e = 128*bh + 32*q + r with bh = e>>7 (0..3), q = (e>>5)&3, r = e&31.
-    // Pure-int addressing: the previous size_t multiplies + runtime switch in
-    // this unrolled loop made the Q6_K kernel instance ~23x slower than its
-    // Q4_K sibling on gfx1100 (S1 rocprof: ffn_down 1505us/call vs ~65us
-    // expected at Q4_K's bandwidth). Element order and the scale application
-    // point are unchanged, so the integer core stays bit-exact.
-    const int bh = e >> 7;
-    const int q = (e >> 5) & 3;
-    const int r = e & 31;
-    const uint8_t qhv = qh[32 * bh + r];
-    // q0/q2 read ql[64*bh + r] (low/high nibble); q1/q3 read ql[64*bh+32 + r].
-    const uint8_t qlv = ql[64 * bh + 32 * (q & 1) + r];
-    const int shift = 4 * ((q >> 1) & 1);   // 0 for q0/q1 (low nibble), 4 for q2/q3
-    const int qsh = 2 * q;                  // qh bit-pair position
-    const int v = static_cast<int8_t>(((qlv >> shift) & 0xF) |
-                                      (((qhv >> qsh) & 3) << 4)) - 32;
-    acc += xb->scales[e >> 4] * (q8[e] * v);
-  }
-  return DF16ToF32(xb->d) * a->d * static_cast<float>(acc);
-}
-
-
-template <>
-__device__ inline float DotSuperblockWarp<WType::kQ5_K>(const void* w,
-                                                         const BlockQ8_K* a,
-                                                         int lane) {
-  const BlockQ5_K* xb = static_cast<const BlockQ5_K*>(w);
-  const uint32_t kmask1 = 0x3f3f3f3f;
-  const uint32_t kmask2 = 0x0f0f0f0f;
-  const uint32_t kmask3 = 0x03030303;
-  const uint8_t* q4 = xb->qs;
-  const int8_t* q8 = a->qs;
-  uint32_t utmp[4];
-  memcpy(utmp, xb->scales, 12);
-  utmp[3] = ((utmp[2] >> 4) & kmask2) | (((utmp[1] >> 6) & kmask3) << 4);
-  const uint32_t uaux = utmp[1] & kmask1;
-  utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & kmask3) << 4);
-  utmp[2] = uaux;
-  utmp[0] &= kmask1;
-  const uint8_t* scales = reinterpret_cast<const uint8_t*>(&utmp[0]);
-  const uint8_t* mins = reinterpret_cast<const uint8_t*>(&utmp[2]);
-  int sumi = 0;
-  for (int j = 0; j < kQK_K / 16; ++j) sumi += a->bsums[j] * mins[j / 2];
-  int acc = 0;
-#pragma unroll
-  for (int t = 0; t < 8; ++t) {
-    const int e = lane + 32 * t;
-    const int b = 32 * (e >> 6) + (e & 31);
-    const int v = static_cast<int8_t>(
-        ((q4[b] >> (((e >> 5) & 1) * 4)) & 0xF) +
-        ((xb->qh[e & 31] & (1 << (e >> 5))) ? 16 : 0));
-    acc += scales[e >> 5] * (q8[e] * v);
-  }
-  if (lane != 0) sumi = 0;  // min-correction once per block (lane 0)
-  const float d = DF16ToF32(xb->d) * a->d;
-  const float dmin = DF16ToF32(xb->dmin) * a->d;
-  return d * static_cast<float>(acc) - dmin * static_cast<float>(sumi);
-}
-
-
 template <WType W>
 __device__ constexpr float FinalFactor() {
   return (W == WType::kIQ2_XXS || W == WType::kIQ2_S)
@@ -846,25 +638,10 @@ __global__ void QuantDotGemmKernel(OutT* __restrict__ out,
   const uint8_t* w_row = weight + static_cast<size_t>(j) * w_row_bytes;
   const BlockQ8_K* a_row = act + i * nsb;
 
-  // Lane mapping: lanes SPLIT each super-block's 256 elements (8 per lane) and
-  // the warp reduces the integer partials. Two's-complement int32 addition is
-  // associative, so regrouping the reference's element order across lanes is
-  // bit-exact; the float scales are applied AFTER the integer sums exactly as
-  // the CPU body does. The old sb=lane stride left 22/32 lanes idle whenever
-  // nsb < 32 (decode: nsb = k/256 = 10..36), serializing the whole dot on one
-  // lane. With nsb >= 32 every lane still owns whole super-blocks first.
-  const int64_t full_sbs = nsb & ~int64_t(31);
   float partial = 0.0f;
-  for (int64_t sb = lane; sb < full_sbs; sb += 32) {
+  for (int64_t sb = lane; sb < nsb; sb += 32) {
     const void* w_sb = w_row + static_cast<size_t>(sb) * w_block_bytes;
     partial += DotSuperblock<W>(w_sb, a_row + sb);
-  }
-  if (nsb & 31) {
-    // Tail super-blocks: all 32 lanes cooperate on ONE block via DotSuperblockWarp.
-    for (int64_t sb = full_sbs; sb < nsb; ++sb) {
-      const void* w_sb = w_row + static_cast<size_t>(sb) * w_block_bytes;
-      partial += DotSuperblockWarp<W>(w_sb, a_row + sb, lane);
-    }
   }
 #pragma unroll
   for (int off = 16; off > 0; off >>= 1)
@@ -878,91 +655,6 @@ __global__ void QuantDotGemmKernel(OutT* __restrict__ out,
       out[i * n + j] = DF32ToBF16(v);
     }
   }
-}
-
-// ---------------------------------------------------------------------------
-// SPLIT-K decode kernel (GFX1100-TG150). For m == 1 and small n the one-warp-
-// per-output geometry above leaves most of the GPU idle: ffn_down (n=2560,
-// K=9216 -> nsb=36) launches 2560 warps total, ~27 warps per CU on a 96-CU
-// part, and each warp serially walks all 36 super-blocks. Measured 1507 ->
-// ~510 us/call after the branch-free body fix, still only ~38 GB/s — the
-// kernel is latency-bound on the serial super-block walk, not bandwidth-bound.
-//
-// This variant splits the K dimension across KSPLIT warps: warp k of the
-// (KSPLIT warps assigned to output (i,j)) owns super-blocks {k, k+KSPLIT, ...},
-// writes its scaled float partial to scratch[k * m * n + i*n + j], and a tiny
-// follow-up reduce kernel sums the KSPLIT partials into `out`. The integer
-// core is unchanged; only the float scale-sum reassociates further, within
-// the same NMSE band the file's gate already accepts for the warp reduction.
-// Scratch must hold KSPLIT*m*n floats and be zeroed OR fully written: every
-// (k, out) pair is written unconditionally by its owning warp (partial stays
-// 0.f when its sb range is empty), so no pre-zeroing is required.
-// ---------------------------------------------------------------------------
-template <WType W>
-__global__ void QuantDotGemmSplitKKernel(float* __restrict__ partials,
-                                         const uint8_t* __restrict__ weight,
-                                         const BlockQ8_K* __restrict__ act,
-                                         int64_t n, int64_t nsb,
-                                         size_t w_row_bytes,
-                                         size_t w_block_bytes) {
-  constexpr int kKSplit = 4;
-  const int64_t wid = static_cast<int64_t>(blockIdx.x) * (blockDim.x >> 5) +
-                      (threadIdx.x >> 5);
-  const int64_t j = wid / kKSplit;
-  if (j >= n) return;
-  const int k = static_cast<int>(wid % kKSplit);
-  const int lane = threadIdx.x & 31;
-
-  const uint8_t* w_row = weight + static_cast<size_t>(j) * w_row_bytes;
-  const BlockQ8_K* a_row = act;  // m == 1
-
-  // Warp-strided over this split's super-blocks: lane covers elements within
-  // a block via DotSuperblockWarp when few blocks remain, else lanes take
-  // whole blocks. Choose per-split strategy from how many sbs this k gets.
-  const int64_t mine = (nsb - k + kKSplit - 1) / kKSplit;
-  float partial = 0.0f;
-  if (mine >= 32) {
-    const int64_t full_sbs = nsb & ~int64_t(31);
-    for (int64_t sb = k + lane * kKSplit; sb < full_sbs; sb += 32 * kKSplit) {
-      const void* w_sb = w_row + static_cast<size_t>(sb) * w_block_bytes;
-      partial += DotSuperblockWarp<W>(w_sb, a_row + sb, lane);
-    }
-    for (int64_t sb = full_sbs + k; sb < nsb; sb += kKSplit) {
-      const void* w_sb = w_row + static_cast<size_t>(sb) * w_block_bytes;
-      partial += DotSuperblockWarp<W>(w_sb, a_row + sb, lane);
-    }
-  } else {
-    for (int64_t sb = k; sb < nsb; sb += kKSplit) {
-      const void* w_sb = w_row + static_cast<size_t>(sb) * w_block_bytes;
-      partial += DotSuperblockWarp<W>(w_sb, a_row + sb, lane);
-    }
-  }
-#pragma unroll
-  for (int off = 16; off > 0; off >>= 1)
-    partial += __shfl_down_sync(0xffffffffffffffffull, partial, off);
-  if (lane == 0)
-    partials[static_cast<int64_t>(k) * n + j] = FinalFactor<W>() * partial;
-}
-
-// Reduce the KSPLIT=4 partials: one thread per output element.
-__global__ void QuantDotGemmSplitKReduceKernel(float* __restrict__ partials,
-                                               float* __restrict__ out,
-                                               int64_t count) {
-  const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (idx >= count) return;
-  out[idx] = partials[idx] + partials[count + idx] +
-             partials[2 * count + idx] + partials[3 * count + idx];
-}
-
-// bf16-out variant: fold then RNE-convert, matching the plain kernel's
-// DF32ToBF16 store.
-__global__ void QuantDotGemmSplitKReduceBf16Kernel(
-    float* __restrict__ partials, uint16_t* __restrict__ out, int64_t count) {
-  const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (idx >= count) return;
-  const float v = partials[idx] + partials[count + idx] +
-                  partials[2 * count + idx] + partials[3 * count + idx];
-  out[idx] = DF32ToBF16(v);
 }
 
 // GROUPED variant: warp per (p, n); weight row selected by expert_ids[p].
@@ -1069,64 +761,12 @@ template <WType W>
 void LaunchGemm(Tensor& out, const uint8_t* weight, const BlockQ8_K* act,
                 int64_t m, int64_t n, int64_t nsb, size_t w_row_bytes,
                 size_t w_block_bytes, hipStream_t s) {
-  // TEMP S1 instrumentation: log unique shapes (VT_QDOT_TRACE=1).
-  constexpr int kWarpsPerBlock = 8;
-  static thread_local std::map<std::array<int64_t,4>, int> seen;
-  if (std::getenv("VT_QDOT_TRACE")) {
-    std::array<int64_t,4> key{static_cast<int64_t>(W), m, n, nsb};
-    if (++seen[key] == 1 || (seen[key] % 500) == 0)
-      std::fprintf(stderr, "[qdot] W=%d m=%lld n=%lld nsb=%lld count=%d grid=%u\n",
-                   static_cast<int>(W), static_cast<long long>(m),
-                   static_cast<long long>(n), static_cast<long long>(nsb),
-                   seen[key],
-                   static_cast<unsigned>((m*n + kWarpsPerBlock - 1) / kWarpsPerBlock));
-  }
   // Wave32 geometry: one warp per output; 8 warps (256 threads) per block.
+  constexpr int kWarpsPerBlock = 8;
   dim3 block(32 * kWarpsPerBlock, 1, 1);
   const int64_t warps = m * n;
   const unsigned grid =
       static_cast<unsigned>((warps + kWarpsPerBlock - 1) / kWarpsPerBlock);
-
-  // SPLIT-K decode arm (GFX1100-TG150): m == 1 with few outputs but many
-  // super-blocks is latency-bound on the serial sb walk. Splitting K across
-  // 4 warps per output quadruples the warp count and quarters the walk.
-  // F32-out only (the reduce kernel sums float partials); gated by
-  // VT_QDOT_SPLITK=0 for A/B.
-  static const bool splitk_on = [] {
-    const char* e = std::getenv("VT_QDOT_SPLITK");
-    return !(e && e[0] == '0');
-  }();
-  if (splitk_on && m == 1 && out.dtype != DType::kF32 && n >= 512 &&
-      nsb >= 8) {
-    constexpr int kKSplit = 4;
-    const int64_t total = n;
-    // Dedicated partials buffer — NOT EnsureScratch: that same per-stream
-    // buffer backs the quantized activation, so aliasing it would clobber the
-    // activations this very kernel reads (the garbage-output bug the A/B
-    // caught before any gate did).
-    static float* sk_partials = nullptr;
-    static size_t sk_bytes = 0;
-    const size_t need = static_cast<size_t>(kKSplit) *
-                        static_cast<size_t>(total) * sizeof(float);
-    if (need > sk_bytes) {
-      if (sk_partials) hipFree(sk_partials);
-      CheckHip(hipMalloc(&sk_partials, need), "splitk partials malloc");
-      sk_bytes = need;
-    }
-    const int64_t wid_total = total * kKSplit;
-    const unsigned sk_grid =
-        static_cast<unsigned>((wid_total + kWarpsPerBlock - 1) / kWarpsPerBlock);
-    QuantDotGemmSplitKKernel<W><<<sk_grid, block, 0, s>>>(
-        sk_partials, weight, act, n, nsb, w_row_bytes, w_block_bytes);
-    // The reduce folds the KSPLIT float partials and converts to the output
-    // dtype (bf16 RNE store matches the plain kernel's DF32ToBF16 path).
-    const unsigned red_grid = static_cast<unsigned>((total + 255) / 256);
-    QuantDotGemmSplitKReduceBf16Kernel<<<red_grid, 256, 0, s>>>(
-        sk_partials, static_cast<uint16_t*>(out.data), total);
-    CheckHipLaunch("matmul_bt_quant splitk launch");
-    return;
-  }
-
   if (out.dtype == DType::kF32) {
     QuantDotGemmKernel<W, float><<<grid, block, 0, s>>>(
         static_cast<float*>(out.data), weight, act, m, n, nsb, w_row_bytes,

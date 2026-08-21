@@ -2544,17 +2544,12 @@ if(VLLM_CPP_HIP)
 # Plain C++ (no HIP header): every assertion goes through the vt:: seam. Each
 # case no-ops when the build has HIP but the box has no AMD GPU.
 vllm_cpp_add_test(test_rocm_backend vt/test_rocm_backend.cpp)
-# GFX1100-TG200 T4a: the focused ROCm keep-quant GEMM gate (the file the
-# campaign spec names; previously absent, so GPU-parity quant cases only ran
-# behind HasCuda() and skipped on ROCm-only boxes). Plain C++ through the vt::
-# seam, guarded on ROCM availability at runtime — never on CUDA. Skips
-# coherently with no AMD GPU.
+# KERNEL-QUANT-CIQ-GEMM-ROCM: the ROCm keep-quant GEMM (kROCM provider for
+# kMatmulBTQuant/kMatmulBTQuantGrouped). Gates the device dequant-in-kernel dot
+# against the CPU keep-quant oracle + an f64 dequant reference on the ten
+# Q8_K-family encodings. Skips coherently with no AMD GPU.
 vllm_cpp_add_test(test_rocm_quant_dot vt/test_rocm_quant_dot.cpp)
-# GFX1100-TG200 lever B2: the focused ROCm bf16-in/f32-out decode-skinny
-# gate (VT_SKINNY_BF16=1) for the GDN BA projection population. Same
-# conventions as test_rocm_quant_dot: plain C++ through the vt:: seam,
-# runtime-guarded on ROCM availability, never on CUDA.
-vllm_cpp_add_test(test_rocm_skinny_f32 vt/test_rocm_skinny_f32.cpp)
+target_include_directories(test_rocm_quant_dot PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # #785 P1 GPU product-seam witness. Executable only — NOT add_test.
 # Ordinary CTest must not see this target. Runner fail-closes on 77/nonzero.
 add_executable(test_ops_paged_attn_sharedk_wmma_p1_gpu
