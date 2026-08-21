@@ -2597,6 +2597,12 @@ if(VLLM_CPP_HIP)
 # case no-ops when the build has HIP but the box has no AMD GPU.
 vllm_cpp_add_test(test_rocm_backend vt/test_rocm_backend.cpp)
 vllm_cpp_add_test(test_rocm_fp8_kv_cache vt/test_rocm_fp8_kv_cache.cpp)
+# KERNEL-QUANT-CIQ-GEMM-ROCM: the ROCm keep-quant GEMM (kROCM provider for
+# kMatmulBTQuant/kMatmulBTQuantGrouped). Gates the device dequant-in-kernel dot
+# against the CPU keep-quant oracle + an f64 dequant reference on the ten
+# Q8_K-family encodings. Skips coherently with no AMD GPU.
+vllm_cpp_add_test(test_rocm_quant_dot vt/test_rocm_quant_dot.cpp)
+target_include_directories(test_rocm_quant_dot PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # #785 P1 GPU product-seam witness. Executable only — NOT add_test.
 # Ordinary CTest must not see this target. Runner fail-closes on 77/nonzero.
 add_executable(test_ops_paged_attn_sharedk_wmma_p1_gpu
