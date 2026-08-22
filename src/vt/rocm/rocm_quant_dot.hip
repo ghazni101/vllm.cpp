@@ -21,9 +21,11 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <array>
 #include <unordered_map>
 
 #include "vt/cpu/cpu_quant_blocks.h"         // vt::cpu::Block* struct mirror
@@ -355,35 +357,46 @@ __device__ inline float DotQ5K(const BlockQ5_K* xb, const BlockQ8_K* yb) {
 }
 
 __device__ inline float DotQ6K(const BlockQ6_K* xb, const BlockQ8_K* yb) {
-  // Decode fused into the dot: no aux8[] array. CPU layout per 128-element
-  // chunk (proven equivalent, see tests): element e -> l = e&31,
-  // quadrant q = (e>>5)&3 picks {ql byte offset, qh bit pair}:
-  // q0: ql[l]&0xF | qh>>0; q1: ql[l+32]&0xF | qh>>2;
-  // q2: ql[l]>>4  | qh>>4; q3: ql[l+32]>>4 | qh>>6; each - 32.
+  // Decode fused into the dot: no aux8[] array. CPU layout (proven equivalent
+  // in the tests): element e = 128*bh + 32*q + r with bh = e>>7 (0..3),
+  // q = (e>>5)&3, r = e&31:
+  //   ql byte = ql[64*bh + 32*(q&1) + r], nibble shift = 4*(q>>1)
+  //   qh bits = 2*q .. 2*q+1 of qh[32*bh + r]; value - 32.
+  //   scale index = e>>4.
+  // The scalar body is the HOT path for decode shapes with nsb >= 32
+  // (ffn_down K=9216 -> nsb=36: each lane decodes a whole super-block here),
+  // where the old switch + per-element size_t form measured ~1507us/call on
+  // gfx1100. Quadrants are unrolled so every address is loop-invariant int
+  // math; group order (and therefore accumulation order) matches the CPU
+  // reference exactly, so the integer core stays bit-exact.
   const uint8_t* ql = xb->ql;
+  const uint8_t* qh = xb->qh;
   const int8_t* q8 = yb->qs;
   int32_t aux32[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-  int e = 0;
-  for (int j = 0; j < kQK_K / 16; ++j) {
-    const int scale = xb->scales[j];
 #pragma unroll
-    for (int l = 0; l < 16; ++l, ++e) {
-      const int r = e & 31;
-      const int quad = (e >> 5) & 3;
-      const size_t p = 64 * (e >> 7);
-      const size_t ph = 32 * (e >> 7);
-      const uint8_t qhv = xb->qh[ph + r];
-      int v;
-      switch (quad) {
-        case 0: v = ((ql[p + r] & 0xF) | (((qhv >> 0) & 3) << 4)) - 32; break;
-        case 1: v = ((ql[p + r + 32] & 0xF) | (((qhv >> 2) & 3) << 4)) - 32; break;
-        case 2: v = ((ql[p + r] >> 4) | (((qhv >> 4) & 3) << 4)) - 32; break;
-        default: v = ((ql[p + r + 32] >> 4) | (((qhv >> 6) & 3) << 4)) - 32; break;
-      }
-      v = static_cast<int8_t>(v);
-      aux32[l & 7] += scale * (q8[l] * v);
+  for (int bh = 0; bh < kQK_K / 128; ++bh) {
+    const uint8_t* ql_lo = ql + 64 * bh;
+    const uint8_t* ql_hi = ql_lo + 32;
+    const uint8_t* qh_b = qh + 32 * bh;
+    const int8_t* q8_b = q8 + 128 * bh;
+    const int8_t* sc_b = xb->scales + 8 * bh;
+    // Quadrant q covers elements [128bh+32q, 128bh+32q+32):
+    //   q0: ql_lo low nibble,   qh bits 0-1
+    //   q1: ql_hi low nibble,   qh bits 2-3
+    //   q2: ql_lo high nibble,  qh bits 4-5
+    //   q3: ql_hi high nibble,  qh bits 6-7
+    // Scale index within the chunk = (32q+l)>>4 = 2q + l/16.
+    for (int l = 0; l < 32; ++l) {
+      const uint8_t qhv = qh_b[l];
+      const int v0 = static_cast<int8_t>((ql_lo[l] & 0xF) | ((qhv & 3) << 4)) - 32;
+      aux32[l & 7] += sc_b[2 * 0 + (l >> 4)] * (q8_b[l] * v0);
+      const int v1 = static_cast<int8_t>((ql_hi[l] & 0xF) | (((qhv >> 2) & 3) << 4)) - 32;
+      aux32[l & 7] += sc_b[2 * 1 + (l >> 4)] * (q8_b[l + 32] * v1);
+      const int v2 = static_cast<int8_t>((ql_lo[l] >> 4) | (((qhv >> 4) & 3) << 4)) - 32;
+      aux32[l & 7] += sc_b[2 * 2 + (l >> 4)] * (q8_b[l + 64] * v2);
+      const int v3 = static_cast<int8_t>((ql_hi[l] >> 4) | (((qhv >> 6) & 3) << 4)) - 32;
+      aux32[l & 7] += sc_b[2 * 3 + (l >> 4)] * (q8_b[l + 96] * v3);
     }
-    q8 += 16;
   }
   const float d = DF16ToF32(xb->d) * yb->d;
   int isum = 0;
@@ -738,24 +751,28 @@ __device__ inline float DotSuperblockWarp<WType::kQ6_K>(const void* w,
                                                          int lane) {
   const BlockQ6_K* xb = static_cast<const BlockQ6_K*>(w);
   const uint8_t* ql = xb->ql;
+  const uint8_t* qh = xb->qh;
   const int8_t* q8 = a->qs;
   int acc = 0;
 #pragma unroll
   for (int t = 0; t < 8; ++t) {
     const int e = lane + 32 * t;
+    // e = 128*bh + 32*q + r with bh = e>>7 (0..3), q = (e>>5)&3, r = e&31.
+    // Pure-int addressing: the previous size_t multiplies + runtime switch in
+    // this unrolled loop made the Q6_K kernel instance ~23x slower than its
+    // Q4_K sibling on gfx1100 (S1 rocprof: ffn_down 1505us/call vs ~65us
+    // expected at Q4_K's bandwidth). Element order and the scale application
+    // point are unchanged, so the integer core stays bit-exact.
+    const int bh = e >> 7;
+    const int q = (e >> 5) & 3;
     const int r = e & 31;
-    const int quad = (e >> 5) & 3;
-    const size_t p = 64 * (e >> 7);
-    const size_t ph = 32 * (e >> 7);
-    const uint8_t qhv = xb->qh[ph + r];
-    int v;
-    switch (quad) {
-      case 0: v = ((ql[p + r] & 0xF) | ((qhv & 3) << 4)) - 32; break;
-      case 1: v = ((ql[p + r + 32] & 0xF) | (((qhv >> 2) & 3) << 4)) - 32; break;
-      case 2: v = ((ql[p + r] >> 4) | (((qhv >> 4) & 3) << 4)) - 32; break;
-      default: v = ((ql[p + r + 32] >> 4) | (((qhv >> 6) & 3) << 4)) - 32; break;
-    }
-    v = static_cast<int8_t>(v);
+    const uint8_t qhv = qh[32 * bh + r];
+    // q0/q2 read ql[64*bh + r] (low/high nibble); q1/q3 read ql[64*bh+32 + r].
+    const uint8_t qlv = ql[64 * bh + 32 * (q & 1) + r];
+    const int shift = 4 * ((q >> 1) & 1);   // 0 for q0/q1 (low nibble), 4 for q2/q3
+    const int qsh = 2 * q;                  // qh bit-pair position
+    const int v = static_cast<int8_t>(((qlv >> shift) & 0xF) |
+                                      (((qhv >> qsh) & 3) << 4)) - 32;
     acc += xb->scales[e >> 4] * (q8[e] * v);
   }
   return DF16ToF32(xb->d) * a->d * static_cast<float>(acc);
@@ -967,8 +984,19 @@ template <WType W>
 void LaunchGemm(Tensor& out, const uint8_t* weight, const BlockQ8_K* act,
                 int64_t m, int64_t n, int64_t nsb, size_t w_row_bytes,
                 size_t w_block_bytes, hipStream_t s) {
-  // Wave32 geometry: one warp per output; 8 warps (256 threads) per block.
+  // TEMP S1 instrumentation: log unique shapes (VT_QDOT_TRACE=1).
   constexpr int kWarpsPerBlock = 8;
+  static thread_local std::map<std::array<int64_t,4>, int> seen;
+  if (std::getenv("VT_QDOT_TRACE")) {
+    std::array<int64_t,4> key{static_cast<int64_t>(W), m, n, nsb};
+    if (++seen[key] == 1 || (seen[key] % 500) == 0)
+      std::fprintf(stderr, "[qdot] W=%d m=%lld n=%lld nsb=%lld count=%d grid=%u\n",
+                   static_cast<int>(W), static_cast<long long>(m),
+                   static_cast<long long>(n), static_cast<long long>(nsb),
+                   seen[key],
+                   static_cast<unsigned>((m*n + kWarpsPerBlock - 1) / kWarpsPerBlock));
+  }
+  // Wave32 geometry: one warp per output; 8 warps (256 threads) per block.
   dim3 block(32 * kWarpsPerBlock, 1, 1);
   const int64_t warps = m * n;
   const unsigned grid =

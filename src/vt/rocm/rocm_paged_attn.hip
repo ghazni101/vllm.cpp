@@ -2054,8 +2054,25 @@ void PagedAttentionKernelRocm(Queue& q, Tensor& out, const Tensor& query, const 
     const int64_t qg = hq / num_kv_heads;
     // GQA fuse: sliding QG=2. Global QG=8: tile as DecodeGqa QG=2 × z=4
     // (proven kernel; halves K/V reloads vs DecodeOpt's 8×). QG=4/8 CTAs lost A/B.
+    //
+    // GFX1100-TG150 (S2): qg == 4 && d == 256 (Qwen3.5-4B geometry, hq=16/kv=4)
+    // previously fell through to the generic PagedAttnOnline, whose per-context-
+    // token __syncthreads() serialization measured 818us/call on the RX 7900 XTX
+    // — 6.1 ms/token across the 8 full-attention layers. The DecodeGqa QG=4 arm
+    // fuses all four q-heads of a KV group into one CTA (K/V read once per group,
+    // warp-strided sequence walk, no per-token block-wide sync). DEFAULT OFF,
+    // opt in with VT_ATTN_DECODE_GQA4=1 — same policy as VT_ATTN_DECODE_D128:
+    // correctness-complete but NOT byte-exact against PagedAttnOnline's reduction
+    // order, so greedy anchors can move at exact bf16 ties; the flip owes the
+    // near-tie adjudication + distributional gate before it becomes the default.
+    static const bool decode_gqa4 = [] {
+      const char* e = std::getenv("VT_ATTN_DECODE_GQA4");
+      return e != nullptr && e[0] == '1';
+    }();
     if (decode_gqa &&
-        ((qg == 2 && (d == 128 || d == 256 || d == 512)) || (qg == 8 && d == 512))) {
+        ((qg == 2 && (d == 128 || d == 256 || d == 512)) ||
+         (qg == 8 && d == 512) ||
+         (decode_gqa4 && qg == 4 && d == 256))) {
       // Prefill SharedK (scoreless). Default ON for long single-req prefill (lab win
       // ~1.09× @11k vs DecodeGqa-z4). Set VT_ATTN_PREFILL_FLASH_SHAREDK=0 to disable.
       // SHAREDK_WMMA=1: rocWMMA QK + online V (lab; keep only if beats scalar SharedK).
@@ -2220,7 +2237,17 @@ void PagedAttentionKernelRocm(Queue& q, Tensor& out, const Tensor& query, const 
       const unsigned z_groups = (qg == 8 && d == 512) ? 4u : 1u;
       dim3 grid(static_cast<unsigned>(total_q), static_cast<unsigned>(num_kv_heads), z_groups);
       dim3 block(static_cast<unsigned>(nwarps * 32));
-      if (d == 128) {
+      if (decode_gqa4 && qg == 4 && d == 256) {
+        // QG=4 fuses all four q-heads of each KV group (Qwen3.5-4B geometry):
+        // K/V read ONCE per group instead of four times, and the sequence walk
+        // is warp-strided with only end-of-loop warp reduces.
+        PagedAttnDecodeGqaBf16<4, 8, 8><<<grid, block, smem, st>>>(
+            out.Ptr<__hip_bfloat16>(), query.Ptr<__hip_bfloat16>(), k_cache.Ptr<__hip_bfloat16>(),
+            v_cache.Ptr<__hip_bfloat16>(), block_table.Ptr<int32_t>(), seq_lens.Ptr<int32_t>(),
+            query_start_loc.Ptr<int32_t>(), num_reqs, hq, num_kv_heads, d, block_size, bt_row,
+            bt_col, kc_blk, kc_pg, kc_hd, vc_blk, vc_pg, vc_hd, args.scale, args.logits_soft_cap,
+            args.causal, window_left, window_right);
+      } else if (d == 128) {
         PagedAttnDecodeGqaBf16<2, 4, 8><<<grid, block, smem, st>>>(
             out.Ptr<__hip_bfloat16>(), query.Ptr<__hip_bfloat16>(), k_cache.Ptr<__hip_bfloat16>(),
             v_cache.Ptr<__hip_bfloat16>(), block_table.Ptr<int32_t>(), seq_lens.Ptr<int32_t>(),
