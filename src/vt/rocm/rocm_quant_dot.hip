@@ -880,6 +880,91 @@ __global__ void QuantDotGemmKernel(OutT* __restrict__ out,
   }
 }
 
+// ---------------------------------------------------------------------------
+// SPLIT-K decode kernel (GFX1100-TG150). For m == 1 and small n the one-warp-
+// per-output geometry above leaves most of the GPU idle: ffn_down (n=2560,
+// K=9216 -> nsb=36) launches 2560 warps total, ~27 warps per CU on a 96-CU
+// part, and each warp serially walks all 36 super-blocks. Measured 1507 ->
+// ~510 us/call after the branch-free body fix, still only ~38 GB/s — the
+// kernel is latency-bound on the serial super-block walk, not bandwidth-bound.
+//
+// This variant splits the K dimension across KSPLIT warps: warp k of the
+// (KSPLIT warps assigned to output (i,j)) owns super-blocks {k, k+KSPLIT, ...},
+// writes its scaled float partial to scratch[k * m * n + i*n + j], and a tiny
+// follow-up reduce kernel sums the KSPLIT partials into `out`. The integer
+// core is unchanged; only the float scale-sum reassociates further, within
+// the same NMSE band the file's gate already accepts for the warp reduction.
+// Scratch must hold KSPLIT*m*n floats and be zeroed OR fully written: every
+// (k, out) pair is written unconditionally by its owning warp (partial stays
+// 0.f when its sb range is empty), so no pre-zeroing is required.
+// ---------------------------------------------------------------------------
+template <WType W>
+__global__ void QuantDotGemmSplitKKernel(float* __restrict__ partials,
+                                         const uint8_t* __restrict__ weight,
+                                         const BlockQ8_K* __restrict__ act,
+                                         int64_t n, int64_t nsb,
+                                         size_t w_row_bytes,
+                                         size_t w_block_bytes) {
+  constexpr int kKSplit = 4;
+  const int64_t wid = static_cast<int64_t>(blockIdx.x) * (blockDim.x >> 5) +
+                      (threadIdx.x >> 5);
+  const int64_t j = wid / kKSplit;
+  if (j >= n) return;
+  const int k = static_cast<int>(wid % kKSplit);
+  const int lane = threadIdx.x & 31;
+
+  const uint8_t* w_row = weight + static_cast<size_t>(j) * w_row_bytes;
+  const BlockQ8_K* a_row = act;  // m == 1
+
+  // Warp-strided over this split's super-blocks: lane covers elements within
+  // a block via DotSuperblockWarp when few blocks remain, else lanes take
+  // whole blocks. Choose per-split strategy from how many sbs this k gets.
+  const int64_t mine = (nsb - k + kKSplit - 1) / kKSplit;
+  float partial = 0.0f;
+  if (mine >= 32) {
+    const int64_t full_sbs = nsb & ~int64_t(31);
+    for (int64_t sb = k + lane * kKSplit; sb < full_sbs; sb += 32 * kKSplit) {
+      const void* w_sb = w_row + static_cast<size_t>(sb) * w_block_bytes;
+      partial += DotSuperblockWarp<W>(w_sb, a_row + sb, lane);
+    }
+    for (int64_t sb = full_sbs + k; sb < nsb; sb += kKSplit) {
+      const void* w_sb = w_row + static_cast<size_t>(sb) * w_block_bytes;
+      partial += DotSuperblockWarp<W>(w_sb, a_row + sb, lane);
+    }
+  } else {
+    for (int64_t sb = k; sb < nsb; sb += kKSplit) {
+      const void* w_sb = w_row + static_cast<size_t>(sb) * w_block_bytes;
+      partial += DotSuperblockWarp<W>(w_sb, a_row + sb, lane);
+    }
+  }
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1)
+    partial += __shfl_down_sync(0xffffffffffffffffull, partial, off);
+  if (lane == 0)
+    partials[static_cast<int64_t>(k) * n + j] = FinalFactor<W>() * partial;
+}
+
+// Reduce the KSPLIT=4 partials: one thread per output element.
+__global__ void QuantDotGemmSplitKReduceKernel(float* __restrict__ partials,
+                                               float* __restrict__ out,
+                                               int64_t count) {
+  const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx >= count) return;
+  out[idx] = partials[idx] + partials[count + idx] +
+             partials[2 * count + idx] + partials[3 * count + idx];
+}
+
+// bf16-out variant: fold then RNE-convert, matching the plain kernel's
+// DF32ToBF16 store.
+__global__ void QuantDotGemmSplitKReduceBf16Kernel(
+    float* __restrict__ partials, uint16_t* __restrict__ out, int64_t count) {
+  const int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx >= count) return;
+  const float v = partials[idx] + partials[count + idx] +
+                  partials[2 * count + idx] + partials[3 * count + idx];
+  out[idx] = DF32ToBF16(v);
+}
+
 // GROUPED variant: warp per (p, n); weight row selected by expert_ids[p].
 template <WType W, typename OutT>
 __global__ void QuantDotGemmGroupedKernel(OutT* __restrict__ out,
@@ -1001,6 +1086,47 @@ void LaunchGemm(Tensor& out, const uint8_t* weight, const BlockQ8_K* act,
   const int64_t warps = m * n;
   const unsigned grid =
       static_cast<unsigned>((warps + kWarpsPerBlock - 1) / kWarpsPerBlock);
+
+  // SPLIT-K decode arm (GFX1100-TG150): m == 1 with few outputs but many
+  // super-blocks is latency-bound on the serial sb walk. Splitting K across
+  // 4 warps per output quadruples the warp count and quarters the walk.
+  // F32-out only (the reduce kernel sums float partials); gated by
+  // VT_QDOT_SPLITK=0 for A/B.
+  static const bool splitk_on = [] {
+    const char* e = std::getenv("VT_QDOT_SPLITK");
+    return !(e && e[0] == '0');
+  }();
+  if (splitk_on && m == 1 && out.dtype != DType::kF32 && n >= 512 &&
+      nsb >= 8) {
+    constexpr int kKSplit = 4;
+    const int64_t total = n;
+    // Dedicated partials buffer — NOT EnsureScratch: that same per-stream
+    // buffer backs the quantized activation, so aliasing it would clobber the
+    // activations this very kernel reads (the garbage-output bug the A/B
+    // caught before any gate did).
+    static float* sk_partials = nullptr;
+    static size_t sk_bytes = 0;
+    const size_t need = static_cast<size_t>(kKSplit) *
+                        static_cast<size_t>(total) * sizeof(float);
+    if (need > sk_bytes) {
+      if (sk_partials) hipFree(sk_partials);
+      CheckHip(hipMalloc(&sk_partials, need), "splitk partials malloc");
+      sk_bytes = need;
+    }
+    const int64_t wid_total = total * kKSplit;
+    const unsigned sk_grid =
+        static_cast<unsigned>((wid_total + kWarpsPerBlock - 1) / kWarpsPerBlock);
+    QuantDotGemmSplitKKernel<W><<<sk_grid, block, 0, s>>>(
+        sk_partials, weight, act, n, nsb, w_row_bytes, w_block_bytes);
+    // The reduce folds the KSPLIT float partials and converts to the output
+    // dtype (bf16 RNE store matches the plain kernel's DF32ToBF16 path).
+    const unsigned red_grid = static_cast<unsigned>((total + 255) / 256);
+    QuantDotGemmSplitKReduceBf16Kernel<<<red_grid, 256, 0, s>>>(
+        sk_partials, static_cast<uint16_t*>(out.data), total);
+    CheckHipLaunch("matmul_bt_quant splitk launch");
+    return;
+  }
+
   if (out.dtype == DType::kF32) {
     QuantDotGemmKernel<W, float><<<grid, block, 0, s>>>(
         static_cast<float*>(out.data), weight, act, m, n, nsb, w_row_bytes,
