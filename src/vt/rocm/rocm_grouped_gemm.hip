@@ -17,6 +17,7 @@
 #include <hip/hip_runtime.h>
 
 #include <atomic>
+
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -991,6 +992,41 @@ void MmvqQuantScratchForTesting(Queue& q, void* dst, const Tensor& a,
   Check(hipGetLastError(), "mmvq quant scratch hook");
 }
 
+// --- T4a REPAIR-ROUND-2: HOST-side dispatch-route counters (test-only) ------
+// One increment per MatmulBTQuantKernelRocm HOST dispatch, on the branch the
+// call took (baseline / non-fused GEMV / fused fold). These make ROUTING
+// observable even though the ON and OFF arms are bit-equal on outputs (the
+// round-2 review gaps F1/F2). Graph-replay reasoning: during stream capture
+// a kernel launch is RECORDED as a graph node and NOT executed, so these
+// counters advance exactly once per capture-time dispatch call and NEVER per
+// replay iteration -- replay multiplicity cannot skew a witness. No
+// per-thread GPU work and no capture-path behavior change beyond one integer
+// increment on the host dispatch path.
+struct MmvqRouteCounts {
+  long long baseline;    // KQuantGemmK warp-reduction dispatches
+  long long gemv_mmvq;   // non-fused MMVQ GEMV dispatches (standalone quant)
+  long long gemv_fused;  // fused-fold sub-branch dispatches
+};
+
+namespace {
+std::atomic<long long> g_mmvq_route_baseline{0};
+std::atomic<long long> g_mmvq_route_gemv{0};
+std::atomic<long long> g_mmvq_route_fused{0};
+}  // namespace
+
+void MmvqResetRouteCountsForTesting() {
+  g_mmvq_route_baseline.store(0, std::memory_order_relaxed);
+  g_mmvq_route_gemv.store(0, std::memory_order_relaxed);
+  g_mmvq_route_fused.store(0, std::memory_order_relaxed);
+}
+
+MmvqRouteCounts MmvqRouteCountsForTesting() {
+  return {g_mmvq_route_baseline.load(std::memory_order_relaxed),
+          g_mmvq_route_gemv.load(std::memory_order_relaxed),
+          g_mmvq_route_fused.load(std::memory_order_relaxed)};
+}
+
+
 
 
 void Q8KQuantizeForTest(Queue& q, void* scratch, const void* act, DType dtype,
@@ -1114,6 +1150,7 @@ void MatmulBTQuantKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tenso
     // quantize the row into their own LDS via the SHARED QuantQ8KSBlock body
     // (byte-identical to QuantizeQ8KK's output; asserted by the focused test).
     if (gemv_fused) {
+      ++g_mmvq_route_fused;
       if (out.dtype == DType::kF32) launch_mvq(float{}, nullptr);
       else launch_mvq(uint16_t{}, nullptr);
       Check(hipGetLastError(), "K-quant gemv mmvq fused");
@@ -1127,12 +1164,14 @@ void MatmulBTQuantKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tenso
     Check(hipGetLastError(), "q8_K quant");
 
     if (gemv_mmvq) {  // non-fused arm (nsb too large for the LDS fold)
+      ++g_mmvq_route_gemv;
       if (out.dtype == DType::kF32) launch_mvq(float{}, qact);
       else launch_mvq(uint16_t{}, qact);
       Check(hipGetLastError(), "K-quant gemv mmvq");
       return;
     }
 
+    ++g_mmvq_route_baseline;
     const int64_t grid = (m * n + kWarpsPerBlock - 1) / kWarpsPerBlock;
     dim3 block(32, kWarpsPerBlock);
     auto launch = [&](auto ot) {
