@@ -963,9 +963,23 @@ void MatmulBTQuantKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tenso
     // 123us); at the lm_head class the fused arm ran 2.2-3.3x SLOWER than
     // baseline while the non-fused arm runs 0.46-0.61x. Gate the fold to
     // small rows only; everything else takes standalone quant + GEMV.
-    constexpr int64_t kMmvqFoldMaxRows = 512;
+    // LEVER B1 (GFX1100-TG200): the 512-row crossover is RUNTIME-TUNABLE via
+    // VT_GEMV_MMVQ_FOLD_MAX so the NET-WIN point can be measured END-TO-END.
+    // Integer rows; default = kMmvqFoldMaxRowsDefault below; empty/invalid
+    // (= non-integer, <=0, trailing garbage) falls back to the default. Read
+    // PER CALL like VT_GEMV_MMVQ so in-process tests and graph capture pick
+    // the value up at dispatch time. Suite pins: tests/vt/
+    // test_rocm_quant_dot.cpp F2 (default routing) + F3 (knob witness).
+    constexpr int64_t kMmvqFoldMaxRowsDefault = 512;
+    int64_t mmvq_fold_max_rows = kMmvqFoldMaxRowsDefault;
+    if (const char* fm_e = std::getenv("VT_GEMV_MMVQ_FOLD_MAX")) {
+      char* fm_end = nullptr;
+      const long long fm_v = std::strtoll(fm_e, &fm_end, 10);
+      if (fm_end != fm_e && *fm_end == '\0' && fm_v > 0)
+        mmvq_fold_max_rows = static_cast<int64_t>(fm_v);
+    }
     const bool gemv_fused =
-        gemv_mmvq && m == 1 && n <= kMmvqFoldMaxRows &&
+        gemv_mmvq && m == 1 && n <= mmvq_fold_max_rows &&
         static_cast<size_t>(nsb) * sizeof(BlockQ8_K) <= kMmvqFoldLdsBytes;
 
     auto launch_mvq = [&](auto ot, BlockQ8_K* qact) {
