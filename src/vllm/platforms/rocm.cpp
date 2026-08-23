@@ -88,13 +88,21 @@ class RocmPlatform final : public Platform {
   // supports_fp8() stays false: gfx942/gfx950 have hardware fp8 and rocm.py lists
   //   "fp8" in supported_quantization (rocm.py:457-467), but we have no ROCm fp8
   //   kernel, and this predicate gates a fused path that would then not exist.
-  // support_static_graph_mode() stays false: the vt::Backend hipGraph capture
-  //   seam is implemented as of BACKEND-ROCM W1 (rocm_backend.hip; see
-  //   .agents/specs/rocm-decode-graph.md) and the address-baking concern that
-  //   used to justify leaving this false is now an assertion, not a worry —
-  //   the mutate-src-then-replay test step fails if replay ever returns a
-  //   snapshot. This flag still stays false because flipping it to engage a
-  //   real model's decode-graph path is W2, not W1.
+  // GFX1100-TG200 (T2b): support_static_graph_mode() is now TRUE. The W1 note
+  // below recorded the two conditions for this flip: the vt::Backend hipGraph
+  // capture seam is implemented (rocm_backend.hip; BeginCapture/EndCaptureGraph/
+  // ReplayGraph mirror cuda_backend.cu call for call, and the mutate-src-then-
+  // replay test asserts replay never returns a snapshot), and a real model's
+  // decode-graph path had to be exercised. The Qwen3_5 dense decode driver
+  // (Qwen3_5DenseDecodeGraph) gates on this predicate plus SupportsGraphCapture()
+  // plus VLLM_CPP_CUDAGRAPH; with all three true it captures the uniform decode
+  // step per padded batch size and replays it. The keep-quant scratch pool is
+  // already capture-safe (hipMallocAsync, stream-ordered, never freed). A/B
+  // evidence: docs/bench-evidence/gfx1100-tg200-t2b-20260823.md.
+  bool support_static_graph_mode() const override { return true; }
+  // HISTORY (BACKEND-ROCM W0/W1): this answer was false through W1 because the
+  // capture seam did not exist yet and then because no model path engaged it.
+  // The original W1 text is preserved in the campaign evidence file.
   // needs_weight_staging() stays false: this is the memory-model POLICY that
   //   selects the FULLY-OPTIMIZED device-resident forward (indexed GDN state
   //   I/O with no op-registration fallback for a couple of its consumers,
