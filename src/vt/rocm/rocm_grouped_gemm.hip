@@ -21,6 +21,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -597,6 +598,141 @@ __global__ void Q8_0GemmK(OutT* __restrict__ out, const uint8_t* __restrict__ we
   }
 }
 
+// --- T4a (GFX1100-TG200): MMVQ-style decode GEMV arm for K-quants ----------
+// Dispatched behind VT_GEMV_MMVQ=1 with m == 1 ONLY; default OFF and the
+// baseline KQuantGemmK path below is byte-unchanged. Geometry-only lever
+// against KQuantGemmK's decode-shape waste: warp-per-(i,j) walks super-
+// blocks lane-strided, so at this model's nsb=10 twenty-two of thirty-two
+// lanes idle while every active lane re-unpacks the whole super-block
+// header and Q6_K rebuilds an aux8[kQK_K] local array (register spill).
+// The warp still owns ONE output element j, but its 32 lanes walk 32-elem
+// CHUNK units (4 super-blocks x 8 chunks per pass): every lane stays busy
+// down to nsb=1, the header unpack is split per chunk, and Q6_K dequantizes
+// positionally in registers.
+//
+// NUMERICS CONTRACT — bit-exact vs the CPU oracle BY CONSTRUCTION. The
+// integer cores are exact under any association; the float side reproduces
+// cpu_quant_dot.cpp VecDot{Q4,Q5,Q6}_KQ8_K's association EXACTLY:
+//   S[l]  += d_sb * A_sb[l]     per super-block, sequential in sb, l = 0..7
+//   sumf  -= dmin_sb * sumi_sb  per super-block, sequential (Q4_K/Q5_K)
+//   out    = sumf + S[0] + ... + S[7]
+// Each lane accumulates its chunk positionally (B[l], l = elem & 7); an
+// octet shuffle reduces those integers exactly; lane 0 folds the per-super-
+// block float products into the chains IN SUPER-BLOCK ORDER. (The baseline
+// instead tree-reduces per-lane floats, which only meets the 1e-6 NMSE
+// band — see tests/vt/test_rocm_quant_dot.cpp.)
+template <typename OutT, int Fmt>
+__global__ void KQuantGemvMmvqK(OutT* __restrict__ out,
+                                const uint8_t* __restrict__ weight,
+                                const BlockQ8_K* __restrict__ act, int64_t n,
+                                int64_t nsb, size_t w_block_bytes) {
+  const int64_t j =
+      static_cast<int64_t>(blockIdx.x) * blockDim.y + threadIdx.y;
+  const int lane = static_cast<int>(threadIdx.x);
+  if (j >= n) return;
+  const uint8_t* w_row =
+      weight + static_cast<size_t>(j) * static_cast<size_t>(nsb) * w_block_bytes;
+  // Per-warp float chains on lane 0: the CPU oracle's sums[0..7] + sumf.
+  float S[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+  float sumf = 0.0f;
+  const int passes = static_cast<int>((nsb + 3) / 4);
+  for (int p = 0; p < passes; ++p) {
+    const int sb = p * 4 + (lane >> 3);
+    const int c = lane & 7;
+    int B[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    int sumi_c = 0;
+    if (sb < nsb) {
+      const uint8_t* blk =
+          w_row + static_cast<size_t>(sb) * w_block_bytes;
+      const BlockQ8_K& yb = act[sb];
+      if constexpr (Fmt == 2) {  // Q6_K: ql@0 qh@128 scales(int8)@192 d@208
+        const uint8_t* ql = blk;
+        const uint8_t* qh = blk + kQK_K / 2;
+        const int8_t* sc = reinterpret_cast<const int8_t*>(blk + 192);
+        const int8_t* q8 = yb.qs + c * 32;
+#pragma unroll
+        for (int u = 0; u < 32; ++u) {
+          const int e = c * 32 + u;
+          const int ck = e >> 7, r = e & 127;
+          int nib, hs;
+          if (r < 32) { nib = ql[ck * 64 + r] & 0xF; hs = 0; }
+          else if (r < 64) { nib = ql[ck * 64 + r] & 0xF; hs = 2; }
+          else if (r < 96) { nib = ql[ck * 64 + (r - 64)] >> 4; hs = 4; }
+          else { nib = ql[ck * 64 + (r - 64)] >> 4; hs = 6; }
+          const int val =
+              (nib | (((qh[ck * 32 + (r & 31)] >> hs) & 3) << 4)) - 32;
+          B[u & 7] += static_cast<int>(sc[e >> 4]) * (q8[u] * val);
+        }
+      } else {  // Q4_K / Q5_K: d@0 dmin@2 scales@4 [qh@16] qs@16|48
+        uint32_t W0, W1, W2;
+        memcpy(&W0, blk + 4, 4);
+        memcpy(&W1, blk + 8, 4);
+        memcpy(&W2, blk + 12, 4);
+        int scale, mn;
+        if (c < 4) {
+          scale = static_cast<int>((W0 >> (8 * c)) & 0x3F);
+          mn = static_cast<int>((W1 >> (8 * c)) & 0x3F);
+        } else {
+          const int i4 = 8 * (c - 4);
+          scale = static_cast<int>(((W2 >> i4) & 0xF) |
+                                   (((W0 >> (i4 + 6)) & 3) << 4));
+          mn = static_cast<int>(((W2 >> (i4 + 4)) & 0xF) |
+                                (((W1 >> (i4 + 6)) & 3) << 4));
+        }
+        const uint8_t* qb = blk + (Fmt == 1 ? 48 : 16) + (c >> 1) * 32;
+        const int shift = (c & 1) ? 4 : 0;
+        const uint8_t* hm = blk + 16;
+        const int8_t* q8 = yb.qs + c * 32;
+#pragma unroll
+        for (int t = 0; t < 32; ++t) {
+          int v = (qb[t] >> shift) & 0xF;
+          if constexpr (Fmt == 1) v += ((hm[t] >> c) & 1) << 4;
+          B[t & 7] += scale * (q8[t] * v);
+        }
+        sumi_c = mn * (yb.bsums[2 * c] + yb.bsums[2 * c + 1]);
+      }
+    }
+#pragma unroll
+    for (int off = 4; off > 0; off >>= 1) {
+#pragma unroll
+      for (int l = 0; l < 8; ++l)
+        B[l] += __shfl_down_sync(0xffffffffULL, B[l], off);
+      sumi_c += __shfl_down_sync(0xffffffffULL, sumi_c, off);
+    }
+    // Fold THIS pass's super-blocks into the chains in strict sb order
+    // (every lane executes; only lane 0's copies are canonical).
+    const int rem = static_cast<int>(nsb - p * 4);
+    const int nact = rem < 4 ? rem : 4;
+    for (int kk = 0; kk < nact; ++kk) {
+      int A[8];
+#pragma unroll
+      for (int l = 0; l < 8; ++l)
+        A[l] = __shfl_sync(0xffffffffULL, B[l], 8 * kk);
+      const int sbk = p * 4 + kk;
+      const uint8_t* blk =
+          w_row + static_cast<size_t>(sbk) * w_block_bytes;
+      uint16_t dh;
+      if constexpr (Fmt == 2) memcpy(&dh, blk + 208, 2); else memcpy(&dh, blk, 2);
+      const float d = DF16ToF32(dh) * act[sbk].d;
+      if constexpr (Fmt != 2) {  // the mins/bsums chain, sequential like CPU
+        uint16_t dmh;
+        memcpy(&dmh, blk + 2, 2);
+        const int SUMI = __shfl_sync(0xffffffffULL, sumi_c, 8 * kk);
+        sumf -= DF16ToF32(dmh) * act[sbk].d * static_cast<float>(SUMI);
+      }
+#pragma unroll
+      for (int l = 0; l < 8; ++l) S[l] += d * static_cast<float>(A[l]);
+    }
+  }
+  if (lane == 0) {
+    float res = sumf;
+#pragma unroll
+    for (int l = 0; l < 8; ++l) res += S[l];
+    if constexpr (sizeof(OutT) == 4) out[j] = res;
+    else out[j] = DF32ToBF16(res);
+  }
+}
+
 inline void Check(hipError_t err, const char* what) {
   if (err != hipSuccess)
     throw std::runtime_error(std::string("vt rocm grouped_gemm: ") + what + ": " +
@@ -613,6 +749,7 @@ inline void Check(hipError_t err, const char* what) {
 // graph may have baked the pointer), and needs NO synchronization: reuse is
 // stream-ordered and retirement keeps every baked pointer valid. Bounded: the
 // buffer grows O(log(max/min)) times over a process.
+
 struct StreamScratch {
   void* buf = nullptr;
   size_t bytes = 0;
@@ -865,7 +1002,35 @@ void MatmulBTQuantKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tenso
                        Q8KProductionRoute::kDense, q.device.index);
     const int64_t grid = (m * n + kWarpsPerBlock - 1) / kWarpsPerBlock;
     const int fmt = b.dtype == DType::kQ6_K ? 2 : b.dtype == DType::kQ5_K ? 1 : 0;
-    const int coop = KQuantDecodeCoopWarps(b.dtype, m, nsb);
+    // T4a MMVQ-style decode GEMV arm (VT_GEMV_MMVQ=1, default OFF; m==1
+    // only). Flag read PER CALL (the CUDA sibling's convention,
+    // cuda_quant_dot.cu:1006) so in-process tests and a captured decode
+    // graph pick the arm up at launch/capture time. The baseline path below
+    // is untouched when the flag is absent.
+    const char* mmvq_e = std::getenv("VT_GEMV_MMVQ");
+    const bool gemv_mmvq =
+        mmvq_e != nullptr && mmvq_e[0] == '1' && mmvq_e[1] == '\0';
+    if (gemv_mmvq && m == 1) {
+      constexpr int kGemvWarps = 4;
+      const int64_t ggrid = (n + kGemvWarps - 1) / kGemvWarps;
+      dim3 gblock(32, kGemvWarps);
+      auto launch_mvq = [&](auto ot) {
+        using OutT = decltype(ot);
+        auto* o = static_cast<OutT*>(out.data);
+        if (fmt == 2)
+          KQuantGemvMmvqK<OutT, 2><<<static_cast<unsigned>(ggrid), gblock, 0, s>>>(
+              o, w, qact, n, nsb, w_block_bytes);
+        else if (fmt == 1)
+          KQuantGemvMmvqK<OutT, 1><<<static_cast<unsigned>(ggrid), gblock, 0, s>>>(
+              o, w, qact, n, nsb, w_block_bytes);
+        else
+          KQuantGemvMmvqK<OutT, 0><<<static_cast<unsigned>(ggrid), gblock, 0, s>>>(
+              o, w, qact, n, nsb, w_block_bytes);
+      };
+      if (out.dtype == DType::kF32) launch_mvq(float{}); else launch_mvq(uint16_t{});
+      Check(hipGetLastError(), "K-quant gemv mmvq");
+      return;
+    }
     auto launch = [&](auto ot) {
       using OutT = decltype(ot);
       auto* o = static_cast<OutT*>(out.data);
