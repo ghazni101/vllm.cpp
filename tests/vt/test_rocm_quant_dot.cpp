@@ -53,8 +53,19 @@ using vt::Tensor;
 namespace vt::rocm {
 void MmvqQuantScratchForTesting(Queue& q, void* dst, const Tensor& a,
                                 bool fused_semantics);
-}  // namespace vt::rocm
 
+// T4a REPAIR-ROUND-2 routing witness (review findings F1/F2): the HOST-side
+// dispatch counters exposed by rocm_grouped_gemm.hip. ON and OFF arms are
+// BIT-EQUAL on outputs by design, so no output comparison can witness which
+// dispatch branch a call took -- these integer counters can.
+struct MmvqRouteCounts {
+  long long baseline;    // KQuantGemmK warp-reduction dispatches
+  long long gemv_mmvq;   // non-fused MMVQ GEMV dispatches (standalone quant)
+  long long gemv_fused;  // fused-fold sub-branch dispatches
+};
+MmvqRouteCounts MmvqRouteCountsForTesting();
+void MmvqResetRouteCountsForTesting();
+}  // namespace vt::rocm
 namespace {
 
 Device Cpu() { return Device{DeviceType::kCPU, 0}; }
@@ -598,6 +609,124 @@ TEST_CASE("T4a repair: per-grid OFF-vs-ON timing at the operator's captured grid
     MESSAGE(buf);
     gpu.Free(d_w);
     gpu.Free(d_a);
+    gpu.Free(d_o);
+  }
+  gpu.DestroyQueue(gq);
+}
+
+// ---------------------------------------------------------------------------
+// T4a REPAIR ROUND 2 (reviewer findings F1/F2). The round-1 gate could not
+// witness ROUTING: EnvGuard(false) writes "0" (never a true unset), and since
+// ON==OFF are bit-equal by design, every output comparison is blind to which
+// dispatch branch ran. These two cases pin routing itself via the host-side
+// dispatch counters.
+
+// F1: with VT_GEMV_MMVQ TRULY ABSENT (unsetenv, not "0") the call must take
+// the BASELINE branch; with VT_GEMV_MMVQ=1 it must NOT. Catches an inverted
+// getenv default (mutation M3) that outputs cannot see.
+TEST_CASE("T4a repair-2 F1: ROUTING WITNESS -- env truly unset routes to BASELINE; ON routes to the GEMV arm") {
+  if (!vt::rocm::DeviceAvailable()) {
+    MESSAGE("no AMD GPU on this host; ROCm keep-quant gate skipped");
+    return;
+  }
+  Backend& gpu = vt::GetBackend(DeviceType::kROCM);
+  Queue gq = gpu.CreateQueue();
+  const WeightCase& c = kKQuantCases[0];  // q4_K
+  const int64_t nsb = 10, k = nsb * c.block_elems, n = 7;
+  std::vector<uint8_t> wq = RandomBlocks(c, n * nsb, 0x5EEDU);
+  std::vector<float> a(static_cast<size_t>(k));
+  GenerateData(1.5F, a.size(), a.data());
+
+  void* d_a = gpu.Alloc(a.size() * sizeof(float));
+  void* d_w = gpu.Alloc(wq.size());
+  void* d_o = gpu.Alloc(sizeof(float) * static_cast<size_t>(n));
+  gpu.Copy(gq, d_a, a.data(), a.size() * sizeof(float));
+  gpu.Copy(gq, d_w, wq.data(), wq.size());
+
+  auto run_once = [&] {
+    Tensor at = DevTensor(d_a, DType::kF32, {1, k});
+    Tensor bt = DevTensor(d_w, c.dtype, {n, k});
+    Tensor ot = DevTensor(d_o, DType::kF32, {1, n});
+    vt::MatmulBTQuant(gq, ot, at, bt);
+    gpu.Synchronize(gq);
+  };
+
+  // TRUE unset: the flag string must be absent from the environment -- NOT
+  // EnvGuard(false), which sets "0". Default-OFF inertness means the
+  // BASELINE counter advances and no GEMV counter moves.
+  ::unsetenv("VT_GEMV_MMVQ");
+  vt::rocm::MmvqResetRouteCountsForTesting();
+  run_once();
+  const auto off_counts = vt::rocm::MmvqRouteCountsForTesting();
+  CHECK(off_counts.baseline == 1);
+  CHECK(off_counts.gemv_mmvq == 0);
+  CHECK(off_counts.gemv_fused == 0);
+
+  // Paired ON case: exactly the reverse. n=7 <= kMmvqFoldMaxRows, so the
+  // arm engages via its FUSED sub-branch; either way the baseline counter
+  // must not move.
+  {
+    EnvGuard on(true);
+    vt::rocm::MmvqResetRouteCountsForTesting();
+    run_once();
+    const auto on_counts = vt::rocm::MmvqRouteCountsForTesting();
+    CHECK(on_counts.baseline == 0);
+    CHECK(on_counts.gemv_fused == 1);
+    CHECK(on_counts.gemv_mmvq == 0);
+  }
+  ::unsetenv("VT_GEMV_MMVQ");
+  gpu.Free(d_a);
+  gpu.Free(d_w);
+  gpu.Free(d_o);
+  gpu.DestroyQueue(gq);
+}
+
+// F2: fold-crossover WITNESS. With the arm ON, n=256 (<= kMmvqFoldMaxRows)
+// must dispatch through the FUSED sub-branch and n=2304 (> 512, within the
+// reviewer's mutated range (512,4096]) must dispatch through the NON-FUSED
+// GEMV branch. Catches a kMmvqFoldMaxRows drift (mutation M4: 512 -> 4096)
+// that flips measured per-call ratios while staying output-green.
+TEST_CASE("T4a repair-2 F2: FOLD-CROSSOVER WITNESS -- fused sub-branch only at n <= kMmvqFoldMaxRows") {
+  if (!vt::rocm::DeviceAvailable()) {
+    MESSAGE("no AMD GPU on this host; ROCm keep-quant gate skipped");
+    return;
+  }
+  Backend& gpu = vt::GetBackend(DeviceType::kROCM);
+  Queue gq = gpu.CreateQueue();
+  const WeightCase& c = kKQuantCases[0];  // q4_K
+  const int64_t nsb = 10, k = nsb * c.block_elems;
+
+  struct FoldShape { const char* name; int64_t n; long long want_fused, want_gemv, want_baseline; };
+  const FoldShape shapes[] = {
+      {"n=256  (fold expected)", 256, 1, 0, 0},
+      {"n=2304 (fold NOT expected)", 2304, 0, 1, 0},
+  };
+  for (const FoldShape& sc : shapes) {
+    CAPTURE(sc.name);
+    std::vector<uint8_t> wq = RandomBlocks(c, sc.n * nsb, 0x5EEDU);
+    std::vector<float> a(static_cast<size_t>(k));
+    GenerateData(2.5F, a.size(), a.data());
+    void* d_a = gpu.Alloc(a.size() * sizeof(float));
+    void* d_w = gpu.Alloc(wq.size());
+    void* d_o = gpu.Alloc(sizeof(float) * static_cast<size_t>(sc.n));
+    gpu.Copy(gq, d_a, a.data(), a.size() * sizeof(float));
+    gpu.Copy(gq, d_w, wq.data(), wq.size());
+    {
+      EnvGuard on(true);
+      vt::rocm::MmvqResetRouteCountsForTesting();
+      Tensor at = DevTensor(d_a, DType::kF32, {1, k});
+      Tensor bt = DevTensor(d_w, c.dtype, {sc.n, k});
+      Tensor ot = DevTensor(d_o, DType::kF32, {1, sc.n});
+      vt::MatmulBTQuant(gq, ot, at, bt);
+      gpu.Synchronize(gq);
+      const auto counts = vt::rocm::MmvqRouteCountsForTesting();
+      CHECK(counts.gemv_fused == sc.want_fused);
+      CHECK(counts.gemv_mmvq == sc.want_gemv);
+      CHECK(counts.baseline == sc.want_baseline);
+    }
+    ::unsetenv("VT_GEMV_MMVQ");
+    gpu.Free(d_a);
+    gpu.Free(d_w);
     gpu.Free(d_o);
   }
   gpu.DestroyQueue(gq);
