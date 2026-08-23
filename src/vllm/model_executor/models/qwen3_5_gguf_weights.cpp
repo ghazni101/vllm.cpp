@@ -244,6 +244,41 @@ OwnedTensor OwnGgufF16(const GgufTensorInfo& tensor, int64_t n, int64_t k,
   return o;
 }
 
+// GFX1100-TG200: STACK two same-shape keep-quant/f16 weights into ONE owned
+// [n1+n2, k] block tensor (gate rows, then up rows). Both source tensors must
+// share dtype and K; the block layout makes row-concatenation exact — each row
+// is a whole number of blocks, so concatenating rows is byte-concatenation of
+// whole blocks and the per-output-row integer dot is unchanged. Always COPIES:
+// two disjoint file spans cannot be borrowed as one mapping span, and the merged
+// owner needs one contiguous buffer.
+OwnedTensor OwnGgufKeptStacked(const GgufFile& /*g*/, const GgufLoadPolicy& /*pol*/,
+                               const GgufTensorInfo& t_gate,
+                               const GgufTensorInfo& t_up) {
+  VT_CHECK(t_gate.ggml_type == t_up.ggml_type && t_gate.shape[1] == t_up.shape[1],
+           "qwen3_5 gguf: merged gate_up tensors must match dtype and K (" +
+               t_gate.name + " vs " + t_up.name + ")");
+  // Both halves are forced to the OWNED copy arm (mmap_src=nullptr): a stacked
+  // owner needs one contiguous buffer, and two disjoint file spans cannot be
+  // borrowed as one mapping span.
+  OwnedTensor gate = OwnGgufQuantBlocks(t_gate, t_gate.shape[0], t_gate.shape[1],
+                                        0, /*mmap_src=*/nullptr,
+                                        /*repack=*/false);
+  OwnedTensor up = OwnGgufQuantBlocks(t_up, t_up.shape[0], t_up.shape[1],
+                                      0, /*mmap_src=*/nullptr,
+                                      /*repack=*/false);
+  OwnedTensor merged;
+  merged.dtype = gate.dtype;
+  merged.rank = 2;
+  merged.shape[0] = gate.shape[0] + up.shape[0];
+  merged.shape[1] = gate.shape[1];
+  merged.nk = gate.nk && up.nk;
+  merged.bytes.resize(gate.bytes.size() + up.bytes.size());
+  std::memcpy(merged.bytes.data(), gate.bytes.data(), gate.bytes.size());
+  std::memcpy(merged.bytes.data() + gate.bytes.size(), up.bytes.data(),
+              up.bytes.size());
+  return merged;
+}
+
 namespace {
 
 // --- small helpers -------------------------------------------------------
@@ -1217,6 +1252,23 @@ void LoadMatmulWeightOrNvfp4(const GgufFile& g, const std::string& name,
   *bf16 = OwnMatmulWeight(g, name, pol);  // routes (and audits) once itself
 }
 
+// GFX1100-TG200: STACKED keep-quant gate_up. Loads ffn_gate + ffn_up and rows-
+// concatenates their blocks into ONE [2I, H] nk=true owner, so the forward issues
+// ONE kMatmulBTQuant (one QuantizeQ8KK + one GEMM) instead of two. Byte-exact:
+// each output row's integer dot is over its own whole blocks; stacking only
+// concatenates output rows. Falls back to the split pair when the two tensors'
+// encodings or K differ (the merged branch in the forward keys on emptiness).
+OwnedTensor LoadMergedKeptGateUp(const GgufFile& g, int64_t il,
+                                 const GgufLoadPolicy& pol) {
+  const GgufTensorInfo& tg = g.Get(Blk(il, "ffn_gate.weight"));
+  const GgufTensorInfo& tu = g.Get(Blk(il, "ffn_up.weight"));
+  if (tg.ggml_type != tu.ggml_type || tg.shape[1] != tu.shape[1]) {
+    // Different encodings/K: keep the split pair (each loads independently).
+    return OwnedTensor{};  // empty => caller falls back to split fields
+  }
+  return OwnGgufKeptStacked(g, pol, tg, tu);
+}
+
 FullAttnLayerWeights LoadAttnGguf(const GgufFile& g, int64_t il,
                                   const GgufLoadPolicy& pol) {
   FullAttnLayerWeights a;
@@ -1575,10 +1627,30 @@ Qwen3_5DenseWeights LoadQwen3_5DenseFromGguf(const GgufFile& gguf,
       VT_CHECK(false, "qwen3_5 gguf: unknown layer_type " + lt);
     }
     // Dense SwiGLU MLP (bf16 fields; the fp4 variants stay empty).
-    LoadMatmulWeightOrNvfp4(gguf, Blk(il, "ffn_gate.weight"), pol,
-                            &layer.mlp.gate_proj, &layer.mlp.gate_proj_fp4);
-    LoadMatmulWeightOrNvfp4(gguf, Blk(il, "ffn_up.weight"), pol,
-                            &layer.mlp.up_proj, &layer.mlp.up_proj_fp4);
+    // GFX1100-TG200: when both gate and up route to a keep residency with
+    // matching dtype/K, load them STACKED into gate_up_proj so the forward
+    // issues one kMatmulBTQuant instead of two. Row-concatenation of whole
+    // blocks is byte-exact per output row. The split gate/up loads below are
+    // skipped in that case (the forward dispatches on gate_up_proj vs the
+    // split fields); down_proj always loads here.
+    const bool merged_gate_up = [&] {
+      const GgufTensorInfo& tg = gguf.Get(Blk(il, "ffn_gate.weight"));
+      const GgufTensorInfo& tu = gguf.Get(Blk(il, "ffn_up.weight"));
+      const GgufResidency rg = pol.Route(tg, GgufTensorRole::kMatmulWeight);
+      const GgufResidency ru = pol.Route(tu, GgufTensorRole::kMatmulWeight);
+      const bool both_keep =
+          (rg == GgufResidency::kKeepQuant || rg == GgufResidency::kKeepF16) &&
+          rg == ru;
+      if (!both_keep) return false;
+      layer.mlp.gate_up_proj = LoadMergedKeptGateUp(gguf, il, pol);
+      return !layer.mlp.gate_up_proj.Empty();
+    }();
+    if (!merged_gate_up) {
+      LoadMatmulWeightOrNvfp4(gguf, Blk(il, "ffn_gate.weight"), pol,
+                              &layer.mlp.gate_proj, &layer.mlp.gate_proj_fp4);
+      LoadMatmulWeightOrNvfp4(gguf, Blk(il, "ffn_up.weight"), pol,
+                              &layer.mlp.up_proj, &layer.mlp.up_proj_fp4);
+    }
     LoadMatmulWeightOrNvfp4(gguf, Blk(il, "ffn_down.weight"), pol,
                             &layer.mlp.down_proj, &layer.mlp.down_proj_fp4);
     w.layers.push_back(std::move(layer));
