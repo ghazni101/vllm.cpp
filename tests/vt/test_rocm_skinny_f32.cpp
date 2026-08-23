@@ -35,6 +35,7 @@
 #include "vt/dtype.h"
 #include "vt/ops.h"
 #include "vt/rocm/rocm_runtime.h"
+#include "vt/tensor.h"
 
 using vt::Backend;
 using vt::Device;
@@ -58,6 +59,7 @@ void SkinnyF32ResetRouteCountsForTesting();
 
 namespace {
 
+Device Cpu() { return Device{DeviceType::kCPU, 0}; }
 Device GpuDev() { return Device{DeviceType::kROCM, 0}; }
 
 // test_rocm_quant_dot.cpp:79 — the band the sibling gates hold their arms to.
@@ -231,23 +233,6 @@ TEST_CASE("ROCm f32-out decode-skinny arm (VT_SKINNY_BF16=1): NMSE vs CPU oracle
 }
 
 TEST_CASE("ROCm f32-out skinny routing witness: TRUE-unset behaves like OFF (default-OFF inertness)") {
-  if (!vt::rocm::DeviceAvailable()) {
-    MESSAGE("no AMD GPU on this host; ROCm f32-out skinny gate skipped");
-    return;
-  }
-  Backend& gpu = vt::GetBackend(DeviceType::kROCM);
-  Queue gq = gpu.CreateQueue();
-  // EnvGuard(false) writes "0" — it can NEVER witness a true unset. The first
-  // window below unsets the variable outright (test_rocm_quant_dot.cpp F1
-  // convention): with no VT_SKINNY_BF16 in the environment at all, the
-  // engine default must route to BLAS exactly as an explicit "0" does.
-  const std::vector<uint16_t> a = RandomBf16(2560, 0x5EEDu);
-  const std::vector<uint16_t> b = RandomBf16(32 * 2560, 0xA11CEu);
-  void* d_a = gpu.Alloc(a.size() * 2);
-  void* d_b = gpu.Alloc(b.size() * 2);
-  gpu.Copy(gq, d_a, a.data(), a.size() * 2);
-  gpu.Copy(gq, d_b, b.data(), b.size() * 2);
-
   const auto run_window = [&](int arm) {
     void* d_o = gpu.Alloc(4 * 32);
     EnvGuard guard(arm == 1);

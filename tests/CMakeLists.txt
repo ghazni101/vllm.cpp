@@ -2550,6 +2550,11 @@ vllm_cpp_add_test(test_rocm_backend vt/test_rocm_backend.cpp)
 # seam, guarded on ROCM availability at runtime — never on CUDA. Skips
 # coherently with no AMD GPU.
 vllm_cpp_add_test(test_rocm_quant_dot vt/test_rocm_quant_dot.cpp)
+# GFX1100-TG200 lever B2: the focused ROCm bf16-in/f32-out decode-skinny
+# gate (VT_SKINNY_BF16=1) for the GDN BA projection population. Same
+# conventions as test_rocm_quant_dot: plain C++ through the vt:: seam,
+# runtime-guarded on ROCM availability, never on CUDA.
+vllm_cpp_add_test(test_rocm_skinny_f32 vt/test_rocm_skinny_f32.cpp)
 # #785 P1 GPU product-seam witness. Executable only — NOT add_test.
 # Ordinary CTest must not see this target. Runner fail-closes on 77/nonzero.
 add_executable(test_ops_paged_attn_sharedk_wmma_p1_gpu
