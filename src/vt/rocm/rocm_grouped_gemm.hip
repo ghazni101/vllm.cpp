@@ -112,21 +112,17 @@ __global__ void QuantizeQ8_0K(BlockQ8_0* __restrict__ scratch, const void* __res
 }
 
 // Q8_K (thread-per-256-superblock): cuda_quant_dot.cu QuantizeQ8KKernel.
-__global__ void QuantizeQ8KK(BlockQ8_K* __restrict__ scratch, const void* __restrict__ a,
-                             ActDT adt, int64_t a_rs, int64_t m, int64_t nsb,
-                             Q8KKernelWitnessCount* kernel_witness) {
-  const int64_t t = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (t >= m * nsb) return;
-  if (t == 0 && kernel_witness != nullptr) atomicAdd(&kernel_witness[0], 1ULL);
-  const int64_t i = t / nsb;
-  const int64_t sb = t % nsb;
-  const int64_t elem0 = i * a_rs + sb * kQK_K;
+// The per-super-block body is factored into QuantQ8KSBlock so the T4a MMVQ
+// fused-prologue arm produces BYTE-IDENTICAL scratch (same amax
+// first-occurrence tie-break, same scale/iscale arithmetic) — asserted by
+// tests/vt/test_rocm_quant_dot.cpp on random AND tied-amax inputs.
+__device__ inline void QuantQ8KSBlock(BlockQ8_K& y, const void* __restrict__ a,
+                                      ActDT adt, int64_t elem0) {
   float mx = 0.0f, amax = 0.0f;
   for (int j = 0; j < kQK_K; ++j) {
     const float ax = fabsf(DLoadAct(a, adt, elem0 + j));
     if (ax > amax) { amax = ax; mx = DLoadAct(a, adt, elem0 + j); }
   }
-  BlockQ8_K& y = scratch[t];
   if (amax == 0.0f) {
     y.d = 0.0f;
     for (int j = 0; j < kQK_K; ++j) y.qs[j] = 0;
@@ -144,6 +140,17 @@ __global__ void QuantizeQ8KK(BlockQ8_K* __restrict__ scratch, const void* __rest
     y.bsums[g] = static_cast<int16_t>(sum);
   }
   y.d = 1.0f / iscale;
+}
+
+__global__ void QuantizeQ8KK(BlockQ8_K* __restrict__ scratch, const void* __restrict__ a,
+                             ActDT adt, int64_t a_rs, int64_t m, int64_t nsb,
+                             Q8KKernelWitnessCount* kernel_witness) {
+  const int64_t t = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (t >= m * nsb) return;
+  if (t == 0 && kernel_witness != nullptr) atomicAdd(&kernel_witness[0], 1ULL);
+  const int64_t i = t / nsb;
+  const int64_t sb = t % nsb;
+  QuantQ8KSBlock(scratch[t], a, adt, i * a_rs + sb * kQK_K);
 }
 
 // Q8_K (block-per-256-superblock): cuda_quant_dot.cu
@@ -622,16 +629,11 @@ __global__ void Q8_0GemmK(OutT* __restrict__ out, const uint8_t* __restrict__ we
 // instead tree-reduces per-lane floats, which only meets the 1e-6 NMSE
 // band — see tests/vt/test_rocm_quant_dot.cpp.)
 template <typename OutT, int Fmt>
-__global__ void KQuantGemvMmvqK(OutT* __restrict__ out,
-                                const uint8_t* __restrict__ weight,
-                                const BlockQ8_K* __restrict__ act, int64_t n,
-                                int64_t nsb, size_t w_block_bytes) {
-  const int64_t j =
-      static_cast<int64_t>(blockIdx.x) * blockDim.y + threadIdx.y;
-  const int lane = static_cast<int>(threadIdx.x);
-  if (j >= n) return;
-  const uint8_t* w_row =
-      weight + static_cast<size_t>(j) * static_cast<size_t>(nsb) * w_block_bytes;
+__device__ inline void KQuantGemvMmvqRow(OutT* __restrict__ out,
+                                         const uint8_t* __restrict__ w_row,
+                                         const BlockQ8_K* __restrict__ act_row,
+                                         int64_t j, int lane, int64_t nsb,
+                                         size_t w_block_bytes) {
   // Per-warp float chains on lane 0: the CPU oracle's sums[0..7] + sumf.
   float S[8] = {0, 0, 0, 0, 0, 0, 0, 0};
   float sumf = 0.0f;
@@ -641,10 +643,11 @@ __global__ void KQuantGemvMmvqK(OutT* __restrict__ out,
     const int c = lane & 7;
     int B[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     int sumi_c = 0;
+
     if (sb < nsb) {
       const uint8_t* blk =
           w_row + static_cast<size_t>(sb) * w_block_bytes;
-      const BlockQ8_K& yb = act[sb];
+      const BlockQ8_K& yb = act_row[sb];
       if constexpr (Fmt == 2) {  // Q6_K: ql@0 qh@128 scales(int8)@192 d@208
         const uint8_t* ql = blk;
         const uint8_t* qh = blk + kQK_K / 2;
@@ -713,12 +716,12 @@ __global__ void KQuantGemvMmvqK(OutT* __restrict__ out,
           w_row + static_cast<size_t>(sbk) * w_block_bytes;
       uint16_t dh;
       if constexpr (Fmt == 2) memcpy(&dh, blk + 208, 2); else memcpy(&dh, blk, 2);
-      const float d = DF16ToF32(dh) * act[sbk].d;
+      const float d = DF16ToF32(dh) * act_row[sbk].d;
       if constexpr (Fmt != 2) {  // the mins/bsums chain, sequential like CPU
         uint16_t dmh;
         memcpy(&dmh, blk + 2, 2);
         const int SUMI = __shfl_sync(0xffffffffULL, sumi_c, 8 * kk);
-        sumf -= DF16ToF32(dmh) * act[sbk].d * static_cast<float>(SUMI);
+        sumf -= DF16ToF32(dmh) * act_row[sbk].d * static_cast<float>(SUMI);
       }
 #pragma unroll
       for (int l = 0; l < 8; ++l) S[l] += d * static_cast<float>(A[l]);
@@ -731,6 +734,53 @@ __global__ void KQuantGemvMmvqK(OutT* __restrict__ out,
     if constexpr (sizeof(OutT) == 4) out[j] = res;
     else out[j] = DF32ToBF16(res);
   }
+}
+
+template <typename OutT, int Fmt>
+__global__ void KQuantGemvMmvqK(OutT* __restrict__ out,
+                                const uint8_t* __restrict__ weight,
+                                const BlockQ8_K* __restrict__ act, int64_t n,
+                                int64_t nsb, size_t w_block_bytes) {
+  const int64_t j =
+      static_cast<int64_t>(blockIdx.x) * blockDim.y + threadIdx.y;
+  if (j >= n) return;
+  const uint8_t* w_row =
+      weight + static_cast<size_t>(j) * static_cast<size_t>(nsb) * w_block_bytes;
+  KQuantGemvMmvqRow<OutT, Fmt>(out, w_row, act, j, static_cast<int>(threadIdx.x),
+                               nsb, w_block_bytes);
+}
+
+// Fused-prologue variant (the operator-steered shape of the arm): the block
+// quantizes the activation row into LDS FIRST — each linear thread takes
+// whole super-blocks in the SAME thread-per-super-block walk as the
+// standalone QuantizeQ8KK grid, via the SHARED QuantQ8KSBlock body, so the
+// bytes are identical by construction — then __syncthreads() and runs the
+// identical GEMV row body against the LDS copy. This deletes the standalone
+// 59us-quant launch from the decode step entirely (T4a capture: 43.7
+// launches/tok on grids of <=1 block). The redundant per-block quantization
+// is ~20 elems/thread at this model's shapes — far cheaper than a launch.
+template <typename OutT, int Fmt>
+__global__ void KQuantGemvMmvqFusedK(OutT* __restrict__ out,
+                                     const uint8_t* __restrict__ weight,
+                                     const void* __restrict__ a, ActDT adt,
+                                     int64_t a_rs, int64_t n, int64_t nsb,
+                                     size_t w_block_bytes) {
+  extern __shared__ unsigned char vt_mmvq_smem[];
+  BlockQ8_K* lds =
+      reinterpret_cast<BlockQ8_K*>(vt_mmvq_smem);  // [nsb] blocks
+  const int tid = static_cast<int>(threadIdx.y) * 32 +
+                  static_cast<int>(threadIdx.x);
+  for (int64_t sb = tid; sb < nsb; sb += 128)
+    QuantQ8KSBlock(lds[sb], a, adt, sb * kQK_K);  // m == 1: elem0 = sb*256
+  __syncthreads();
+  const int64_t j =
+      static_cast<int64_t>(blockIdx.x) * blockDim.y + threadIdx.y;
+  if (j >= n) return;  // only AFTER the barrier: whole block quantizes first
+  const uint8_t* w_row =
+      weight + static_cast<size_t>(j) * static_cast<size_t>(nsb) * w_block_bytes;
+  KQuantGemvMmvqRow<OutT, Fmt>(out, w_row, lds, j,
+                               static_cast<int>(threadIdx.x), nsb,
+                               w_block_bytes);
 }
 
 inline void Check(hipError_t err, const char* what) {
@@ -901,33 +951,47 @@ bool Q6KSmallPrivateEnabled() {
 
 }  // namespace
 
-// Warps that cooperate on one output row of the dense K-quant GEMM. 1 selects
-// the single-warp `KQuantGemmK` the path has always had.
-//
-// Every value here is MEASURED on this tree's `Dot*K` bodies rather than copied
-// from llama.cpp's RDNA4 table, and the measurement disagreed with that table.
-// Upstream's `vec_dot_q*_K_q8_1` already splits a superblock 16 ways where ours
-// does all 256 weights in one lane, so the traffic a warp split adds is a
-// different quantity here: re-reading each superblock's header per warp and
-// breaking the quant read's contiguity costs a bandwidth-bound GEMV more than
-// the extra resident warps buy. Q4_K and Q5_K therefore keep the single-warp
-// arm at every width tried. `## Outcome` in the spec has the full sweep.
-int KQuantDecodeCoopWarps(DType wdt, int64_t m, int64_t nsb) {
-  // Decode only. The spec's `## Scope` keeps prefill on the arm it already has:
-  // one block per output element costs m*n blocks, and m > 1 is not the regime
-  // where a row's lanes run out of superblocks to chew on.
-  if (m != 1) return 1;
-  // nsb > 32 already fills all 32 lanes of a single warp (the k=12288 shapes in
-  // the issue's table), and `## Gate` requires those to keep the kernel and the
-  // launch config they had.
-  if (nsb > 32) return 1;
-  // Q6_K at 8: the one arm the sweep put ahead of the single-warp kernel.
-  return wdt == DType::kQ6_K ? 8 : 1;
+// T4a testing hook: fill dst (device ptr, k/256 BlockQ8_K blocks for row a)
+// with the standalone-quantizer semantics (mode 0: the production
+// QuantizeQ8KK grid) or the fused-prologue semantics (mode 1: ONE block,
+// cooperative LDS phase then copy-out) so tests can assert BYTE equality
+// between the two on arbitrary — including tied-amax — inputs.
+namespace {
+__global__ void MmvqPrologueQuantForTestingK(BlockQ8_K* __restrict__ dst,
+                                             const void* __restrict__ a,
+                                             ActDT adt, int64_t a_rs,
+                                             int64_t nsb) {
+  extern __shared__ unsigned char vt_mmq_smem[];
+  BlockQ8_K* lds = reinterpret_cast<BlockQ8_K*>(vt_mmq_smem);
+  const int tid = static_cast<int>(threadIdx.y) * 32 +
+                  static_cast<int>(threadIdx.x);
+  for (int64_t sb = tid; sb < nsb; sb += 128)
+    QuantQ8KSBlock(lds[sb], a, adt, sb * kQK_K);
+  __syncthreads();
+  for (int64_t sb = tid; sb < nsb; sb += 128) dst[sb] = lds[sb];
+}
+}  // namespace
+void MmvqQuantScratchForTesting(Queue& q, void* dst, const Tensor& a,
+                                bool fused_semantics) {
+  EnsureQueueDevice(q);
+  hipStream_t s = static_cast<hipStream_t>(q.handle);
+  const int64_t k = a.shape[1], nsb = k / kQK_K;
+  if (a.shape[0] != 1 || k % kQK_K != 0)
+    throw std::runtime_error("vt rocom mmvq test hook: need one whole row");
+  if (!fused_semantics) {
+    QuantizeQ8KK<<<static_cast<unsigned>((nsb + 127) / 128), 128, 0, s>>>(
+        static_cast<BlockQ8_K*>(dst), a.data, ActDtOf(a.dtype), a.stride[0], 1,
+        nsb);
+  } else {
+    MmvqPrologueQuantForTestingK<<<1, dim3(32, 4),
+                                   static_cast<size_t>(nsb) * sizeof(BlockQ8_K),
+                                   s>>>(static_cast<BlockQ8_K*>(dst), a.data,
+                                        ActDtOf(a.dtype), a.stride[0], nsb);
+  }
+  Check(hipGetLastError(), "mmvq quant scratch hook");
 }
 
-uint64_t KQuantCoopDispatchCount() {
-  return g_kq_coop_dispatches.load(std::memory_order_relaxed);
-}
+
 
 void Q8KQuantizeForTest(Queue& q, void* scratch, const void* act, DType dtype,
                         int64_t row_stride, int64_t rows, int64_t nsb, bool candidate) {
@@ -996,11 +1060,6 @@ void MatmulBTQuantKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tenso
                                 : b.dtype == DType::kQ5_K ? sizeof(BlockQ5_K)
                                                           : sizeof(BlockQ4_K);
     const size_t w_row_bytes = static_cast<size_t>(nsb) * w_block_bytes;
-    BlockQ8_K* qact = static_cast<BlockQ8_K*>(EnsureQuantScratch(
-        static_cast<size_t>(m) * nsb * sizeof(BlockQ8_K), s));
-    LaunchQ8KQuantizer(qact, a.data, ActDtOf(a.dtype), a.stride[0], m, nsb, s,
-                       Q8KProductionRoute::kDense, q.device.index);
-    const int64_t grid = (m * n + kWarpsPerBlock - 1) / kWarpsPerBlock;
     const int fmt = b.dtype == DType::kQ6_K ? 2 : b.dtype == DType::kQ5_K ? 1 : 0;
     // T4a MMVQ-style decode GEMV arm (VT_GEMV_MMVQ=1, default OFF; m==1
     // only). Flag read PER CALL (the CUDA sibling's convention,
@@ -1010,13 +1069,35 @@ void MatmulBTQuantKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tenso
     const char* mmvq_e = std::getenv("VT_GEMV_MMVQ");
     const bool gemv_mmvq =
         mmvq_e != nullptr && mmvq_e[0] == '1' && mmvq_e[1] == '\0';
-    if (gemv_mmvq && m == 1) {
+    constexpr size_t kMmvqFoldLdsBytes = 32 * 1024;
+    const bool gemv_fused =
+        gemv_mmvq && m == 1 &&
+        static_cast<size_t>(nsb) * sizeof(BlockQ8_K) <= kMmvqFoldLdsBytes;
+
+    auto launch_mvq = [&](auto ot, BlockQ8_K* qact) {
+      using OutT = decltype(ot);
+      auto* o = static_cast<OutT*>(out.data);
       constexpr int kGemvWarps = 4;
       const int64_t ggrid = (n + kGemvWarps - 1) / kGemvWarps;
       dim3 gblock(32, kGemvWarps);
-      auto launch_mvq = [&](auto ot) {
-        using OutT = decltype(ot);
-        auto* o = static_cast<OutT*>(out.data);
+      if (gemv_fused) {
+        const size_t lds_bytes = static_cast<size_t>(nsb) * sizeof(BlockQ8_K);
+        if (fmt == 2)
+          KQuantGemvMmvqFusedK<OutT, 2><<<static_cast<unsigned>(ggrid), gblock,
+                                         lds_bytes, s>>>(
+              o, w, a.data, ActDtOf(a.dtype), a.stride[0], n, nsb,
+              w_block_bytes);
+        else if (fmt == 1)
+          KQuantGemvMmvqFusedK<OutT, 1><<<static_cast<unsigned>(ggrid), gblock,
+                                         lds_bytes, s>>>(
+              o, w, a.data, ActDtOf(a.dtype), a.stride[0], n, nsb,
+              w_block_bytes);
+        else
+          KQuantGemvMmvqFusedK<OutT, 0><<<static_cast<unsigned>(ggrid), gblock,
+                                         lds_bytes, s>>>(
+              o, w, a.data, ActDtOf(a.dtype), a.stride[0], n, nsb,
+              w_block_bytes);
+      } else {
         if (fmt == 2)
           KQuantGemvMmvqK<OutT, 2><<<static_cast<unsigned>(ggrid), gblock, 0, s>>>(
               o, w, qact, n, nsb, w_block_bytes);
@@ -1026,11 +1107,34 @@ void MatmulBTQuantKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tenso
         else
           KQuantGemvMmvqK<OutT, 0><<<static_cast<unsigned>(ggrid), gblock, 0, s>>>(
               o, w, qact, n, nsb, w_block_bytes);
-      };
-      if (out.dtype == DType::kF32) launch_mvq(float{}); else launch_mvq(uint16_t{});
+      }
+    };
+
+    // FUSED arm: no standalone quant launch, no scratch — the GEMV blocks
+    // quantize the row into their own LDS via the SHARED QuantQ8KSBlock body
+    // (byte-identical to QuantizeQ8KK's output; asserted by the focused test).
+    if (gemv_fused) {
+      if (out.dtype == DType::kF32) launch_mvq(float{}, nullptr);
+      else launch_mvq(uint16_t{}, nullptr);
+      Check(hipGetLastError(), "K-quant gemv mmvq fused");
+      return;
+    }
+
+    BlockQ8_K* qact = static_cast<BlockQ8_K*>(EnsureQuantScratch(
+        static_cast<size_t>(m) * nsb * sizeof(BlockQ8_K), s));
+    QuantizeQ8KK<<<static_cast<unsigned>((m * nsb + 127) / 128), 128, 0, s>>>(
+        qact, a.data, ActDtOf(a.dtype), a.stride[0], m, nsb);
+    Check(hipGetLastError(), "q8_K quant");
+
+    if (gemv_mmvq) {  // non-fused arm (nsb too large for the LDS fold)
+      if (out.dtype == DType::kF32) launch_mvq(float{}, qact);
+      else launch_mvq(uint16_t{}, qact);
       Check(hipGetLastError(), "K-quant gemv mmvq");
       return;
     }
+
+    const int64_t grid = (m * n + kWarpsPerBlock - 1) / kWarpsPerBlock;
+    dim3 block(32, kWarpsPerBlock);
     auto launch = [&](auto ot) {
       using OutT = decltype(ot);
       auto* o = static_cast<OutT*>(out.data);
