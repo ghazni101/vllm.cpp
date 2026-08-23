@@ -154,8 +154,8 @@ __device__ inline void QuantQ8KSBlock(BlockQ8_K& y, const void* __restrict__ a,
                                       ActDT adt, int64_t elem0) {
   float mx = 0.0f, amax = 0.0f;
   for (int j = 0; j < kQK_K; ++j) {
-    const float ax = fabsf(DLoadAct(a, adt, elem0 + j));
-    if (ax > amax) { amax = ax; mx = DLoadAct(a, adt, elem0 + j); }
+    const float x = DLoadAct(a, adt, elem0 + j);
+    if (const float ax = fabsf(x); ax > amax) { amax = ax; mx = x; }
   }
   if (amax == 0.0f) {
     y.d = 0.0f;
@@ -565,65 +565,89 @@ __global__ void Q8_0GemmK(OutT* __restrict__ out, const uint8_t* __restrict__ we
 
 // --- T4a (GFX1100-TG200): MMVQ-style decode GEMV arm for K-quants ----------
 // Dispatched behind VT_GEMV_MMVQ=1 with m == 1 ONLY; default OFF and the
-// baseline KQuantGemmK path below is byte-unchanged. Geometry-only lever
-// against KQuantGemmK's decode-shape waste: warp-per-(i,j) walks super-
-// blocks lane-strided, so at this model's nsb=10 twenty-two of thirty-two
-// lanes idle while every active lane re-unpacks the whole super-block
-// header and Q6_K rebuilds an aux8[kQK_K] local array (register spill).
-// The warp still owns ONE output element j, but its 32 lanes walk 32-elem
-// CHUNK units (4 super-blocks x 8 chunks per pass): every lane stays busy
-// down to nsb=1, the header unpack is split per chunk, and Q6_K dequantizes
-// positionally in registers.
+// baseline KQuantGemmK path below is byte-unchanged.
 //
-// NUMERICS CONTRACT — bit-exact vs the CPU oracle BY CONSTRUCTION. The
-// integer cores are exact under any association; the float side reproduces
-// cpu_quant_dot.cpp VecDot{Q4,Q5,Q6}_KQ8_K's association EXACTLY:
-//   S[l]  += d_sb * A_sb[l]     per super-block, sequential in sb, l = 0..7
-//   sumf  -= dmin_sb * sumi_sb  per super-block, sequential (Q4_K/Q5_K)
-//   out    = sumf + S[0] + ... + S[7]
-// Each lane accumulates its chunk positionally (B[l], l = elem & 7); an
-// octet shuffle reduces those integers exactly; lane 0 folds the per-super-
-// block float products into the chains IN SUPER-BLOCK ORDER. (The baseline
-// instead tree-reduces per-lane floats, which only meets the 1e-6 NMSE
-// band — see tests/vt/test_rocm_quant_dot.cpp.)
+// NUMERICS CONTRACT (T4a REPAIR ROUND) — the arm is BIT-EQUAL TO THE
+// BASELINE KQuantGemmK OUTPUT at every (Fmt, nsb, j), not merely within the
+// oracle NMSE band. History: the first round reproduced the CPU ORACLE's
+// association exactly and was bit-exact vs it, yet the ENGINE degraded into
+// number-loops — the extended ON-vs-OFF sweep showed the arm differs from
+// the BASELINE by float ULPs (different summation association), flipping
+// greedy near-ties at isolated rows (red at N=2304..248320). Repair
+// mechanism, three steps:
+//   1. INTEGER PHASE: an octet of 8 lanes walks one super-block in 32-elem
+//      chunk units (all lanes busy down to nsb=1; dp4a word cores below).
+//      Integer sums are EXACT under any association, so the redistribution
+//      cannot change them; an exact octet shuffle recovers each super-
+//      block's full isum (and the Q4/Q5 mins-bsums sumi).
+//   2. TERM RECONSTRUCTION: the octet leader evaluates the baseline's OWN
+//      float expression for that super-block — d*isum (Q6_K) resp.
+//      d*isum - dmin*sumi (Q4_K/Q5_K) with the same d/dmin products — and
+//      broadcasts it. Identical inputs, identical expression => identical
+//      float bits as the baseline's per-super-block Dot return value.
+//   3. ASSOCIATION REPLAY: every lane adds the broadcast term under the
+//      BASELINE's lane ownership (lane l owns super-blocks l, l+32, ...
+//      sequentially in increasing sb order — here: predicate (sb%32)==lane
+//      over the in-order sb stream) and partials close with the baseline's
+//      __shfl_down(16,8,4,2,1) tree.
+// Identical float values in identical order => identical bits. The focused
+// sweep (tests/vt/test_rocm_quant_dot.cpp, ENGINE shape set incl. lm_head
+// N=248320) asserts ON==OFF byte identity at every model shape.
 template <typename OutT, int Fmt>
 __device__ inline void KQuantGemvMmvqRow(OutT* __restrict__ out,
                                          const uint8_t* __restrict__ w_row,
                                          const BlockQ8_K* __restrict__ act_row,
                                          int64_t j, int lane, int64_t nsb,
                                          size_t w_block_bytes) {
-  // Per-warp float chains on lane 0: the CPU oracle's sums[0..7] + sumf.
-  float S[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-  float sumf = 0.0f;
+  float partial = 0.0f;
   const int passes = static_cast<int>((nsb + 3) / 4);
   for (int p = 0; p < passes; ++p) {
     const int sb = p * 4 + (lane >> 3);
     const int c = lane & 7;
-    int B[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-    int sumi_c = 0;
+    int acc = 0;    // this chunk's weighted integer dot (exact)
+    int sumi_c = 0; // Q4/Q5: mn * (bsums pair), exact
 
     if (sb < nsb) {
       const uint8_t* blk =
           w_row + static_cast<size_t>(sb) * w_block_bytes;
       const BlockQ8_K& yb = act_row[sb];
       if constexpr (Fmt == 2) {  // Q6_K: ql@0 qh@128 scales(int8)@192 d@208
-        const uint8_t* ql = blk;
-        const uint8_t* qh = blk + kQK_K / 2;
+        // Chunk c covers dequant elements [c*32, c*32+32). DotQ6K layout:
+        // quarter q=c>>2 holds elements [q*128,+128); segment seg=c&3 picks
+        // the ql low/high nibble half and the qh 2-bit field. Nibble values
+        // are biased by -32; the bias is removed EXACTLY in the integer
+        // domain with a constant-word dp4a (32*q8 per byte), so `acc`
+        // equals the baseline's exact isum whatever the grouping.
+        // seg 0/1: low nibble of ql bytes l / l+32; seg 2/3: high nibble.
+        // qh contributes a 2-bit field per element (mask 0x03030303).
+        const int q = c >> 2, seg = c & 3;
+        const uint8_t* ql = blk + q * 64 + (seg & 1) * 32;
+        const uint8_t* qh = blk + kQK_K / 2 + q * 32;
         const int8_t* sc = reinterpret_cast<const int8_t*>(blk + 192);
+        const int shift = (seg >> 1) * 4;
+        const int hs = seg * 2;
         const int8_t* q8 = yb.qs + c * 32;
+        int sub0 = 0, pre0 = 0, sub1 = 0, pre1 = 0;
 #pragma unroll
-        for (int u = 0; u < 32; ++u) {
-          const int e = c * 32 + u;
-          const int ck = e >> 7, r = e & 127;
-          int nib, hs;
-          if (r < 32) { nib = ql[ck * 64 + r] & 0xF; hs = 0; }
-          else if (r < 64) { nib = ql[ck * 64 + r] & 0xF; hs = 2; }
-          else if (r < 96) { nib = ql[ck * 64 + (r - 64)] >> 4; hs = 4; }
-          else { nib = ql[ck * 64 + (r - 64)] >> 4; hs = 6; }
-          const int val =
-              (nib | (((qh[ck * 32 + (r & 31)] >> hs) & 3) << 4)) - 32;
-          B[u & 7] += static_cast<int>(sc[e >> 4]) * (q8[u] * val);
+        for (int w = 0; w < 8; ++w) {
+          uint32_t Wq, Wh, W8;
+          memcpy(&Wq, ql + 4 * w, 4);
+          memcpy(&Wh, qh + 4 * w, 4);
+          memcpy(&W8, q8 + 4 * w, 4);
+          const uint32_t v =
+              ((Wq >> shift) & 0x0F0F0F0Fu) |
+              (((Wh >> hs) & 0x03030303u) << 4);
+          // scales change every 16 elems: words 0-3 -> sc[2c], 4-7 -> sc[2c+1]
+          if (w < 4) {
+            sub0 = Dp4a(static_cast<int>(v), static_cast<int>(W8), sub0);
+            pre0 = Dp4a(0x20202020, static_cast<int>(W8), pre0);
+          } else {
+            sub1 = Dp4a(static_cast<int>(v), static_cast<int>(W8), sub1);
+            pre1 = Dp4a(0x20202020, static_cast<int>(W8), pre1);
+          }
         }
+        acc = static_cast<int>(sc[2 * c]) * (sub0 - pre0) +
+              static_cast<int>(sc[2 * c + 1]) * (sub1 - pre1);
       } else {  // Q4_K / Q5_K: d@0 dmin@2 scales@4 [qh@16] qs@16|48
         uint32_t W0, W1, W2;
         memcpy(&W0, blk + 4, 4);
@@ -644,53 +668,65 @@ __device__ inline void KQuantGemvMmvqRow(OutT* __restrict__ out,
         const int shift = (c & 1) ? 4 : 0;
         const uint8_t* hm = blk + 16;
         const int8_t* q8 = yb.qs + c * 32;
+        int sub = 0;
 #pragma unroll
-        for (int t = 0; t < 32; ++t) {
-          int v = (qb[t] >> shift) & 0xF;
-          if constexpr (Fmt == 1) v += ((hm[t] >> c) & 1) << 4;
-          B[t & 7] += scale * (q8[t] * v);
+        for (int w = 0; w < 8; ++w) {
+          uint32_t Wq, W8;
+          memcpy(&Wq, qb + 4 * w, 4);
+          memcpy(&W8, q8 + 4 * w, 4);
+          uint32_t v = (Wq >> shift) & 0x0F0F0F0Fu;
+          if constexpr (Fmt == 1) {
+            uint32_t Wh;
+            memcpy(&Wh, hm + 4 * w, 4);
+            v |= ((Wh >> c) & 0x01010101u) << 4;
+          }
+          sub = Dp4a(static_cast<int>(v), static_cast<int>(W8), sub);
         }
+        acc = scale * sub;
         sumi_c = mn * (yb.bsums[2 * c] + yb.bsums[2 * c + 1]);
       }
     }
 #pragma unroll
     for (int off = 4; off > 0; off >>= 1) {
-#pragma unroll
-      for (int l = 0; l < 8; ++l)
-        B[l] += __shfl_down_sync(0xffffffffULL, B[l], off);
+      acc += __shfl_down_sync(0xffffffffULL, acc, off);
       sumi_c += __shfl_down_sync(0xffffffffULL, sumi_c, off);
     }
-    // Fold THIS pass's super-blocks into the chains in strict sb order
-    // (every lane executes; only lane 0's copies are canonical).
+    // Fold THIS pass's super-blocks: reconstruct the baseline's exact float
+    // term on the octet leader (after the reduce above, lane 8*kk holds the
+    // whole-octet integer totals) and add it under the baseline's lane
+    // ownership (lane l owns sbs l, l+32, ... — the stream here is strictly
+    // sb-increasing, so per-lane accumulation order matches).
     const int rem = static_cast<int>(nsb - p * 4);
     const int nact = rem < 4 ? rem : 4;
     for (int kk = 0; kk < nact; ++kk) {
-      int A[8];
-#pragma unroll
-      for (int l = 0; l < 8; ++l)
-        A[l] = __shfl_sync(0xffffffffULL, B[l], 8 * kk);
       const int sbk = p * 4 + kk;
-      const uint8_t* blk =
-          w_row + static_cast<size_t>(sbk) * w_block_bytes;
-      uint16_t dh;
-      if constexpr (Fmt == 2) memcpy(&dh, blk + 208, 2); else memcpy(&dh, blk, 2);
-      const float d = DF16ToF32(dh) * act_row[sbk].d;
-      if constexpr (Fmt != 2) {  // the mins/bsums chain, sequential like CPU
-        uint16_t dmh;
-        memcpy(&dmh, blk + 2, 2);
-        const int SUMI = __shfl_sync(0xffffffffULL, sumi_c, 8 * kk);
-        sumf -= DF16ToF32(dmh) * act_row[sbk].d * static_cast<float>(SUMI);
+      const int isum = __shfl_sync(0xffffffffULL, acc, 8 * kk);
+      const int SUMI = __shfl_sync(0xffffffffULL, sumi_c, 8 * kk);
+      float term = 0.0f;
+      if (lane == 8 * kk) {
+        const uint8_t* blk =
+            w_row + static_cast<size_t>(sbk) * w_block_bytes;
+        uint16_t dh;
+        if constexpr (Fmt == 2) memcpy(&dh, blk + 208, 2); else memcpy(&dh, blk, 2);
+        const float d = DF16ToF32(dh) * act_row[sbk].d;
+        if constexpr (Fmt != 2) {  // baseline: d * isum - dmin * sumi
+          uint16_t dmh;
+          memcpy(&dmh, blk + 2, 2);
+          const float dmin = DF16ToF32(dmh) * act_row[sbk].d;
+          term = d * static_cast<float>(isum) - dmin * static_cast<float>(SUMI);
+        } else {                   // baseline: d * isum
+          term = d * static_cast<float>(isum);
+        }
       }
-#pragma unroll
-      for (int l = 0; l < 8; ++l) S[l] += d * static_cast<float>(A[l]);
+      const float P = __shfl_sync(0xffffffffULL, term, 8 * kk);
+      if ((sbk & 31) == lane) partial += P;
     }
   }
-  if (lane == 0) {
-    float res = sumf;
 #pragma unroll
-    for (int l = 0; l < 8; ++l) res += S[l];
-    if constexpr (sizeof(OutT) == 4) out[j] = res;
-    else out[j] = DF32ToBF16(res);
+  for (int off = 16; off > 0; off >>= 1) partial += __shfl_down_sync(0xffffffffULL, partial, off);
+  if (lane == 0) {
+    if constexpr (sizeof(OutT) == 4) out[j] = partial;
+    else out[j] = DF32ToBF16(partial);
   }
 }
 
@@ -714,9 +750,11 @@ __global__ void KQuantGemvMmvqK(OutT* __restrict__ out,
 // standalone QuantizeQ8KK grid, via the SHARED QuantQ8KSBlock body, so the
 // bytes are identical by construction — then __syncthreads() and runs the
 // identical GEMV row body against the LDS copy. This deletes the standalone
-// 59us-quant launch from the decode step entirely (T4a capture: 43.7
-// launches/tok on grids of <=1 block). The redundant per-block quantization
-// is ~20 elems/thread at this model's shapes — far cheaper than a launch.
+// ~59us quant launch (T4a capture: 43.7 launches/tok on grids of <=1
+// block). The redundant per-block requantization is bounded by the
+// kMmvqFoldMaxRows gate at the dispatch site: measured on gfx1100, the fold
+// beats the launch at n<=512 and loses badly beyond (the redundancy scales
+// with the block count) — see the gate comment there.
 template <typename OutT, int Fmt>
 __global__ void KQuantGemvMmvqFusedK(OutT* __restrict__ out,
                                      const uint8_t* __restrict__ weight,
@@ -868,12 +906,30 @@ void MatmulBTQuantKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tenso
     // cuda_quant_dot.cu:1006) so in-process tests and a captured decode
     // graph pick the arm up at launch/capture time. The baseline path below
     // is untouched when the flag is absent.
+    // REPAIR-ROUND GATE FIX: the m==1 restriction must gate the WHOLE arm,
+    // not just the LDS fold. The first round gated only `gemv_fused`, so
+    // multi-row calls (the engine's m=39 PREFILL chunks) fell into the
+    // non-fused GEMV branch, whose kernels write row 0 only — rows 1..m-1
+    // of the output were left UNWRITTEN (stale memory) while every op-level
+    // test (all m==1) stayed green: the exact op-green/engine-garbage
+    // pattern of round 1, red-proven by the MULTI-M byte-identity case in
+    // tests/vt/test_rocm_quant_dot.cpp (canary-filled outputs).
     const char* mmvq_e = std::getenv("VT_GEMV_MMVQ");
     const bool gemv_mmvq =
-        mmvq_e != nullptr && mmvq_e[0] == '1' && mmvq_e[1] == '\0';
+        mmvq_e != nullptr && mmvq_e[0] == '1' && mmvq_e[1] == '\0' &&
+        m == 1;
     constexpr size_t kMmvqFoldLdsBytes = 32 * 1024;
+    // The fold trades the standalone quant launch for a PER-BLOCK redundant
+    // requant of the activation row, so its cost grows with the block count
+    // (n/4) while the launch it deletes costs a fixed few us. Measured
+    // crossover on gfx1100 at this model's shapes: fold WINS at n=320
+    // (grid 80: 135us vs 148us) and LOSES by n=2304 (grid 576: 159us vs
+    // 123us); at the lm_head class the fused arm ran 2.2-3.3x SLOWER than
+    // baseline while the non-fused arm runs 0.46-0.61x. Gate the fold to
+    // small rows only; everything else takes standalone quant + GEMV.
+    constexpr int64_t kMmvqFoldMaxRows = 512;
     const bool gemv_fused =
-        gemv_mmvq && m == 1 &&
+        gemv_mmvq && m == 1 && n <= kMmvqFoldMaxRows &&
         static_cast<size_t>(nsb) * sizeof(BlockQ8_K) <= kMmvqFoldLdsBytes;
 
     auto launch_mvq = [&](auto ot, BlockQ8_K* qact) {
