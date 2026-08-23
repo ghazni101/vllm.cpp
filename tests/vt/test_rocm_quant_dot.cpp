@@ -731,3 +731,79 @@ TEST_CASE("T4a repair-2 F2: FOLD-CROSSOVER WITNESS -- fused sub-branch only at n
   }
   gpu.DestroyQueue(gq);
 }
+
+// F3 (lever B1, GFX1100-TG200): the fold crossover becomes RUNTIME-TUNABLE
+// via VT_GEMV_MMVQ_FOLD_MAX (integer rows; default = kMmvqFoldMaxRowsDefault
+// = 512; invalid/empty = default). The suite constants above keep pinning
+// DEFAULT behavior; THIS case asserts the env actually moves ROUTING via the
+// same host-side dispatch counters:
+//   - unset  : n=256 folds, n=2304 does NOT   (default pinned)
+//   - "4096" : n=2304 FOLDS                   (knob widens the gate)  [RED pre-knob: env inert]
+//   - "128"  : n=256 does NOT fold            (knob narrows the gate) [RED pre-knob: env inert]
+//   - "256"  : n=256 still folds              (boundary is INCLUSIVE <=)
+//   - garbage: behaves exactly like unset     (invalid falls back to default)
+// RED-first contract: before the knob exists VT_GEMV_MMVQ_FOLD_MAX is
+// inert, so the "4096" and "128" legs fail while routing stays at defaults.
+namespace {
+struct FoldMaxGuard {
+  explicit FoldMaxGuard(const char* v) {
+    if (v != nullptr) ::setenv("VT_GEMV_MMVQ_FOLD_MAX", v, 1);
+    else ::unsetenv("VT_GEMV_MMVQ_FOLD_MAX");
+  }
+  ~FoldMaxGuard() { ::unsetenv("VT_GEMV_MMVQ_FOLD_MAX"); }
+};
+}  // namespace
+
+TEST_CASE("T4a lever-B1 F3: FOLD-MAX KNOB WITNESS -- VT_GEMV_MMVQ_FOLD_MAX moves routing at runtime; invalid values fall back to the default") {
+  if (!vt::rocm::DeviceAvailable()) {
+    MESSAGE("no AMD GPU on this host; ROCm keep-quant gate skipped");
+    return;
+  }
+  Backend& gpu = vt::GetBackend(DeviceType::kROCM);
+  Queue gq = gpu.CreateQueue();
+  const WeightCase& c = kKQuantCases[0];  // q4_K
+  const int64_t nsb = 10, k = nsb * c.block_elems;
+
+  struct Leg { const char* name; const char* fold_max; int64_t n;
+               long long want_fused, want_gemv, want_baseline; };
+  const Leg legs[] = {
+      {"unset    n=256  (default pins fold)",       nullptr,        256,  1, 0, 0},
+      {"unset    n=2304 (default pins non-fused)",  nullptr,        2304, 0, 1, 0},
+      {"4096     n=2304 (knob WIDENS -> fold)",     "4096",         2304, 1, 0, 0},
+      {"128      n=256  (knob NARROWS -> gemv)",    "128",          256,  0, 1, 0},
+      {"256      n=256  (boundary is inclusive)",   "256",          256,  1, 0, 0},
+      {"garbage  n=256  (invalid -> default fold)", "not-a-number", 256,  1, 0, 0},
+      {"garbage  n=2304 (invalid -> default gemv)", "not-a-number", 2304, 0, 1, 0},
+  };
+  for (const Leg& sc : legs) {
+    CAPTURE(sc.name);
+    std::vector<uint8_t> wq = RandomBlocks(c, sc.n * nsb, 0x5EEDU);
+    std::vector<float> a(static_cast<size_t>(k));
+    GenerateData(2.5F, a.size(), a.data());
+    void* d_a = gpu.Alloc(a.size() * sizeof(float));
+    void* d_w = gpu.Alloc(wq.size());
+    void* d_o = gpu.Alloc(sizeof(float) * static_cast<size_t>(sc.n));
+    gpu.Copy(gq, d_a, a.data(), a.size() * sizeof(float));
+    gpu.Copy(gq, d_w, wq.data(), wq.size());
+    {
+      EnvGuard on(true);
+      FoldMaxGuard fm(sc.fold_max);
+      vt::rocm::MmvqResetRouteCountsForTesting();
+      Tensor at = DevTensor(d_a, DType::kF32, {1, k});
+      Tensor bt = DevTensor(d_w, c.dtype, {sc.n, k});
+      Tensor ot = DevTensor(d_o, DType::kF32, {1, sc.n});
+      vt::MatmulBTQuant(gq, ot, at, bt);
+      gpu.Synchronize(gq);
+      const auto counts = vt::rocm::MmvqRouteCountsForTesting();
+      CHECK(counts.gemv_fused == sc.want_fused);
+      CHECK(counts.gemv_mmvq == sc.want_gemv);
+      CHECK(counts.baseline == sc.want_baseline);
+    }
+    ::unsetenv("VT_GEMV_MMVQ_FOLD_MAX");
+    ::unsetenv("VT_GEMV_MMVQ");
+    gpu.Free(d_a);
+    gpu.Free(d_w);
+    gpu.Free(d_o);
+  }
+  gpu.DestroyQueue(gq);
+}
