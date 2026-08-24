@@ -846,7 +846,7 @@ std::vector<unsigned char> RunNormQuantChain(Backend& gpu, Queue& gq,
                                              void* d_o, int64_t k, int64_t n) {
   std::vector<unsigned char> out_raw(sizeof(uint16_t) * static_cast<size_t>(n));
   Tensor xt = DevTensor(d_x, DType::kBF16, {1, k});
-  Tensor wt = DevTensor(d_nw, DType::kBF16, {1, k});
+  Tensor wt = DevTensor(d_nw, DType::kBF16, {k});
   void* d_norm = gpu.Alloc(sizeof(uint16_t) * static_cast<size_t>(k));
   Tensor nout = DevTensor(d_norm, DType::kBF16, {1, k});
   vt::RmsNorm(gq, nout, xt, wt, vt::RmsNormArgs{1e-6f, false});
@@ -909,7 +909,7 @@ TEST_CASE("Lever C red: VT_NORM_QUANT_FUSED=1 routes norm-produced activations t
     // run the chain twice manually to keep the same normalized buffer alive
     // across two consumers
     Tensor xt = DevTensor(d_a, DType::kBF16, {1, k});
-    Tensor wt = DevTensor(d_nw, DType::kBF16, {1, k});
+    Tensor wt = DevTensor(d_nw, DType::kBF16, {k});
     void* d_norm = gpu.Alloc(sizeof(uint16_t) * static_cast<size_t>(k));
     Tensor nout = DevTensor(d_norm, DType::kBF16, {1, k});
     vt::RmsNorm(gq, nout, xt, wt, vt::RmsNormArgs{1e-6f, false});
@@ -980,28 +980,55 @@ TEST_CASE("Lever C: fused norm-epilogue Q8_K scratch is BYTE-IDENTICAL to the st
       gpu.Copy(gq, d_a, abf.data(), abuf_bytes);
       gpu.Copy(gq, d_nw, nw.data(), nw.size() * 2);
 
-      // reference: standalone quantizer, row by row (its hook takes one row)
-      std::vector<unsigned char> ref(rowset.size() * nsb * kQ8KBytes);
-      for (size_t r = 0; r < rowset.size(); ++r) {
-        Tensor rt = DevTensor(static_cast<char*>(d_a) + r * static_cast<size_t>(k) * 2, DType::kBF16, {1, k});
-        vt::rocm::MmvqQuantScratchForTesting(gq, ref.data() + r * nsb * kQ8KBytes, rt, false);
-      }
-
-      // fused: producer-fused RmsNorm epilogue over all rows
+      // The fused epilogue quantizes the NORM'S OUTPUT rows, so the reference
+      // is the standalone quantizer over those SAME output rows: run the
+      // producer-fused RmsNorm first, then hook the standalone QuantizeQ8KK
+      // on the produced out tensor (device dst, copied back after).
+      void* d_out = gpu.Alloc(abuf_bytes);
       EnvNormQuantGuard on(true);
       vt::rocm::NormQuantResetForTesting();
       Tensor xt = DevTensor(d_a, DType::kBF16, {static_cast<int64_t>(rowset.size()), k});
-      Tensor wt = DevTensor(d_nw, DType::kBF16, {static_cast<int64_t>(rowset.size()), k});
-      void* d_out = gpu.Alloc(abuf_bytes);
+      Tensor wt = DevTensor(d_nw, DType::kBF16, {k});
       Tensor ot = DevTensor(d_out, DType::kBF16, {static_cast<int64_t>(rowset.size()), k});
       vt::RmsNorm(gq, ot, xt, wt, vt::RmsNormArgs{1e-6f, false});
       const void* scratch = vt::rocm::NormQuantLastScratchForTesting();
       REQUIRE(scratch != nullptr);
+
+      void* d_ref = gpu.Alloc(rowset.size() * static_cast<size_t>(nsb) * kQ8KBytes);
+      for (size_t r = 0; r < rowset.size(); ++r) {
+        Tensor rt = DevTensor(static_cast<char*>(d_out) + r * static_cast<size_t>(k) * 2, DType::kBF16, {1, k});
+        vt::rocm::MmvqQuantScratchForTesting(gq, static_cast<char*>(d_ref) + r * static_cast<size_t>(nsb) * kQ8KBytes, rt, false);
+      }
+
+      std::vector<unsigned char> ref(rowset.size() * nsb * kQ8KBytes);
+      gpu.Copy(gq, ref.data(), d_ref, ref.size());
       std::vector<unsigned char> got(rowset.size() * nsb * kQ8KBytes);
       gpu.Copy(gq, got.data(), scratch, got.size());
       gpu.Synchronize(gq);
-      gpu.Free(d_out);
+      gpu.Free(d_ref);
       CHECK(std::memcmp(got.data(), ref.data(), got.size()) == 0);
+      // HOST-ORACLE leg: vt::cpu::QuantizeRowQ8_K over the bf16-rounded norm
+      // outputs. The two GPU paths above share one device body, so a drift in
+      // that body moves BOTH identically -- this independent oracle is what
+      // actually pins the tie-break (lowest-index first occurrence) and the
+      // d-scale arithmetic down.
+      const auto from_float = vt::cpu::BlockFromFloat(DType::kQ8_K);
+      REQUIRE(from_float != nullptr);
+      std::vector<uint16_t> out_host(rowset.size() * static_cast<size_t>(k));
+      gpu.Copy(gq, out_host.data(), d_out, out_host.size() * 2);
+      gpu.Synchronize(gq);
+      for (size_t r = 0; r < rowset.size(); ++r) {
+        std::vector<float> xf(static_cast<size_t>(k));
+        for (int64_t j = 0; j < k; ++j)
+          xf[static_cast<size_t>(j)] =
+              vt::BF16ToF32(out_host[r * static_cast<size_t>(k) + static_cast<size_t>(j)]);
+        std::vector<unsigned char> want(nsb * kQ8KBytes);
+        from_float(xf.data(), want.data(), k);
+        CAPTURE(r);
+        CHECK(std::memcmp(got.data() + r * nsb * kQ8KBytes, want.data(),
+                          nsb * kQ8KBytes) == 0);
+      }
+      gpu.Free(d_out);
       gpu.Free(d_a);
       gpu.Free(d_nw);
     }
@@ -1040,7 +1067,7 @@ TEST_CASE("Lever C: a non-matching K-quant consumer invalidates the producer tok
   vt::rocm::NormQuantResetForTesting();
   // produce a token for d_a
   Tensor xt = DevTensor(d_a, DType::kBF16, {1, k});
-  Tensor wt = DevTensor(d_nw, DType::kBF16, {1, k});
+  Tensor wt = DevTensor(d_nw, DType::kBF16, {k});
   void* d_norm = gpu.Alloc(sizeof(uint16_t) * static_cast<size_t>(k));
   Tensor nout = DevTensor(d_norm, DType::kBF16, {1, k});
   vt::RmsNorm(gq, nout, xt, wt, vt::RmsNormArgs{1e-6f, false});
