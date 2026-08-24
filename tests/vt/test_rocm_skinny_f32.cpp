@@ -213,10 +213,13 @@ TEST_CASE("ROCm f32-out decode-skinny arm (VT_SKINNY_BF16=1): NMSE vs CPU oracle
 
     const ArmRun run = RunBothArms(gpu, gq, a, b, sc.m, sc.n, sc.k);
 
-    // Routing witness: OFF must never take the arm; ON takes exactly one of
-    // the two branches, and which one is decided by the shape gate alone.
-    CHECK(run.blas_delta == (sc.arm_serves ? 0 : 2));
-    CHECK(run.skinny_delta == (sc.arm_serves ? 2 : 0));
+    // Routing witness over the TWO dispatches (OFF then ON). The counters
+    // only track the bf16-in/f32-out population with M in [1,4]; inside it,
+    // OFF always routes to BLAS and ON's branch is decided by the shape gate
+    // alone; outside it (e.g. m=5) neither dispatch is counted.
+    const bool in_pop = sc.m <= 4;
+    CHECK(run.blas_delta == (in_pop ? 1 : 0) + (in_pop && !sc.arm_serves ? 1 : 0));
+    CHECK(run.skinny_delta == (sc.arm_serves ? 1 : 0));
 
     for (int arm = 0; arm < 2; ++arm) {
       CAPTURE(arm);
