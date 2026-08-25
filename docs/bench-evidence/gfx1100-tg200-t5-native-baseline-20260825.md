@@ -203,3 +203,25 @@ Near-tie adjudication: output diverges from the T6a stream at char 285
 another greedy tie flip, coherent prose both sides. Teacher-forced
 ceremony remains owed before default flips of the three opt-in arms
 (GQA4 / GDN_SCAN_COOP / PREAMBLE_COOP).
+
+## Session-close attribution (T6b config, rocpd 512 tokens)
+
+GPU busy **12.13 ms/tok** (wall ~13.1 = 76.6 tok/s); dispatch gap ~1 ms.
+Next-session starting table:
+
+| Kernel | ms/tok | note |
+|---|---|---|
+| wvSplitKSml<1,bf16> o_proj | 2.30 | 408 GB/s of ~598 peak; donor-tuned; near-roofline |
+| KQuantGemvMmvqK Li0 big-grid | 1.81 | 56.8us/call; dp4a-tuned; needs GEOMETRY rewrite (coalesced ki walk) not a load-policy tweak |
+| RmsNormRowKernel fused | 1.18 | epilogue residue: nsb threads still serial-ish per row |
+| GdnScanCoopK | 0.78 | was 1.46 pre-T6a |
+| KQuantGemmK lm_head class | ~1.17 total | large-grid GEMMs |
+| GdnPostConvChunkedK | 0.65 | |
+| GemvMmvq other grids | ~1.48 | |
+| QuantizeQ8KK standalone | 0.53 | post-T5a |
+
+Session ledger: baseline 49.97 -> 76.60 tok/s median (+53%). Adopted:
+T5a shared-quant-body vectorization (+23%), T5b d128 f32-Q DecodeGqa arm
+(+13.5%), T6a cooperative GDN scan (+4.6%), T6b cooperative attn preamble
+(+4.6%). Closed negative: T5c MMVQ nontemporal loads (wash, reverted).
+Failed-attempt count against the goal's cap: 1 of 10.
