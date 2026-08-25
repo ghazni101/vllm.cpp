@@ -163,3 +163,27 @@ rebuilt clean). The donor's policy does not transfer: the MMVQ row body is
 dp4a/reduction-latency bound, not L2-capacity bound. Next attack on this
 family would need a geometry change (row-per-wavefront coalesced ki walk),
 which is a rewrite, not a lever.
+
+## T6a result — cooperative GDN scan (VT_GDN_SCAN_COOP=1)
+
+Warp-per-row remap of GdnScanK (commit 640d9418): lanes walk ki coalesced,
+dots reduce through a fixed shfl_down tree, rows iterate warp-strided.
+Acceptance A/B interleaved x5:
+
+| Arm | warm runs | median |
+|---|---|---|
+| COOP=1 | 73.017, 73.061, 73.068, 71.863, 73.144 | **73.061** |
+| donor walk | 69.942, 66.846, 69.641, 69.823, 69.820 | 69.820 |
+
+COOP wins all five pairs, +4.6%. cross_device recurrence NMSE green under
+the flag (24/25; the one failure is the pre-existing native-build case).
+Near-tie adjudication: gate-prompt output diverges at char 204
+("Transformers process input..." vs baseline "it processes input...") — a
+greedy tie flip from the changed dot-reduction order; both streams are
+coherent analytic prose with identical structure. Full teacher-forced
+logprob-band ceremony owed before any default flip; until then the flag
+rides the campaign config.
+
+Position: **73.1 tok/s median** (13.7 ms/tok wall). Next budget:
+AttnQkNormRopeGateK (8 calls/tok @ 88us on one 256-thread block),
+RmsNormRow fused-epilogue residue (~18us x 65/tok), GemvMmvq geometry.
