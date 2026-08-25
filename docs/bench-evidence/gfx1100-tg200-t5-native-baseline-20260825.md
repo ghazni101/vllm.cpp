@@ -147,3 +147,19 @@ lever.
 Position after T5b: **69.8 tok/s median** (14.3 ms/tok) vs the 200 tok/s /
 5.00 ms/tok target. Next budget: GemvMmvq weight-streaming efficiency,
 GdnScan latency, RmsNorm epilogue residue (~18µs × 65/tok).
+
+## T5c — nontemporal weight loads in KQuantGemvMmvqRow: CLOSED NEGATIVE
+
+Hypothesis: the donor wvSplitKSml streams weights with
+__builtin_nontemporal_load; the MMVQ row body's memcpy weight loads might
+gain the same way (weights stream once per token). Implementation touched
+only load policy (Wq/Wh/W0-W2 nontemporal; shared activation q8 temporal);
+bit-exact by construction, test_rocm_quant_dot 12/12·797 green.
+
+Acceptance window x5 (same config as T5b ON): 69.358, 69.247, 67.775,
+69.294, 69.218 → median **69.294** vs T5b's 69.780 — no win (-0.7%,
+cross-window noise at best). REVERTED (byte-restored via git checkout,
+rebuilt clean). The donor's policy does not transfer: the MMVQ row body is
+dp4a/reduction-latency bound, not L2-capacity bound. Next attack on this
+family would need a geometry change (row-per-wavefront coalesced ki walk),
+which is a rewrite, not a lever.
