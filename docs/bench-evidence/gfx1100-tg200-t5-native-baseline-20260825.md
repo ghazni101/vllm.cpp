@@ -108,3 +108,42 @@ Acceptance workload, only `VT_NORM_QUANT_FUSED` varied, other levers ON:
 New position: **~61.6 tok/s median** (16.2 ms/tok) against the 200 tok/s /
 5.00 ms/tok target. Next attribution re-take prices what the ~3 ms/tok of
 killed pathology left at the top.
+
+## T5a re-attribution and T5b — the attention fallback
+
+Fresh rocpd capture at a5bfddb0 (512 tokens): GPU busy 15.21 ms/tok.
+Top items: wvSplitKSml bf16 o_proj 2.31 (408 GB/s ≈ 68% of the ~598 GB/s
+board peak with the donor-tuned split-K kernel — recorded near-roofline, no
+ceiling declared); PagedAttnOnlineIf 2.20; KQuantGemvMmvq Li0 big-grid 1.81
+(194 GB/s effective); GdnScanK 1.45.
+
+The attention item was NOT a kernel deficiency but a ROUTING hole: the GGUF
+dense path feeds f32 queries, which excludes every bf16 decode kernel, and
+the f32-Q DecodeGqa arm (T3a) hard-required d == 256 while this model has
+d == 128. T5b (`5b71c8a4`) adds the EPL=4 instantiation behind the existing
+opt-in `VT_ATTN_DECODE_GQA4=1`. 276µs/call of serial per-key __syncthreads
+walk replaced by the warp-strided geometry.
+
+## T5b result — acceptance A/B, interleaved x5 pairs
+
+| Arm | warm runs | median |
+|---|---|---|
+| GQA4=1 | 69.851, 69.902, 67.660, 69.764, 69.780 | **69.780** |
+| GQA4 unset | 61.519, 61.468, 61.475, 61.441, 60.661 | 61.468 |
+
+ON wins all five pairs, **+13.5% median**. Near-tie adjudication: the ON
+arm's 256-token gate-prompt output is BYTE-IDENTICAL to the original
+pre-campaign baseline output (cmp over completion bodies) — zero tie flips
+on this workload despite the reduction-order change. Owed before any
+DEFAULT flip of `VT_ATTN_DECODE_GQA4`: the full teacher-forced logprob-band
+ceremony per `.agents/specs/rocm-m4-oracle.md` on a gate model; until then
+the flag rides the campaign config like its siblings.
+
+Pre-existing-failure note: `test_gguf_keep_quant` (7 cases) and one
+`test_backend_cross_device` case fail identically on the pristine head
+without T5b — native-build configuration issues owned separately from this
+lever.
+
+Position after T5b: **69.8 tok/s median** (14.3 ms/tok) vs the 200 tok/s /
+5.00 ms/tok target. Next budget: GemvMmvq weight-streaming efficiency,
+GdnScan latency, RmsNorm epilogue residue (~18µs × 65/tok).
