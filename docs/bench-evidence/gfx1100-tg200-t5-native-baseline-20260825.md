@@ -187,3 +187,19 @@ rides the campaign config.
 Position: **73.1 tok/s median** (13.7 ms/tok wall). Next budget:
 AttnQkNormRopeGateK (8 calls/tok @ 88us on one 256-thread block),
 RmsNormRow fused-epilogue residue (~18us x 65/tok), GemvMmvq geometry.
+
+## T6b result — cooperative attention preamble (VT_ATTN_PREAMBLE_COOP=1)
+
+Warp-per-item remap of AttnQkNormRopeGateK. Acceptance A/B interleaved x5:
+
+| Arm | warm runs | median |
+|---|---|---|
+| COOP=1 | 76.667, 76.595, 76.396, 76.334, 76.204 | **76.595** |
+| donor walk | 73.220, 73.196, 73.176, 73.022, 73.205 | 73.196 |
+
+ON wins all five pairs, +4.6%. cross_device green under the flag.
+Near-tie adjudication: output diverges from the T6a stream at char 285
+("...mechanism to weigh the import..." vs "...to capture long-ran...") —
+another greedy tie flip, coherent prose both sides. Teacher-forced
+ceremony remains owed before default flips of the three opt-in arms
+(GQA4 / GDN_SCAN_COOP / PREAMBLE_COOP).
