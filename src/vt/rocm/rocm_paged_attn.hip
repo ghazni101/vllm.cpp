@@ -2155,23 +2155,33 @@ void PagedAttentionKernelRocm(Queue& q, Tensor& out, const Tensor& query, const 
   if (decode_opt && decode_gqa4_f32q && total_q <= hq &&
       query.dtype == DType::kF32 && out.dtype == DType::kF32 &&
       k_cache.dtype == DType::kBF16 && v_cache.dtype == DType::kBF16 &&
-      d == 256 && hq == 16 && num_kv_heads == 4) {
+      (d == 128 || d == 256) && hq == 16 && num_kv_heads == 4) {
     constexpr int kDecWarpsG = 8;
     constexpr int kQgG = 4;
-    const int nwarps = kDecWarpsG;
-    // Kernel smem layout (see PagedAttnDecodeGqaF32Q): o_sh[NWARPS*QG*d],
-    // m_sh[NWARPS*QG], l_sh[NWARPS*QG]. The formula must key on QG, not 2.
+    constexpr int kNwarpsG = kDecWarpsG;
+    // EPL = d / 32 lanes: 8 at head_dim 256 (the original TG150 arm), 4 at
+    // head_dim 128 (Qwen3-dense class, TG200). One kernel body; it
+    // self-guards d != EPL*32, so a wrong pairing exits without reading.
     const size_t smem = sizeof(float) *
-        (static_cast<size_t>(nwarps) * kQgG * static_cast<size_t>(d) +
-         2 * static_cast<size_t>(nwarps) * kQgG);
-    dim3 grid(static_cast<unsigned>(total_q), static_cast<unsigned>(num_kv_heads), 1);
-    dim3 block(static_cast<unsigned>(nwarps * 32));
-    PagedAttnDecodeGqaF32Q<4, 8, 8><<<grid, block, smem, st>>>(
-        out.Ptr<float>(), query.Ptr<float>(), k_cache.Ptr<__hip_bfloat16>(),
-        v_cache.Ptr<__hip_bfloat16>(), block_table.Ptr<int32_t>(), seq_lens.Ptr<int32_t>(),
-        query_start_loc.Ptr<int32_t>(), num_reqs, hq, num_kv_heads, d, block_size,
-        bt_row, bt_col, kc_blk, kc_pg, kc_hd, vc_blk, vc_pg, vc_hd, args.scale,
-        args.logits_soft_cap, args.causal, window_left, window_right);
+        (static_cast<size_t>(kNwarpsG) * kQgG * static_cast<size_t>(d) +
+         2 * static_cast<size_t>(kNwarpsG) * kQgG);
+    dim3 grid3(static_cast<unsigned>(total_q), static_cast<unsigned>(num_kv_heads), 1);
+    dim3 block3(static_cast<unsigned>(kNwarpsG * 32));
+    if (d == 128) {
+      PagedAttnDecodeGqaF32Q<kQgG, 4, kDecWarpsG><<<grid3, block3, smem, st>>>(
+          out.Ptr<float>(), query.Ptr<float>(), k_cache.Ptr<__hip_bfloat16>(),
+          v_cache.Ptr<__hip_bfloat16>(), block_table.Ptr<int32_t>(), seq_lens.Ptr<int32_t>(),
+          query_start_loc.Ptr<int32_t>(), num_reqs, hq, num_kv_heads, d, block_size,
+          bt_row, bt_col, kc_blk, kc_pg, kc_hd, vc_blk, vc_pg, vc_hd, args.scale,
+          args.logits_soft_cap, args.causal, window_left, window_right);
+    } else {
+      PagedAttnDecodeGqaF32Q<kQgG, 8, kDecWarpsG><<<grid3, block3, smem, st>>>(
+          out.Ptr<float>(), query.Ptr<float>(), k_cache.Ptr<__hip_bfloat16>(),
+          v_cache.Ptr<__hip_bfloat16>(), block_table.Ptr<int32_t>(), seq_lens.Ptr<int32_t>(),
+          query_start_loc.Ptr<int32_t>(), num_reqs, hq, num_kv_heads, d, block_size,
+          bt_row, bt_col, kc_blk, kc_pg, kc_hd, vc_blk, vc_pg, vc_hd, args.scale,
+          args.logits_soft_cap, args.causal, window_left, window_right);
+    }
     Check(hipGetLastError(), "paged_attention decode_gqa_f32q launch");
     return;
   }
