@@ -32,6 +32,7 @@
 #include "vt/quant.h"
 #include "vt/rocm/rocm_mmvq_policy.h"
 #include "vt/rocm/rocm_norm_quant_bridge.h"
+#include "vt/rocm/rocm_runtime.h"
 #include "vt/tensor.h"
 
 // Compile the exact scratch policy used by the HIP provider with host fakes.
