@@ -30,7 +30,6 @@
 #include <hip/hip_runtime.h>
 
 #include <cstdlib>
-#include <string>
 
 #include "vt/cpu/cpu_quant_blocks.h"
 #include "vt/rocm/rocm_act_quant.h"
@@ -81,8 +80,8 @@ __device__ inline float ResRound<__hip_bfloat16>(float v) {
 // the scratch is byte-identical to the standalone path by construction
 // (asserted in tests/vt/test_rocm_quant_dot.cpp). Requires nsb <= kBlock: one
 // thread per superblock within this single-row block.
-template <typename Tin, typename Tw, typename Tout, typename Tres>
-__global__ void RmsNormRowKernel(Tout* out, const Tin* x, const Tw* w, Tres* residual, int64_t h,
+template <typename Tin, typename Tout, typename Tres>
+__global__ void RmsNormRowKernel(Tout* out, const Tin* x, const Tin* w, Tres* residual, int64_t h,
                                  float eps, bool gemma, vt::cpu::BlockQ8_K* q8_out, int nsb,
                                  ActDT q8_adt) {
   const int64_t row = blockIdx.x;
@@ -150,11 +149,10 @@ __global__ void RmsNormRowKernel(Tout* out, const Tin* x, const Tw* w, Tres* res
 //      rule), iscale/DNearestInt/clamp arithmetic is verbatim, and bsums
 //      stay exact integer sums. Asserted against the standalone quantizer
 //      by the focused test under BOTH flag states.
-template <typename Tin, typename Tw, typename Tout, typename Tres>
-__global__ void RmsNormRowCoopKernel(Tout* out, const Tin* x, const Tw* w, Tres* residual,
+template <typename Tin, typename Tout, typename Tres>
+__global__ void RmsNormRowCoopKernel(Tout* out, const Tin* x, const Tin* w, Tres* residual,
                                      int64_t h, float eps, bool gemma,
-                                     vt::cpu::BlockQ8_K* q8_out, int nsb, ActDT q8_adt,
-                                     bool lds_quant) {
+                                     vt::cpu::BlockQ8_K* q8_out, int nsb, ActDT q8_adt) {
   const int64_t row = blockIdx.x;
   const int tid = static_cast<int>(threadIdx.x);
   const Tin* xrow = x + row * h;
@@ -166,8 +164,7 @@ __global__ void RmsNormRowCoopKernel(Tout* out, const Tin* x, const Tw* w, Tres*
   // Statically sized for the narrowest wavefront (32); kWaves is runtime.
   __shared__ float wave_mx[kBlock / 32];
   __shared__ float wave_amax[kBlock / 32];
-  extern __shared__ char dyn_smem[];
-  Tout* lds_out = reinterpret_cast<Tout*>(dyn_smem);
+
   const bool vec = sizeof(Tin) == 2 &&
                    (rrow == nullptr || sizeof(Tres) == 2) &&
                    (reinterpret_cast<uintptr_t>(xrow) & 15u) == 0 &&
@@ -281,18 +278,12 @@ __global__ void RmsNormRowCoopKernel(Tout* out, const Tin* x, const Tw* w, Tres*
         o.z = static_cast<unsigned>(ho[4]) | (static_cast<unsigned>(ho[5]) << 16);
         o.w = static_cast<unsigned>(ho[6]) | (static_cast<unsigned>(ho[7]) << 16);
         ov[j8 / 8] = o;
-        if (q8_out != nullptr && lds_quant) {
-#pragma unroll
-          for (int u = 0; u < 8; ++u)
-            *reinterpret_cast<uint16_t*>(lds_out + j8 + u) = ho[u];
-        }
       } else {
         for (int j = j8; j < j8 + elems; ++j) {
           const float v = rrow != nullptr ? Load(rrow, j) : Load(xrow, j);
           float wj = Load(w, j);
           if (gemma) wj += 1.0f;
           Store(orow, j, v * inv * wj);
-          if (q8_out != nullptr && lds_quant) lds_out[j] = static_cast<Tout>(v * inv * wj);
         }
       }
     }
@@ -302,7 +293,6 @@ __global__ void RmsNormRowCoopKernel(Tout* out, const Tin* x, const Tw* w, Tres*
       float wj = Load(w, j);
       if (gemma) wj += 1.0f;
       Store(orow, j, v * inv * wj);
-      if (q8_out != nullptr && lds_quant) lds_out[j] = static_cast<Tout>(v * inv * wj);
     }
   }
 
@@ -312,11 +302,9 @@ __global__ void RmsNormRowCoopKernel(Tout* out, const Tin* x, const Tw* w, Tres*
     __syncthreads();
     __shared__ int8_t sq[kQK_K];
     __shared__ float lead_mx, lead_iscale;
-    const void* quant_src = lds_quant ? static_cast<const void*>(lds_out)
-                                      : static_cast<const void*>(orow);
     for (int sb = 0; sb < nsb; ++sb) {
       vt::cpu::BlockQ8_K& y = q8_out[static_cast<int64_t>(row) * nsb + sb];
-      const float x = DLoadAct(quant_src, q8_adt, static_cast<int64_t>(sb) * kQK_K + tid);
+      const float x = DLoadAct(orow, q8_adt, static_cast<int64_t>(sb) * kQK_K + tid);
       float mx = x, amax = fabsf(x);
       for (int off = waveSz / 2; off > 0; off >>= 1) {
         const float ox = __shfl_down_sync(0xffffffffULL, mx, off);
@@ -361,7 +349,7 @@ __global__ void RmsNormRowCoopKernel(Tout* out, const Tin* x, const Tw* w, Tres*
   }
 }
 
-template <typename Tin, typename Tw, typename Tout>
+template <typename Tin, typename Tout>
 void LaunchRmsNormRes(hipStream_t s, Tensor& out, const Tensor& x, const Tensor& w,
                       const RmsNormArgs& args, Tensor* residual, unsigned rows, int64_t h,
                       vt::cpu::BlockQ8_K* q8_out) {
@@ -373,34 +361,26 @@ void LaunchRmsNormRes(hipStream_t s, Tensor& out, const Tensor& x, const Tensor&
   const bool coop = coop_e != nullptr && coop_e[0] == '1' && coop_e[1] == '\0' &&
                     h % kQK_K == 0 && h / kQK_K <= kBlock;
   if (coop) {
-    // T24: LDS-buffered quant epilogue (VT_RMSNORM_LDS_QUANT, default ON).
-    // Stores the normalized row to LDS during Pass 3 so the Q8_K quant
-    // epilogue reads from LDS instead of re-reading global memory.
-    const char* lds_e = std::getenv("VT_RMSNORM_LDS_QUANT");
-    const bool lds_quant =
-        lds_e == nullptr || lds_e[0] == '1';  // default ON when q8_out active
-    const size_t smem =
-        (q8_out != nullptr && lds_quant) ? static_cast<size_t>(h) * sizeof(Tout) : 0;
     if (residual != nullptr && residual->dtype == DType::kBF16) {
-      RmsNormRowCoopKernel<Tin, Tw, Tout, __hip_bfloat16><<<rows, kBlock, smem, s>>>(
-          out.Ptr<Tout>(), x.Ptr<Tin>(), w.Ptr<Tw>(), residual->Ptr<__hip_bfloat16>(), h,
-          args.eps, args.gemma, q8_out, nsb, ActDtOf(out.dtype), lds_quant);
+      RmsNormRowCoopKernel<Tin, Tout, __hip_bfloat16><<<rows, kBlock, 0, s>>>(
+          out.Ptr<Tout>(), x.Ptr<Tin>(), w.Ptr<Tin>(), residual->Ptr<__hip_bfloat16>(), h,
+          args.eps, args.gemma, q8_out, nsb, ActDtOf(out.dtype));
     } else {
       float* res = residual == nullptr ? nullptr : residual->Ptr<float>();
-      RmsNormRowCoopKernel<Tin, Tw, Tout, float><<<rows, kBlock, smem, s>>>(
-          out.Ptr<Tout>(), x.Ptr<Tin>(), w.Ptr<Tw>(), res, h, args.eps, args.gemma, q8_out,
-          nsb, ActDtOf(out.dtype), lds_quant);
+      RmsNormRowCoopKernel<Tin, Tout, float><<<rows, kBlock, 0, s>>>(
+          out.Ptr<Tout>(), x.Ptr<Tin>(), w.Ptr<Tin>(), res, h, args.eps, args.gemma, q8_out,
+          nsb, ActDtOf(out.dtype));
     }
     return;
   }
   if (residual != nullptr && residual->dtype == DType::kBF16) {
-    RmsNormRowKernel<Tin, Tw, Tout, __hip_bfloat16><<<rows, kBlock, 0, s>>>(
-        out.Ptr<Tout>(), x.Ptr<Tin>(), w.Ptr<Tw>(), residual->Ptr<__hip_bfloat16>(), h, args.eps,
+    RmsNormRowKernel<Tin, Tout, __hip_bfloat16><<<rows, kBlock, 0, s>>>(
+        out.Ptr<Tout>(), x.Ptr<Tin>(), w.Ptr<Tin>(), residual->Ptr<__hip_bfloat16>(), h, args.eps,
         args.gemma, q8_out, nsb, ActDtOf(out.dtype));
   } else {
     float* res = residual == nullptr ? nullptr : residual->Ptr<float>();
-    RmsNormRowKernel<Tin, Tw, Tout, float><<<rows, kBlock, 0, s>>>(
-        out.Ptr<Tout>(), x.Ptr<Tin>(), w.Ptr<Tw>(), res, h, args.eps, args.gemma, q8_out,
+    RmsNormRowKernel<Tin, Tout, float><<<rows, kBlock, 0, s>>>(
+        out.Ptr<Tout>(), x.Ptr<Tin>(), w.Ptr<Tin>(), res, h, args.eps, args.gemma, q8_out,
         nsb, ActDtOf(out.dtype));
   }
 }
@@ -419,7 +399,7 @@ vt::cpu::BlockQ8_K* NormQuantEpilogueFor(int64_t rows, int64_t h, hipStream_t s,
   return static_cast<vt::cpu::BlockQ8_K*>(NormQuantProducerScratch(*scratch_bytes, s));
 }
 
-template <typename Tin, typename Tw>
+template <typename Tin>
 void LaunchRmsNorm(hipStream_t s, Queue& q, Tensor& out, const Tensor& x, const Tensor& w,
                    const RmsNormArgs& args, Tensor* residual) {
   const int64_t t = x.shape[0], h = x.shape[1];
@@ -430,42 +410,16 @@ void LaunchRmsNorm(hipStream_t s, Queue& q, Tensor& out, const Tensor& x, const 
       NormQuantEpilogueFor(t, h, s, &q8_bytes);  // nullptr unless opt-in flag
   switch (out.dtype) {
     case DType::kF32:
-      LaunchRmsNormRes<Tin, Tw, float>(s, out, x, w, args, residual, rows, h, q8_out);
+      LaunchRmsNormRes<Tin, float>(s, out, x, w, args, residual, rows, h, q8_out);
       break;
     case DType::kBF16:
-      LaunchRmsNormRes<Tin, Tw, __hip_bfloat16>(s, out, x, w, args, residual, rows, h, q8_out);
+      LaunchRmsNormRes<Tin, __hip_bfloat16>(s, out, x, w, args, residual, rows, h, q8_out);
       break;
     default:
       VT_CHECK(false, "rocm rmsnorm: unsupported out dtype (f32/bf16 only)");
   }
   if (q8_out != nullptr) {
     NormQuantRecordProducer(out.data, t, h, /*row_stride=*/h, out.dtype, q8_out, s);
-  }
-}
-
-// The gamma's dtype is dispatched SEPARATELY from the activation's, mirroring
-// `DispatchRmsNormWeight` in cuda_ops.cu. The refusal that used to live in
-// `RmsNormKernelRocm` as `VT_CHECK(w.dtype == x.dtype)` is NARROWED here rather
-// than deleted: accepting a mismatch without retyping the kernel above would have
-// read a bf16 gamma through a `const float*` and run off the end of it. An
-// unsupported gamma dtype is still refused, and now says which one it got.
-template <typename Tin>
-void DispatchRmsNormWeight(hipStream_t s, Queue& q, Tensor& out, const Tensor& x, const Tensor& w,
-                           const RmsNormArgs& args, Tensor* residual) {
-  switch (w.dtype) {
-    case DType::kF32:
-      LaunchRmsNorm<Tin, float>(s, q, out, x, w, args, residual);
-      break;
-    case DType::kF16:
-      LaunchRmsNorm<Tin, __half>(s, q, out, x, w, args, residual);
-      break;
-    case DType::kBF16:
-      LaunchRmsNorm<Tin, __hip_bfloat16>(s, q, out, x, w, args, residual);
-      break;
-    default:
-      VT_CHECK(false, std::string("rocm rmsnorm: unsupported weight dtype "
-                                  "(f32/f16/bf16 only), got ") +
-                          Name(w.dtype));
   }
 }
 
@@ -506,13 +460,14 @@ void RmsNormKernelRocm(Queue& q,
  Tensor& out, const Tensor& x, const Tensor& w,
                        const RmsNormArgs& args, Tensor* residual) {
   EnsureQueueDevice(q);
+  VT_CHECK(w.dtype == x.dtype, "rocm rmsnorm: weight dtype must match x");
   hipStream_t s = static_cast<hipStream_t>(q.handle);
   switch (x.dtype) {
     case DType::kF32:
-      DispatchRmsNormWeight<float>(s, q, out, x, w, args, residual);
+      LaunchRmsNorm<float>(s, q, out, x, w, args, residual);
       break;
     case DType::kBF16:
-      DispatchRmsNormWeight<__hip_bfloat16>(s, q, out, x, w, args, residual);
+      LaunchRmsNorm<__hip_bfloat16>(s, q, out, x, w, args, residual);
       break;
     default:
       VT_CHECK(false, "rocm rmsnorm: unsupported input dtype (f32/bf16 only)");
