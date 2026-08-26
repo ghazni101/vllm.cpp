@@ -129,3 +129,26 @@ Three concrete sub-targets, ranked:
 3. **Small-copy storm**: dozens of 2-6 us copies behind 3-5 us host gaps
    ≈ 0.3-0.5 ms/tok aggregate — fold into the decode graph or batch the
    host API calls.
+
+## ISA verification: the dp4a core already uses RDNA3 hardware dot (2026-08-26)
+
+Question raised by the objective ("use the architecture fully"): does the
+repo's scalar `Dp4a` fallback (four int8 multiplies + adds,
+`rocm_grouped_gemm.hip:63`) actually lower to the hardware dot instruction
+on gfx1100, or is every quant kernel emulating it?
+
+Answer, by disassembling an `-O3 --offload-arch=gfx1100` compile of both
+forms: the scalar body AUTO-FORMS `v_dot4_i32_iu8` with
+`neg_lo:[1,1,0]` signedness handling — 12 instructions total for the whole
+test kernel. The explicit `__builtin_amdgcn_sdot4` intrinsic, by contrast,
+fails to compile unless the `dot1-insts` target feature is forced. So the
+idiom-recognition path is not just sufficient but the ONLY practical
+spelling, and every K-quant kernel (GemvMmvq family, grouped paths) already
+executes the hardware dot instruction per element group.
+
+Consequence for the ladder: the integer-dot core of the quant families has
+no instruction-selection headroom on this silicon. Combined with the
+78-88%-of-peak streaming audit, this closes the last speculative lever on
+the GemvMmvq/wvSplitK families at the ISA level — their remaining costs are
+memory-system physics, matching the T5c/T7 measurements. Future levers stay
+in the latency/fusion/dispatch classes named above.
