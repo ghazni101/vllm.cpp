@@ -171,3 +171,12 @@ OFF median **82.180** vs ON **82.897** tok/s — ON wins all five pairs,
 **+0.9%**, ALL PAIRS BYTE-IDENTICAL (argmax is bit-deterministic).
 T14's pending tok/s A/B is hereby CLOSED: adopted at +0.9% on top of the
 full stack. Session total with every lever enabled: ~92.8 tok/s canonical.
+
+## Host-contention isolation probe (same day): pinning does not recover it
+
+`taskset -c 16-31` on vllm-cli under load ~5.5 reads 48.1-59.4 (median
+53.8) — statistically identical to unpinned. The contention is HOST
+MEMORY BANDWIDTH from the sibling services' pinned-core workloads, not
+core competition; launch-bound decode cannot be isolated by core
+selection. Idle-host conditions remain the only valid state for absolute
+numbers.
