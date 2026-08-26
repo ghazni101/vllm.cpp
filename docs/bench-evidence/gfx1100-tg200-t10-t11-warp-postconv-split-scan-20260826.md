@@ -43,6 +43,25 @@ median**, zero output divergence.
 Full focused suite **15/15 cases, 826 assertions SUCCESS** including the
 new T10 COOP-vs-donor NMSE + flag-inertness case.
 
+## RETRACTION AND RE-MEASUREMENT STATUS (2026-08-26 later same day)
+
+The A/B numbers above are RETRACTED as invalid: post-hoc body inspection
+showed BOTH arms of the T11 section produced degenerate token loops ("A /
+A / newline repetition"), not coherent prose. Root cause found in T10's
+GdnPostConvWarpK: the conv row stride was computed `key_dim + value_dim`
+instead of the donor's `2*key_dim + value_dim` (layout [q|k|v]) — decode
+rows (tok=0) masked it, PREFILL rows (tok>=1) read wrong conv memory and
+poisoned the whole generation from step one. The claim "coherent prose
+both arms" was written without inspecting the bodies; the coherence-check
+rule exists precisely for this and was violated.
+
+Status after the fix (stride corrected, gate 15/15 x 826 green):
+- Engine-level re-measurement of T10 and T11 is OWED on a clean window
+  (co-tenant VRAM/load collisions invalidated two further attempts).
+- Until then the recorded position remains the T9 number: 77.7 tok/s
+  median. T10/T11 speed claims above are UNPROVEN; their kernels are
+  default-OFF and harmless, but must not be enabled until the re-run lands.
+
 ## Position
 
 **84.3 tok/s median** with both arms on (host load 2.5–3.7). Session

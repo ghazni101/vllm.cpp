@@ -213,7 +213,7 @@ __global__ void GdnPostConvWarpK(Tqkv* q_out, Tqkv* k_out, Tqkv* v_out,
   const int lane = static_cast<int>(threadIdx.x) & 31;
   const int64_t tok = item / slots;
   const int64_t slot = item % slots;
-  const int64_t row = tok * (key_dim + value_dim);
+  const int64_t row = tok * (2 * key_dim + value_dim);  // conv row: [q|k|v]
   if (slot < hk) {
     const int64_t head = slot;
     const Tconv* qin = conv + row + head * dk;
