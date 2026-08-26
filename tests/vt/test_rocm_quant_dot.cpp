@@ -1432,16 +1432,21 @@ TEST_CASE("T10 COOP postconv: output within ULP band of chunked donor kernel; fl
     const float c = vt::BF16ToF32(cv[i * 2] | (cv[i * 2 + 1] << 8));
     num += (p - c) * (p - c); den += p * p;
   }
-  [[maybe_unused]] bool gident = true;
+  // g/beta carry NO reduction-order change between the arms: they must be
+  // BYTE-IDENTICAL (a divergence means the arm never engaged or corrupted
+  // them). This is also what makes the nmse leg bite: q/k/v may move within
+  // bf16 rounding, but a stride-class layout bug moves them FAR outside the
+  // band -- the exact defect class this case exists to catch.
+  bool gident = true;
   for (size_t i = 0; i < pg.size(); ++i) {
-    if (pg[i] != cg[i]) gident = false;
-    num += (pg[i] - cg[i]) * (pg[i] - cg[i]);
-    den += pg[i] * pg[i];
+    if (pg[i] != cg[i] || pbe[i] != cbe[i]) gident = false;
+    num += (static_cast<double>(pg[i]) - cg[i]) * (pg[i] - cg[i]);
+    den += static_cast<double>(pg[i]) * pg[i];
     num += (pbe[i] - cbe[i]) * (pbe[i] - cbe[i]);
+    den += static_cast<double>(pbe[i]) * pbe[i];
   }
-  // Informational: bf16 rounding usually absorbs the f32-ULP shift, so a
-  // zero diff here does NOT mean the arm was inert. Engagement is recorded
-  // by the acceptance window's rocpd kernel symbol.
+  CAPTURE(gident);
+  CHECK(gident);
   CAPTURE(diff);
   const double nmse = den > 0 ? num / den : 0.0;
   CAPTURE(nmse);
