@@ -870,12 +870,19 @@ bool NormQuantTakeConsumer(const void* a_ptr, int64_t rows, int64_t h,
       g_nq_token.adt == adt &&
       g_nq_token.stream == static_cast<hipStream_t>(stream)) {
     *scratch_out = g_nq_token.scratch;
-    // token STAYS valid: the attn q/k/v matvecs consume ONE normalized row
-    // three times; only a non-matching consumer invalidates it.
+    // Token STAYS valid across non-matching consumers. The token records the
+    // PRODUCER's output pointer and scratch; a non-matching consumer reads a
+    // DIFFERENT activation buffer that cannot stale this token. The token is
+    // overwritten only when a new producer calls NormQuantRecordProducer.
+    // T22: the prior invalidation forced standalone QuantizeQ8KK launches
+    // when a non-matching GEMV (e.g. attn gate) queried between the norm
+    // producer and a matching GDN in_proj consumer that shares the normed
+    // hidden state — 3 redundant quants per layer at ~13.4 us each.
     g_nq_consumers_fused.fetch_add(1, std::memory_order_relaxed);
     return true;
   }
-  g_nq_valid = false;
+  // Do NOT invalidate: a non-matching consumer reads a different buffer and
+  // cannot stale this token. Only a new producer overwrites it.
   g_nq_consumers_standalone.fetch_add(1, std::memory_order_relaxed);
   return false;
 }

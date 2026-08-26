@@ -1036,7 +1036,7 @@ TEST_CASE("Lever C: fused norm-epilogue Q8_K scratch is BYTE-IDENTICAL to the st
   gpu.DestroyQueue(gq);
 }
 
-TEST_CASE("Lever C: a non-matching K-quant consumer invalidates the producer token (stale-scratch guard)") {
+TEST_CASE("Lever C: a non-matching K-quant consumer does NOT invalidate the producer token (T22)") {
   if (!vt::rocm::DeviceAvailable()) {
     MESSAGE("no AMD GPU on this host; ROCm keep-quant gate skipped");
     return;
@@ -1065,14 +1065,15 @@ TEST_CASE("Lever C: a non-matching K-quant consumer invalidates the producer tok
 
   EnvNormQuantGuard on(true);
   vt::rocm::NormQuantResetForTesting();
-  // produce a token for d_a
+  // produce a token for d_norm (the RmsNorm output of d_a)
   Tensor xt = DevTensor(d_a, DType::kBF16, {1, k});
   Tensor wt = DevTensor(d_nw, DType::kBF16, {k});
   void* d_norm = gpu.Alloc(sizeof(uint16_t) * static_cast<size_t>(k));
   Tensor nout = DevTensor(d_norm, DType::kBF16, {1, k});
   vt::RmsNorm(gq, nout, xt, wt, vt::RmsNormArgs{1e-6f, false});
-  // non-matching consumer (different ptr/shape): must take the standalone
-  // quant AND invalidate the token...
+  // non-matching consumer (different ptr/shape): goes standalone but does NOT
+  // invalidate the token. The token records d_norm's pointer; this consumer
+  // reads d_a2 — a completely different buffer that cannot stale d_norm.
   Tensor at2 = DevTensor(d_a2, DType::kBF16, {1, k2});
   Tensor bt2 = DevTensor(d_w2, DType::kQ4_K, {n, k2});
   Tensor oo = DevTensor(d_o, DType::kBF16, {1, n});
@@ -1082,14 +1083,17 @@ TEST_CASE("Lever C: a non-matching K-quant consumer invalidates the producer tok
   CHECK(c.producers == 1);
   CHECK(c.consumers_fused == 0);
   CHECK(c.consumers_standalone == 1);
-  // ...so even a shape-matching call on the OLD buffer now goes standalone
+  // The token SURVIVES: a shape-matching call on the SAME buffer (d_norm)
+  // still reuses the fused scratch. This is the T22 fix — the prior code
+  // invalidated the token on the non-matching query above, forcing this
+  // call to launch a redundant standalone QuantizeQ8KK.
   Tensor bt = DevTensor(d_w, DType::kQ4_K, {n, k});
   Tensor nout2 = DevTensor(d_norm, DType::kBF16, {1, k});
   vt::MatmulBTQuant(gq, oo, nout2, bt);
   gpu.Synchronize(gq);
   c = vt::rocm::NormQuantCountsForTesting();
-  CHECK(c.consumers_fused == 0);
-  CHECK(c.consumers_standalone == 2);
+  CHECK(c.consumers_fused == 1);
+  CHECK(c.consumers_standalone == 1);
   gpu.Free(d_norm);
   gpu.Free(d_a); gpu.Free(d_a2); gpu.Free(d_nw); gpu.Free(d_w); gpu.Free(d_w2); gpu.Free(d_o);
   gpu.DestroyQueue(gq);
