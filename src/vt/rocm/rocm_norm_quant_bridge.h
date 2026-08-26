@@ -12,10 +12,11 @@
 //   2. A MatmulBTQuant K-quant dispatch whose activation EXACTLY matches the
 //      recorded token (same device pointer, rows, row length, stride, input
 //      dtype) SKIPS its standalone QuantizeQ8KK launch and consumes the
-//      produced scratch. The token survives matching consumers (the model's
-//      attn q/k/v matvecs re-quantize ONE normalized row three times) and is
-//      INVALIDATED by any non-matching K-quant consumer, so a stale token can
-//      never serve a different buffer.
+//      produced scratch. The token survives ALL consumers (matching or not):
+//      a non-matching consumer reads a DIFFERENT buffer and cannot stale this
+//      token. The token is overwritten only when a new producer records. This
+//      lets the GDN in_proj_z/a/b consumers reuse the input_norm's fused quant
+//      even when the attn gate projection (different buffer) queries in between.
 //   Stream-ordering argument: producer and consumer are enqueued on one
 //   stream, and the epilogue quantizes the same global bf16 rows the
 //   standalone kernel would read, through the SAME shared QuantQ8KSBlock body
@@ -38,7 +39,7 @@ void NormQuantRecordProducer(const void* out_ptr, int64_t rows, int64_t h,
                              int64_t row_stride, DType adt, const void* scratch,
                              void* stream);
 // Consumer side: true + scratch when the activation matches the live token;
-// false otherwise (and any non-matching query invalidates the token).
+// false otherwise. The token is NOT invalidated by a non-matching query.
 bool NormQuantTakeConsumer(const void* a_ptr, int64_t rows, int64_t h,
                            int64_t row_stride, DType adt, void* stream,
                            const void** scratch_out);
