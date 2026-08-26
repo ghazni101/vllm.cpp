@@ -103,3 +103,29 @@ owes before any lever claim.
    then enable both flags in the campaign config, restore this file's
    numbers, and update the spec position. Otherwise revert both arms
    byte-restored and close per the T5c/T7 precedent.
+
+## Dispatch-gap refinement (memory-copy table + per-step sequence)
+
+The campaign-config capture contains ZERO D2H copies inside decode
+windows — the sampled-id handoff rides `__amd_rocclr_copyBuffer` KERNEL
+entries. Per-step anatomy at an Argmax boundary:
+
+| op | dur | gap before |
+|---|---|---|
+| ArgmaxK (greedy, [1, vocab] f32) | **153.96 us** | — |
+| rocclr_copyBuffer (sampled id D2H) | 3.2 | 8 |
+| — **stall** — | — | **289.4** |
+| rocclr_copyBuffer #2 (next-step setup) | 3.2 | 40 |
+| EmbeddingKernel | 2.9 | 14.6 |
+| ~dozens of state-update copyBuffers | 2-6 ea | 3-5 ea |
+
+Three concrete sub-targets, ranked:
+1. **Sampling round trip ~290 us/step**: host wakes on the D2H, processes
+   one token, issues the next step. On-device token feedback or a
+   one-step-deferred sync removes it.
+2. **ArgmaxK 154 us for a 993 KB row**: launch geometry walks the row
+   serially at batch 1 — same single-block class as T8/T9/T11 won on.
+   Expected floor ~5 us ⇒ ~0.15 ms/tok.
+3. **Small-copy storm**: dozens of 2-6 us copies behind 3-5 us host gaps
+   ≈ 0.3-0.5 ms/tok aggregate — fold into the decode graph or batch the
+   host API calls.
