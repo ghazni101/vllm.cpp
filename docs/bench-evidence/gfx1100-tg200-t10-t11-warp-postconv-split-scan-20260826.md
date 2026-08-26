@@ -109,3 +109,21 @@ alternative for a future session: one-step-deferred D2H inside
 LLLMEngine::step (double-buffer the sampled-id host read) so the sync loop
 overlaps detokenization with the next forward — no scheduler change, no
 server dependency.
+
+## Host-load sensitivity finding + T15 attempt closed negative (2026-08-26 later)
+
+A post-retraction rmsnorm_row "LDS epilogue" attempt (cache the rounded
+bf16 row in shared memory to skip the q8 epilogue's global re-read)
+measured a -38% REGRESSION on a clean GPU and was reverted byte-restored:
+the gmem re-read it removed was already L1-resident (~5 KB row), while the
+u16 LDS access pattern from consecutive lanes incurred heavy bank
+conflicts. Attempt recorded; lever closed.
+
+Separately, post-revert verification read 53-58 tok/s with BYTE-IDENTICAL
+code to the 92.9 tok/s window — root cause is HOST CPU contention (two
+sibling python processes at ~200% each plus a llama-server; load 4.9-5.7
+vs 2.5-3.7 in the fast window). Launch-bound decode scales with host
+scheduling quality. MEASUREMENT RULE ADDED: engine tok/s numbers are only
+comparable at recorded host load; future acceptance runs must log loadavg
+per rep (now done) and treat windows above load ~4 as provisional for
+absolute claims (paired A/Bs remain valid).
