@@ -275,3 +275,38 @@ family accounts for 6.33 ms/tok = 63% of wall.
 unpacks bf16→f32 then does 3 FLOPs per pair. RDNA3's v_dot2_f32_bf16
 does this in 1 instruction. If compute is the bottleneck at 57%
 bandwidth, dot2 should raise utilization toward 80-90%.
+
+## T17 v_dot2_f32_bf16 — CLOSED NOT-ADOPTED (2026-08-26, idle host load 0.55)
+
+### Hypothesis
+wvSplitKSml at 57% bandwidth utilization might be compute-bound. The inner
+loop does 599 v_mul_f32 + 1158 v_add_f32 = 1757 scalar f32 ops. RDNA3's
+v_dot2_f32_bf16 does a.x*b.x + a.y*b.y + c in 1 instruction, replacing 5
+ops per bf16x2 pair.
+
+### Implementation
+Env-gated VT_WVSPLIT_DOT2=1 selects the dot2 MAC path. ISA verified: 1120
+v_dot2_f32_bf16 instructions generated for the ON path. Kernel parameter
+threads the flag through WvSplitKBTDispatch.
+
+### A/B result (idle host, load 0.55, 5 paired runs)
+- OFF median: 88.784 tok/s
+- ON median: 88.897 tok/s (+0.13%, WASH)
+- All 5 pairs DIFFER (reduction order change)
+- Both outputs coherent analytic prose (207 vs 223 words, same topic)
+
+### Root cause: memory-bound, not compute-bound
+The kernel is memory-bound at 57% bandwidth. Compute is already fully
+hidden behind memory latency. Reducing compute instructions doesn't help
+when waiting for memory. Same lesson as T15.
+
+### Additional finding: runtime branch regression
+The OFF arm regressed from 100.4 → 88.8 tok/s (−12%) because the runtime
+branch in the inner loop increased code size and register pressure for
+both paths. Reverted; 100.47 tok/s confirmed restored post-revert.
+
+### Decision
+CLOSED not-adopted. The dot2 instruction is architecturally correct but
+targets the wrong bottleneck. To utilize dot2, the kernel would need to
+first become compute-bound (e.g., by increasing memory reuse or reducing
+memory traffic), which is a different optimization.
