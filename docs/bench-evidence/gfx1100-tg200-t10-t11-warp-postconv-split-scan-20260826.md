@@ -89,3 +89,17 @@ sampling/token feedback (the LAGUNA path already has
 of 10–16 µs repeat after the GemvMmvq→SiluMul boundary (~24/tok ≈ 0.3 ms
 aggregate). Numbers are trace-inflated; an untraced paired measurement
 owes before any lever claim.
+
+## Re-measurement decision rules (mechanical, applied to batch-final output)
+
+1. Every arm's body must pass the letter-density coherence probe AND read
+   as analytic prose on manual spot-check; an empty or degenerate body
+   voids the window.
+2. T11: all five pairs must be BYTE-IDENTICAL (bit-exactness is the
+   lever's design contract). Any divergence kills the split arm.
+3. T10: divergences are expected tie flips — record first-divergence byte
+   and confirm both streams coherent; teacher-forced ceremony stays owed.
+4. Adopt iff ON median beats OFF median with ON winning >= 4 of 5 pairs;
+   then enable both flags in the campaign config, restore this file's
+   numbers, and update the spec position. Otherwise revert both arms
+   byte-restored and close per the T5c/T7 precedent.
