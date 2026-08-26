@@ -263,11 +263,12 @@ __global__ void GdnPostConvWarpK(Tqkv* q_out, Tqkv* k_out, Tqkv* v_out,
 // T10 opt-in (read once per process like the sibling arms): warp-per-item
 // mapping. Default OFF keeps the chunked decomposition.
 inline bool GdnPostConvWarpEnabled() {
-  static const bool on = [] {
-    const char* e = std::getenv("VT_GDN_POSTCONV_COOP");
-    return e != nullptr && e[0] == '1' && e[1] == '\0';
-  }();
-  return on;
+  // Read PER CALL (unlike the chunked toggle's read-once): the focused test
+  // toggles the flag in-process between arms, and a once-per-process static
+  // made the ON arm silently reuse the donor -- the exact gate gap that let
+  // the T10 stride bug ship behind a green suite.
+  const char* e = std::getenv("VT_GDN_POSTCONV_COOP");
+  return e != nullptr && e[0] == '1' && e[1] == '\0';
 }
 
 }  // namespace
