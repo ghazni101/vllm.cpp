@@ -70,3 +70,22 @@ Adopted across sessions: T5a (+23%), T5b (+13.5%), T6a (+4.6%), T6b
 (+4.6%), T8 (+3.2%), T9 (+2.6%), T10 (+4.7%), T11 (+3.2%) — all paired,
 all coherence-checked. Closed negative/not-adopted: T5c, T7, T12.
 Failed-attempt ledger: 3 of 10.
+
+## Full-config verification (2026-08-26 late, clean GPU)
+
+With the sibling training finished (full VRAM), the complete eleven-flag
+config was verified end-to-end:
+- Graph replay ENGAGES with all new arms captured: "[DenseDecodeGraph]
+  captured ... S=1", "126 total replays" over 128 tokens — capture-safety
+  of every arm added this session is empirically confirmed.
+- Short prompt (~45 tok): warmup 89.5, steady **99.9/101.1 tok/s**.
+- Canonical 70-token prompt: warmup 84.3, steady **92.9/92.7 tok/s**,
+  coherent analytic output.
+
+Fresh rocpd budget at this config (8.89 ms/tok kernel busy): the three
+streaming families hold 6.33 ms/tok at their audited near-peak rates;
+every latency-class kernel added or remapped this session sits at
+0.02–0.75 ms/tok. Remaining non-kernel time ~1.9 ms/step decomposes into
+the ~290 us sampling round trip plus per-op launch gaps — T13 scope,
+requiring the async-serving engine path (the blocking CLI cannot engage
+AsyncScheduler), which is the next session's scoped item.
