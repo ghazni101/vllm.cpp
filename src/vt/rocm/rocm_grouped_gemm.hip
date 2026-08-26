@@ -395,6 +395,12 @@ __device__ inline void KQuantGemvMmvqRow(OutT* __restrict__ out,
         const int shift = (seg >> 1) * 4;
         const int hs = seg * 2;
         const int8_t* q8 = yb.qs + c * 32;
+        // 0x20202020 = 32 in each byte; used for Q6_K bias correction.
+        // amd_mixed_dot(char4,char4,...) forces v_dot4 instruction selection;
+        // the scalar Dp4a emulation does NOT auto-lower when the input comes
+        // from a shift+mask expression (compiler cannot prove 8-bit range).
+        static constexpr uint32_t kBias32Word = 0x20202020u;
+        const char* const kBias32 = reinterpret_cast<const char*>(&kBias32Word);
         int sub0 = 0, pre0 = 0, sub1 = 0, pre1 = 0;
 #pragma unroll
         for (int w = 0; w < 8; ++w) {
@@ -402,16 +408,16 @@ __device__ inline void KQuantGemvMmvqRow(OutT* __restrict__ out,
           memcpy(&Wq, ql + 4 * w, 4);
           memcpy(&Wh, qh + 4 * w, 4);
           memcpy(&W8, q8 + 4 * w, 4);
-          const uint32_t v =
+          uint32_t v =
               ((Wq >> shift) & 0x0F0F0F0Fu) |
               (((Wh >> hs) & 0x03030303u) << 4);
           // scales change every 16 elems: words 0-3 -> sc[2c], 4-7 -> sc[2c+1]
           if (w < 4) {
-            sub0 = Dp4a(static_cast<int>(v), static_cast<int>(W8), sub0);
-            pre0 = Dp4a(0x20202020, static_cast<int>(W8), pre0);
+            sub0 = amd_mixed_dot(*reinterpret_cast<char4*>(&v), *reinterpret_cast<char4*>(&W8), sub0, false);
+            pre0 = amd_mixed_dot(*reinterpret_cast<const char4*>(kBias32), *reinterpret_cast<char4*>(&W8), pre0, false);
           } else {
-            sub1 = Dp4a(static_cast<int>(v), static_cast<int>(W8), sub1);
-            pre1 = Dp4a(0x20202020, static_cast<int>(W8), pre1);
+            sub1 = amd_mixed_dot(*reinterpret_cast<char4*>(&v), *reinterpret_cast<char4*>(&W8), sub1, false);
+            pre1 = amd_mixed_dot(*reinterpret_cast<const char4*>(kBias32), *reinterpret_cast<char4*>(&W8), pre1, false);
           }
         }
         acc = static_cast<int>(sc[2 * c]) * (sub0 - pre0) +
@@ -448,7 +454,7 @@ __device__ inline void KQuantGemvMmvqRow(OutT* __restrict__ out,
             memcpy(&Wh, hm + 4 * w, 4);
             v |= ((Wh >> c) & 0x01010101u) << 4;
           }
-          sub = Dp4a(static_cast<int>(v), static_cast<int>(W8), sub);
+          sub = amd_mixed_dot(*reinterpret_cast<char4*>(&v), *reinterpret_cast<char4*>(&W8), sub, false);
         }
         acc = scale * sub;
         sumi_c = mn * (yb.bsums[2 * c] + yb.bsums[2 * c + 1]);
