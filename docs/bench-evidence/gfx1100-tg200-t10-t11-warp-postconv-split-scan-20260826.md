@@ -205,3 +205,27 @@ mechanisms, in preference order:
 Validation either way: body-content coherence per arm (the committed
 rule), engagement witness from rocpd kernel symbols, and paired deltas
 under matched host load recorded per rep.
+
+## T16 YTILE=4 ADOPTED (2026-08-26 ~18:37Z, watcher-fired sweep)
+
+The detached idle-sweep watcher fired when load dipped below 4. Paired
+A/B x5 through vllm-cli, full eleven-arm config:
+
+| Pair | base (YT=2) | yt4 (YT=4) | delta |
+|---|---|---|---|
+| 1 | 53.125 | 55.127 | +3.8% |
+| 2 | 52.950 | 54.276 | +2.5% |
+| 3 | 52.474 | 53.836 | +2.6% |
+| 4 | 52.485 | 53.597 | +2.1% |
+| 5 | 53.904 | 53.910 | +0.01% |
+
+ON wins 5/5. Base median 52.950, YT4 median 53.910 (+1.8%). Output
+BIT-IDENTICAL (separate coherence check, 128 tokens, seed 0). Decision
+rule (adopt iff ON wins >=4/5) satisfied. Default changed from YT=2 to
+YT=4 in WvCfg (rocm_skinny_gemm.hip:169). The f32-out B2 arm keeps
+donor geometry (kYtile=2) regardless, via the existing cfg.yt!=2 guard.
+Gate: 16/16, 839 assertions.
+
+Note: readings at ~53 tok/s reflect residual host memory-bandwidth
+contention despite load<4; the paired comparison remains valid under
+matched conditions per the measurement rule.
