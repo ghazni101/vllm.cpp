@@ -1456,3 +1456,89 @@ TEST_CASE("T10 COOP postconv: output within ULP band of chunked donor kernel; fl
   gpu.Free(d_q); gpu.Free(d_k); gpu.Free(d_v); gpu.Free(d_g); gpu.Free(d_be);
   gpu.DestroyQueue(gq);
 }
+
+// T14 (GFX1100-TG200): row-split greedy argmax (VT_ARGMAX_SPLIT=1). The
+// donor runs ONE block per row; the arm splits each row across 128 blocks
+// with a one-block final reduce. The (value, lower-index) comparator is
+// associative, so results are BIT-IDENTICAL for every input including
+// tied maxima -- asserted byte-level here over random and adversarial
+// tied-max rows at the engine's real vocab size, plus flag-inertness.
+TEST_CASE("T14 SPLIT argmax: BIT-IDENTICAL to donor incl. tied maxima; inert when unset") {
+  if (!vt::rocm::DeviceAvailable()) {
+    MESSAGE("no AMD GPU on this host; ROCm keep-quant gate skipped");
+    return;
+  }
+  Backend& gpu = vt::GetBackend(DeviceType::kROCM);
+  Queue gq = gpu.CreateQueue();
+  struct Case {
+    int64_t vocab;
+    const char* name;
+    bool tie_max_first_half;  // adversarial: equal maxima either side of center
+    bool all_equal;           // every element equal (global tie)
+  };
+  const std::vector<Case> cases = {
+      {248320, "engine vocab", false, false},
+      {248320, "engine vocab TIED-MAX", true, false},
+      {4096, "small TIED", true, false},
+      {1024, "ALL-EQUAL", false, true},
+  };
+  std::mt19937 rng(0x7F00U);
+  for (const Case& c : cases) {
+    CAPTURE(c.name);
+    std::vector<float> lg(c.vocab);
+    if (c.all_equal) {
+      std::fill(lg.begin(), lg.end(), 0.75F);
+    } else {
+      for (auto& v : lg) v = static_cast<float>(static_cast<int>(rng() % 2001) - 1000) / 500.0F;
+      if (c.tie_max_first_half) {
+        std::fill(lg.begin(), lg.end(), -1.0F);
+        lg[c.vocab / 4] = 9.5F;
+        lg[3 * c.vocab / 4] = 9.5F;  // later index must LOSE
+      }
+    }
+    void* d_l = gpu.Alloc(lg.size() * 4);
+    void* d_o1 = gpu.Alloc(8);
+    void* d_o2 = gpu.Alloc(8);
+    gpu.Copy(gq, d_l, lg.data(), lg.size() * 4);
+
+    auto run = [&](void* dst) {
+      Tensor lt = DevTensor(d_l, DType::kF32, {1, c.vocab});
+      Tensor ot = DevTensor(dst, DType::kI64, {1});
+      vt::GreedyArgmax(gq, ot, lt);
+      gpu.Synchronize(gq);
+    };
+    int64_t a = -1, b = -1;
+    {
+      ::unsetenv("VT_ARGMAX_SPLIT");
+      run(d_o1);
+      gpu.Copy(gq, &a, d_o1, 8);
+    }
+    {
+      ::setenv("VT_ARGMAX_SPLIT", "1", 1);
+      run(d_o2);
+      gpu.Copy(gq, &b, d_o2, 8);
+      ::unsetenv("VT_ARGMAX_SPLIT");
+    }
+    CAPTURE(a);
+    CAPTURE(b);
+    CHECK(a == b);
+    const bool in_range = a >= 0 && a < c.vocab;
+    CHECK(in_range);
+    // Expected winner under lowest-index tie-break:
+    int64_t want = 0;
+    if (c.all_equal) want = 0;
+    else if (c.tie_max_first_half) want = c.vocab / 4;
+    else {
+      float best = lg[0];
+      for (int64_t i = 1; i < c.vocab; ++i) {
+        float v = lg[static_cast<size_t>(i)];
+        if (v > best) { best = v; want = i; }
+        else if (v == best && i < want) { want = i; }
+      }
+    }
+    CAPTURE(want);
+    CHECK(a == want);
+    gpu.Free(d_l); gpu.Free(d_o1); gpu.Free(d_o2);
+  }
+  gpu.DestroyQueue(gq);
+}
