@@ -127,3 +127,25 @@ scheduling quality. MEASUREMENT RULE ADDED: engine tok/s numbers are only
 comparable at recorded host load; future acceptance runs must log loadavg
 per rep (now done) and treat windows above load ~4 as provisional for
 absolute claims (paired A/Bs remain valid).
+
+## CORRECTION: wvSplitKSml per-site rates (position-resolved, same capture)
+
+The earlier "~700 GB/s aggregate" read blended three distinct sites. With
+each call assigned to its step position across 505 steady steps (72
+calls/step = 24 GDN layers x 3 projections), the durations are cleanly
+periodic:
+
+| pos%3 | tensor | bytes/call | median us | GB/s |
+|---|---|---|---|---|
+| 0 | attn_qkv [4096,2560] | 20.97 MB | 46.00 | **456** |
+| 1 | attn_gate [4096,2560] | 10.49 MB | 23.72 | **442** |
+| 2 | ssm_out [2048x? class] | 10.49 MB | 26.52 | **396** |
+
+(The prior "700 GB/s aggregate" and "911 GB/s on qkv" figures used wrong
+byte assignments.) The family therefore HAS headroom: ~0.45-0.6 ms/tok to
+a ~550-600 GB/s practical target. The launches are donor-tuned via
+`mindiv(N, cu*kYtile, kWvPrGrp)` for other shape classes; a per-shape
+launch-config sweep (kYtile/wvPrGrp/split factor) on gfx1100 for exactly
+these three (N,K) shapes is the concrete next lever, priced at up to
+~+0.5 ms/tok. ArgmaxSplitPhaseA (34 us) and the two-phase argmax total
+44.7 us are separate items already recorded.
