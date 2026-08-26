@@ -55,3 +55,18 @@ QuantizeQ8KK standalone elimination (~0.48 ms/tok), dispatch-gap audit
 (~up to 1.0), rmsnorm_row second pass (+0.38). Streaming families
 (GemvMmvq/wvSplitKSml) are at 75–95% of peak per the corrected byte
 audit — micro-tuning only.
+
+## Dispatch-gap audit (T13 target definition, same-day)
+
+Argmax-delimited decode-step analysis over the campaign-config capture
+(`cap-t1011`): 503 steady-state steps average **span 10.84 ms**, kernel
+busy 9.00 ms ⇒ **~1.83 ms/step non-kernel time** under trace. Largest
+single stalls cluster around the per-token sampling round trip:
+`__amd_rocclr_copyBuffer` pairs flanking `EmbeddingErr` carry idles of
+302/80/62 µs — the argmax-result D2H copy serializing each step against
+the host before the next embedding fill. Candidate lever: on-device
+sampling/token feedback (the LAGUNA path already has
+`VT_LAGUNA_ONDEV_SAMPLE`; the main GDN path does not). Second-order gaps
+of 10–16 µs repeat after the GemvMmvq→SiluMul boundary (~24/tok ≈ 0.3 ms
+aggregate). Numbers are trace-inflated; an untraced paired measurement
+owes before any lever claim.
