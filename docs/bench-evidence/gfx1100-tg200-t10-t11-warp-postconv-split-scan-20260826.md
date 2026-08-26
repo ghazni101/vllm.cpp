@@ -229,3 +229,49 @@ Gate: 16/16, 839 assertions.
 Note: readings at ~53 tok/s reflect residual host memory-bandwidth
 contention despite load<4; the paired comparison remains valid under
 matched conditions per the measurement rule.
+
+## IDLE-WINDOW ACCEPTANCE GATE + T13 + COPY-STORM ATTRIBUTION (2026-08-26 ~18:55Z)
+
+### Acceptance gate rerun (load 1.45-2.20, idle host)
+
+Full 12-lever config (YT4 now default), 6 reps, 256 tokens, seed 0:
+- Run 1 (warmup): 90.197 tok/s
+- Runs 2-6: 100.534, 100.482, 100.462, 100.392, 100.407
+- **Median: 100.46 tok/s** (runs 2-6, warmup discarded)
+
+Crossing the 100 tok/s milestone. The YT4 adoption contributes more
+under unconstrained memory bandwidth than the contended paired sweep
+showed (+1.8% under load → +8.1% idle: 92.8 → 100.4).
+
+### T13 async-runner paired A/B (idle host, load 1.45)
+
+OFF median 89.984 vs ON 89.819 (−0.18%, WASH). All 5 pairs byte-identical.
+Confirms: the CLI sync loop drains depth-1 regardless of
+VT_ASYNC_RUNNER; the batch-queue pipelining only engages under
+AsyncScheduler (serving mode). T13 CLOSED for the CLI path.
+
+### Copy-storm attribution (rocprofv3 trace, 64 tokens)
+
+318 memory copies total, ALL >64KB. Per-step small copies (160KB×2 +
+64KB×1 + 1.4MB every 4 steps) total ~734KB/step at ~35µs/step = **0.035
+ms/tok — NEGLIGIBLE**. The large copies (33MB×76, 20MB×48, etc.) are
+model-loading artifacts, not steady-state decode. The "small copy storm"
+is CLOSED as a lever — it was a profiling artifact of aggregate counting.
+
+### Roofline analysis
+
+Model: 2.74 GB. At 800 GB/s effective, minimum weight read = 3.43 ms/tok.
+At 200 tok/s (5.0 ms/tok), leaves 1.57 ms for all compute + attention +
+dispatch. Current kernel budget: 8.89 ms/tok (2.6x minimum). The GEMV/GEMM
+family accounts for 6.33 ms/tok = 63% of wall.
+
+| Kernel | ms/tok | % of roofline | headroom |
+|---|---|---|---|
+| KQuantGemvMmvqK<Q4_K> | 2.76 | 78-88% | limited |
+| wvSplitKSml<1,4,bf16> | 2.30 | ~57% | **significant** |
+| KQuantGemvMmvqK<Q6_K> | 1.27 | ~85% | limited |
+
+**Next attack: wvSplitKSml compute-memory balance.** The inner loop
+unpacks bf16→f32 then does 3 FLOPs per pair. RDNA3's v_dot2_f32_bf16
+does this in 1 instruction. If compute is the bottleneck at 57%
+bandwidth, dot2 should raise utilization toward 80-90%.
