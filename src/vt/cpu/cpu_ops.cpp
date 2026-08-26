@@ -3354,6 +3354,24 @@ void CastF32Kernel(Queue&, Tensor& out, const Tensor& in) {
   });
 }
 
+// T25: Permute V-heads from grouped (k*rpk+r) to tiled (r*num_k+k) order.
+void PermuteVHeadsKernel(Queue&, Tensor& out, const Tensor& in,
+                         int64_t T, int64_t num_k, int64_t rpk, int64_t dv) {
+  const int64_t value_dim = num_k * rpk * dv;
+  auto* out_p = out.Ptr<uint16_t>();
+  const auto* in_p = in.Ptr<uint16_t>();
+  for (int64_t row = 0; row < T; ++row) {
+    for (int64_t t = 0; t < num_k * rpk; ++t) {
+      const int64_t r = t / num_k;
+      const int64_t k = t % num_k;
+      const int64_t g = k * rpk + r;
+      for (int64_t h = 0; h < dv; ++h)
+        out_p[row * value_dim + t * dv + h] =
+            in_p[row * value_dim + g * dv + h];
+    }
+  }
+}
+
 // x[m,n] *= col[n]; x f32 OR bf16 [M,N] (inner-contiguous rows, row stride
 // x.stride[0]), col always f32 [N]. CPU sibling of the CUDA MulColVecF32 kernel,
 // and the portable reference every other backend ports FROM — so it carries the
@@ -3766,6 +3784,9 @@ struct Registrar {
     RegisterOp(OpId::kDFlashBlockAttention, DeviceType::kCPU,
                reinterpret_cast<void*>(
                    static_cast<DFlashBlockAttentionFn>(&DFlashBlockAttentionKernel)));
+    RegisterOp(OpId::kPermuteVHeads, DeviceType::kCPU,
+               reinterpret_cast<void*>(
+                   static_cast<PermuteVHeadsFn>(&PermuteVHeadsKernel)));
     RegisterOp(OpId::kDFlashPagedBlockAttention, DeviceType::kCPU,
                reinterpret_cast<void*>(
                    static_cast<DFlashPagedBlockAttentionFn>(&DFlashPagedBlockAttentionKernel)));
