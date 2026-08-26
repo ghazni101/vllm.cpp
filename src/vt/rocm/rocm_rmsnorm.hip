@@ -152,7 +152,8 @@ __global__ void RmsNormRowKernel(Tout* out, const Tin* x, const Tin* w, Tres* re
 template <typename Tin, typename Tout, typename Tres>
 __global__ void RmsNormRowCoopKernel(Tout* out, const Tin* x, const Tin* w, Tres* residual,
                                      int64_t h, float eps, bool gemma,
-                                     vt::cpu::BlockQ8_K* q8_out, int nsb, ActDT q8_adt) {
+                                     vt::cpu::BlockQ8_K* q8_out, int nsb, ActDT q8_adt,
+                                     bool lds_quant) {
   const int64_t row = blockIdx.x;
   const int tid = static_cast<int>(threadIdx.x);
   const Tin* xrow = x + row * h;
@@ -164,7 +165,8 @@ __global__ void RmsNormRowCoopKernel(Tout* out, const Tin* x, const Tin* w, Tres
   // Statically sized for the narrowest wavefront (32); kWaves is runtime.
   __shared__ float wave_mx[kBlock / 32];
   __shared__ float wave_amax[kBlock / 32];
-
+  extern __shared__ char dyn_smem[];
+  Tout* lds_out = reinterpret_cast<Tout*>(dyn_smem);
   const bool vec = sizeof(Tin) == 2 &&
                    (rrow == nullptr || sizeof(Tres) == 2) &&
                    (reinterpret_cast<uintptr_t>(xrow) & 15u) == 0 &&
@@ -278,12 +280,18 @@ __global__ void RmsNormRowCoopKernel(Tout* out, const Tin* x, const Tin* w, Tres
         o.z = static_cast<unsigned>(ho[4]) | (static_cast<unsigned>(ho[5]) << 16);
         o.w = static_cast<unsigned>(ho[6]) | (static_cast<unsigned>(ho[7]) << 16);
         ov[j8 / 8] = o;
+        if (q8_out != nullptr && lds_quant) {
+#pragma unroll
+          for (int u = 0; u < 8; ++u)
+            *reinterpret_cast<uint16_t*>(lds_out + j8 + u) = ho[u];
+        }
       } else {
         for (int j = j8; j < j8 + elems; ++j) {
           const float v = rrow != nullptr ? Load(rrow, j) : Load(xrow, j);
           float wj = Load(w, j);
           if (gemma) wj += 1.0f;
           Store(orow, j, v * inv * wj);
+          if (q8_out != nullptr && lds_quant) lds_out[j] = static_cast<Tout>(v * inv * wj);
         }
       }
     }
@@ -293,6 +301,7 @@ __global__ void RmsNormRowCoopKernel(Tout* out, const Tin* x, const Tin* w, Tres
       float wj = Load(w, j);
       if (gemma) wj += 1.0f;
       Store(orow, j, v * inv * wj);
+      if (q8_out != nullptr && lds_quant) lds_out[j] = static_cast<Tout>(v * inv * wj);
     }
   }
 
@@ -302,9 +311,11 @@ __global__ void RmsNormRowCoopKernel(Tout* out, const Tin* x, const Tin* w, Tres
     __syncthreads();
     __shared__ int8_t sq[kQK_K];
     __shared__ float lead_mx, lead_iscale;
+    const void* quant_src = lds_quant ? static_cast<const void*>(lds_out)
+                                      : static_cast<const void*>(orow);
     for (int sb = 0; sb < nsb; ++sb) {
       vt::cpu::BlockQ8_K& y = q8_out[static_cast<int64_t>(row) * nsb + sb];
-      const float x = DLoadAct(orow, q8_adt, static_cast<int64_t>(sb) * kQK_K + tid);
+      const float x = DLoadAct(quant_src, q8_adt, static_cast<int64_t>(sb) * kQK_K + tid);
       float mx = x, amax = fabsf(x);
       for (int off = waveSz / 2; off > 0; off >>= 1) {
         const float ox = __shfl_down_sync(0xffffffffULL, mx, off);
@@ -361,15 +372,23 @@ void LaunchRmsNormRes(hipStream_t s, Tensor& out, const Tensor& x, const Tensor&
   const bool coop = coop_e != nullptr && coop_e[0] == '1' && coop_e[1] == '\0' &&
                     h % kQK_K == 0 && h / kQK_K <= kBlock;
   if (coop) {
+    // T24: LDS-buffered quant epilogue (VT_RMSNORM_LDS_QUANT, default ON).
+    // Stores the normalized row to LDS during Pass 3 so the Q8_K quant
+    // epilogue reads from LDS instead of re-reading global memory.
+    const char* lds_e = std::getenv("VT_RMSNORM_LDS_QUANT");
+    const bool lds_quant =
+        lds_e == nullptr || lds_e[0] == '1';  // default ON when q8_out active
+    const size_t smem =
+        (q8_out != nullptr && lds_quant) ? static_cast<size_t>(h) * sizeof(Tout) : 0;
     if (residual != nullptr && residual->dtype == DType::kBF16) {
-      RmsNormRowCoopKernel<Tin, Tout, __hip_bfloat16><<<rows, kBlock, 0, s>>>(
+      RmsNormRowCoopKernel<Tin, Tout, __hip_bfloat16><<<rows, kBlock, smem, s>>>(
           out.Ptr<Tout>(), x.Ptr<Tin>(), w.Ptr<Tin>(), residual->Ptr<__hip_bfloat16>(), h,
-          args.eps, args.gemma, q8_out, nsb, ActDtOf(out.dtype));
+          args.eps, args.gemma, q8_out, nsb, ActDtOf(out.dtype), lds_quant);
     } else {
       float* res = residual == nullptr ? nullptr : residual->Ptr<float>();
-      RmsNormRowCoopKernel<Tin, Tout, float><<<rows, kBlock, 0, s>>>(
+      RmsNormRowCoopKernel<Tin, Tout, float><<<rows, kBlock, smem, s>>>(
           out.Ptr<Tout>(), x.Ptr<Tin>(), w.Ptr<Tin>(), res, h, args.eps, args.gemma, q8_out,
-          nsb, ActDtOf(out.dtype));
+          nsb, ActDtOf(out.dtype), lds_quant);
     }
     return;
   }
