@@ -163,3 +163,11 @@ conclusive under contention. Knob kept default-OFF-equivalent (env unset
 = donor config); idle-host re-sweep owed before any adoption. The
 position-resolved audit's ~0.45-0.6 ms/tok headroom estimate stands;
 the sweep so far captured only a fraction of it.
+
+## T14 stacked engine A/B result (2026-08-26 ~10:41Z, same window)
+
+The watcher run's chain included the T14 arms stacked on T10+T11:
+OFF median **82.180** vs ON **82.897** tok/s — ON wins all five pairs,
+**+0.9%**, ALL PAIRS BYTE-IDENTICAL (argmax is bit-deterministic).
+T14's pending tok/s A/B is hereby CLOSED: adopted at +0.9% on top of the
+full stack. Session total with every lever enabled: ~92.8 tok/s canonical.
