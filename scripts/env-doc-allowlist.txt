@@ -1,19 +1,21 @@
 VLLM_CPP_QWEN3_DENSE_DECODE_GRAPH
 VLLM_GEMMA4_MM_DEBUG
 VLLM_MM_TOWER_PROFILE
-VT_ACT_F32
 VT_ARCH_TACTIC_STATS
 VT_ASYNC_EXECUTOR_NO_DBUF
 VT_ASYNC_EXECUTOR_POISON
 VT_ASYNC_EXECUTOR_TRACE
 VT_ATTN_DECODE_D128
 VT_ATTN_DECODE_GQA
+VT_ATTN_DECODE_GQA4
 VT_ATTN_DECODE_OPT
 VT_ATTN_FLASH2
 VT_ATTN_GQA
+VT_ATTN_PREAMBLE_COOP
 VT_ATTN_PREFILL_BM
 VT_ATTN_PREFILL_NOSYNC
 VT_ATTN_PREFILL_VEC
+VT_ATTN_SELECT_LOG
 VT_ATTN_WMMA
 VT_BF16_GEMM_OUT
 VT_BF16_RESIDUAL
@@ -26,10 +28,9 @@ VT_DEEPSEEK_GRAPH_VERIFY
 VT_DENSE_CUBLASLT_FP8
 VT_DENSE_NATIVE
 VT_DIRECT_DEVICE_LOAD
-VT_DSV4_EXL3_MOE_TRACE
 VT_DUMP_ACT
-VT_EXL3_GEMV
-VT_EXL3_GEMV_SMEM
+VT_DUMP_ACT_SUB
+VT_DUMP_ATTN
 VT_FA2_DECODE_35B
 VT_FA2_DECODE_QWEN3
 VT_FA2_NSPLITS_CAP
@@ -85,6 +86,7 @@ VT_GDN_MERGED_QKVZ
 VT_GDN_MERGED_QKVZ_FP8
 VT_GDN_NORMGATED_COOP
 VT_GDN_OCC_BLOCK
+VT_GDN_POSTCONV_COOP
 VT_GDN_OUT_FP8_FUSE
 VT_GDN_PACKED_DECODE_FP8_TOWER
 VT_GDN_PACKED_DECODE_TRITON
@@ -92,6 +94,8 @@ VT_GDN_PACKED_REG_TILE
 VT_GDN_POSTCONV_FAST
 VT_GDN_POSTCONV_SPLIT
 VT_GDN_POSTCONV_TOKEN_TILE
+VT_GDN_SCAN_COOP
+VT_GDN_SCAN_SPLIT
 VT_GDN_SLACK_MEMSET
 VT_GDN_STATE_BF16
 VT_GDN_TILE_PIPE
@@ -113,6 +117,8 @@ VT_GEMMA4_HOST_AXPY
 VT_GEMMA4_PROFILE
 VT_GEMM_ALGO_LOG
 VT_GEMM_PLAN_CACHE
+VT_GEMV_MMVQ
+VT_GEMV_MMVQ_FOLD_MAX
 VT_GGUF_GDN_NK
 VT_GGUF_NO_SPLIT
 VT_GGUF_RELEASE_PAGES
@@ -121,7 +127,6 @@ VT_GLUE_FUSE
 VT_INTERNLM2_WRONG_SPLIT
 VT_KDA_CHUNK_TRITON
 VT_KV_ALLOC_LOG
-VT_ATTN_SELECT_LOG
 VT_LAGUNA_DECODE_GRAPH
 VT_LAGUNA_FAST_NORM
 VT_LAGUNA_GLUE_FUSED
@@ -155,10 +160,10 @@ VT_MOE_FUSED_W13
 VT_MOE_GLUE_FUSE
 VT_MOE_HOST_FREE
 VT_MOE_PAD_STATS
-VT_MOE_SEL_FP
 VT_MOE_SHARED_AUX_STREAM
 VT_MOE_SHARED_AUX_THRESHOLD
 VT_MOE_SPLIT_K
+VT_NORM_QUANT_FUSED
 VT_NVFP4_CUTLASS
 VT_NVFP4_FP4_GEMV
 VT_NVFP4_FP4_NATIVE
@@ -167,8 +172,6 @@ VT_NVFP4_WMMA
 VT_PAGED_FLASH
 VT_POOL_EXACT
 VT_POOL_STATS
-VT_Q4EXP_LAYER_FP
-VT_Q4EXP_STATE_FP
 VT_QWEN35_GROUPED_MOE
 VT_QWEN3MOE_CUDAGRAPH
 VT_QWEN3_ATTN_F32
@@ -182,13 +185,9 @@ VT_ROCM_GDN_POSTCONV_CHUNK
 VT_ROCM_GEMM_COMPUTE
 VT_ROCM_GEMV
 VT_ROCM_HIPBLASLT
-VT_ROCM_LT_ALGO
-VT_ROCM_MANAGED_ALLOC
-VT_ROCM_Q6K_SMALL_PRIVATE
-VT_ROCM_SPLIT_N
-VT_ROCM_WMMA_GEMM
 VT_ROCM_SKINNY
 VT_SILU_FP4_FAST
+VT_SKINNY_BF16
 VT_SPEC_TEST_SELECT_SPIN_MS
 VT_SPEC_TRACE
 VT_SWIZZLE_IN_QUANT
@@ -223,31 +222,3 @@ VT_V4_RESIDENT_W
 VT_V4_ROPE_FLOAT
 VT_V4_ROUTE_WARP_TOPK
 VT_W4A4_TRUE
-# (VT_ASYNC_EXECUTOR_TRACE). Never set in production.
-# Gemma-4 MoE expert-execution tuning (#154, gemma4_moe.cpp / gemma4.cpp). Each
-# Inherited ROCm/Gemma-4 bring-up tactics. These are default-off diagnostic,
-# Kernel-internal env vars (deferred from docs/ENVIRONMENT.md).
-# Kernel-internal, so allowlisted rather than documented as user knobs.
-# ROCm GEMM/GEMV tactic selection (rocm_matmul_hipblaslt.hip). Same class: they
-# SEES the logits/input reuse hazard (a RED arm). Never set in production.
-# Test-only escape hatch: skip the depth-2 drain (VT_ASYNC_EXECUTOR=1) while
-# Test-only: deterministic RED for Option A — poison the PINNED H2D source right
-# These are kernel implementation / micro-tuning / bisect switches whose
-# after StageStepInputs enqueues the async copy (a true-async DMA reads the garbage),
-# defaults to the measured-best path; none changes an API contract or an output.
-# docs/BENCHMARKS.md, not on the deployment surface. scripts/check-env-doc.py
-# fallback, or experimental kernel behavior, not supported deployment knobs.
-# forcing the decode-graph parity ring OFF (single slot), so the async-serving gate
-# meaning is tied to a specific kernel; they are recorded in the ledger and
-# measured on gfx1201.
-# pick between hipBLASLt and our own kernels, all defaulting to the faster arm
-# proving the input-staged event boundary is load-bearing. Also a drain-skip counter
-# selects a kernel or a batching strategy for the expert GEMMs and each
-# treats a name here as a known kernel-internal knob. A NEW production env
-# var must be documented in docs/ENVIRONMENT.md OR added here.
-VT_DUMP_ACT_SUB
-VT_DUMP_ATTN
-VT_TT_SLOT_TRACE
-VT_DUMP_LOGITS
-VT_DUMP_QKVZ
-VT_DUMP_TRUST

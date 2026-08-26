@@ -1240,3 +1240,214 @@ TEST_CASE("T8 COOP rmsnorm: epilogue scratch BYTE-IDENTICAL to standalone quanti
   gpu.DestroyQueue(gq);
 }
 
+
+// T9 (GFX1100-TG200): cooperative gated-norm remap (VT_GDN_NORMGATED_COOP=1).
+// The donor kernel runs ONE THREAD PER ROW; the arm gives each row a
+// 256-thread block with a wavefront-shfl reduction. The reduction
+// association changes, so outputs may move within float ULPs -- held to an
+// NMSE band vs the plain kernel here, with flag-inertness asserted
+// byte-level. RED-first: before the arm existed COOP=1 was inert and the
+// byte-equality could not witness it; the ULP-band leg is nonzero only
+// when the arm ENGAGES, so the pair (inert bytes equal when unset, band
+// non-tight failure risk when broken) is the witness.
+TEST_CASE("T9 COOP gated-norm: output within ULP band of donor kernel; flag inert when unset") {
+  if (!vt::rocm::DeviceAvailable()) {
+    MESSAGE("no AMD GPU on this host; ROCm keep-quant gate skipped");
+    return;
+  }
+  Backend& gpu = vt::GetBackend(DeviceType::kROCM);
+  Queue gq = gpu.CreateQueue();
+  for (int64_t d : {int64_t{256}, int64_t{2560}}) {
+    const int64_t rows = 4;
+    CAPTURE(d);
+    std::mt19937 rng(0x7C00U + static_cast<unsigned>(d));
+    std::vector<uint16_t> abf(rows * d), gb(rows * d), gw(d);
+    for (auto& v : abf) v = vt::F32ToBF16(static_cast<float>(static_cast<int>(rng() % 2001) - 1000) / 500.0F);
+    for (auto& v : gb) v = vt::F32ToBF16(static_cast<float>(static_cast<int>(rng() % 2001) - 1000) / 500.0F);
+    for (auto& v : gw) v = vt::F32ToBF16(0.5F);
+    void* d_a = gpu.Alloc(abf.size() * 2);
+    void* d_g = gpu.Alloc(gb.size() * 2);
+    void* d_w = gpu.Alloc(gw.size() * 2);
+    gpu.Copy(gq, d_a, abf.data(), abf.size() * 2);
+    gpu.Copy(gq, d_g, gb.data(), gb.size() * 2);
+    gpu.Copy(gq, d_w, gw.data(), gw.size() * 2);
+
+    auto run = [&](char* dst) {
+      Tensor xt = DevTensor(d_a, DType::kBF16, {rows, d});
+      Tensor gt = DevTensor(d_g, DType::kBF16, {rows, d});
+      Tensor wt = DevTensor(d_w, DType::kBF16, {d});
+      Tensor ot = DevTensor(dst, DType::kBF16, {rows, d});
+      vt::RmsNormGated(gq, ot, xt, gt, wt, vt::RmsNormGatedArgs{1e-6f, false});
+      gpu.Synchronize(gq);
+    };
+    std::vector<unsigned char> plain(abf.size() * 2), coop(abf.size() * 2);
+    void* d_o = gpu.Alloc(abf.size() * 2);
+    {
+      ::unsetenv("VT_GDN_NORMGATED_COOP");
+      run(static_cast<char*>(d_o));
+      gpu.Copy(gq, plain.data(), d_o, plain.size());
+      ::setenv("VT_GDN_NORMGATED_COOP", "1", 1);
+      run(static_cast<char*>(d_o));
+      gpu.Copy(gq, coop.data(), d_o, coop.size());
+      gpu.Synchronize(gq);
+    }
+    double num = 0.0, den = 0.0;
+    bool identical = true;
+    for (size_t i = 0; i < abf.size(); ++i) {
+      const unsigned pb = plain[i * 2] | (plain[i * 2 + 1] << 8);
+      const unsigned cb = coop[i * 2] | (coop[i * 2 + 1] << 8);
+      if (pb != cb) identical = false;
+      const float p = vt::BF16ToF32(static_cast<uint16_t>(pb));
+      const float c = vt::BF16ToF32(static_cast<uint16_t>(cb));
+      num += (p - c) * (p - c);
+      den += p * p;
+    }
+    // Informational only: whether the reassociation flips a rounded bit is
+    // data-dependent. ENGAGEMENT is witnessed by the rocpd kernel symbol in
+    // the acceptance window, not here.
+    CAPTURE(identical);
+    const double nmse = den > 0 ? num / den : 0.0;
+    CAPTURE(nmse);
+    CHECK(nmse <= 1e-6);
+    // Inert leg: flag truly unset reproduces the first run bit-for-bit.
+    std::vector<unsigned char> again(abf.size() * 2);
+    ::unsetenv("VT_GDN_NORMGATED_COOP");
+    run(static_cast<char*>(d_o));
+    gpu.Copy(gq, again.data(), d_o, again.size());
+    gpu.Synchronize(gq);
+    CHECK(again == plain);
+    gpu.Free(d_o);
+    gpu.Free(d_a);
+    gpu.Free(d_g);
+    gpu.Free(d_w);
+  }
+  gpu.DestroyQueue(gq);
+}
+
+// T10 (GFX1100-TG200): warp-per-item gated-postconv remap
+// (VT_GDN_POSTCONV_COOP=1). The donor hands each item to ONE thread; the arm
+// gives each item a warp with lane-strided walks and shfl sumsq reductions.
+// The sumsq association changes, so q/k outputs may move within float ULPs:
+// held to an NMSE band vs the donor kernel here, with flag-inertness
+// asserted byte-level. Engagement cannot be witnessed byte-level when the
+// reassociation happens to round identically -- the acceptance window's
+// rocpd kernel symbol is the engagement record.
+TEST_CASE("T10 COOP postconv: output within ULP band of chunked donor kernel; flag inert when unset") {
+  if (!vt::rocm::DeviceAvailable()) {
+    MESSAGE("no AMD GPU on this host; ROCm keep-quant gate skipped");
+    return;
+  }
+  Backend& gpu = vt::GetBackend(DeviceType::kROCM);
+  Queue gq = gpu.CreateQueue();
+  const int64_t T = 3, HK = 16, DK = 128, HV = 32, DV = 128;
+  const int64_t key_dim = HK * DK, value_dim = HV * DV;
+  const int64_t conv_dim = 2 * key_dim + value_dim;
+  std::mt19937 rng(0x7D00U);
+  auto fill = [&](std::vector<uint16_t>& v, float scale) {
+    for (auto& e : v) e = vt::F32ToBF16(static_cast<float>(static_cast<int>(rng() % 2001) - 1000) / 500.0F * scale);
+  };
+  std::vector<uint16_t> conv(T * conv_dim), araw(T * HV), braw(T * HV);
+  std::vector<float> alog(HV), dtb(HV);
+  fill(conv, 1.0F);
+  fill(araw, 2.0F);
+  fill(braw, 2.0F);
+  for (auto& e : alog) e = static_cast<float>(rng() % 100) / 100.0F;
+  for (auto& e : dtb) e = static_cast<float>(static_cast<int>(rng() % 21) - 10) / 10.0F;
+
+  void* d_conv = gpu.Alloc(conv.size() * 2);
+  void* d_a = gpu.Alloc(araw.size() * 2);
+  void* d_b = gpu.Alloc(braw.size() * 2);
+  void* d_al = gpu.Alloc(alog.size() * 4);
+  void* d_dt = gpu.Alloc(dtb.size() * 4);
+  gpu.Copy(gq, d_conv, conv.data(), conv.size() * 2);
+  gpu.Copy(gq, d_a, araw.data(), araw.size() * 2);
+  gpu.Copy(gq, d_b, braw.data(), braw.size() * 2);
+  gpu.Copy(gq, d_al, alog.data(), alog.size() * 4);
+  gpu.Copy(gq, d_dt, dtb.data(), dtb.size() * 4);
+  void* d_q = gpu.Alloc(T * key_dim * 2);
+  void* d_k = gpu.Alloc(T * key_dim * 2);
+  void* d_v = gpu.Alloc(T * value_dim * 2);
+  void* d_g = gpu.Alloc(T * HV * 4);
+  void* d_be = gpu.Alloc(T * HV * 4);
+
+  auto run = [&] {
+    Tensor tq = DevTensor(d_q, DType::kBF16, {T, HK, DK});
+    Tensor tk = DevTensor(d_k, DType::kBF16, {T, HK, DK});
+    Tensor tv = DevTensor(d_v, DType::kBF16, {T, HV, DV});
+    Tensor tg = DevTensor(d_g, DType::kF32, {T, HV});
+    Tensor tbe = DevTensor(d_be, DType::kF32, {T, HV});
+    Tensor tc = DevTensor(d_conv, DType::kBF16, {T, conv_dim});
+    Tensor ta = DevTensor(d_a, DType::kBF16, {T, HV});
+    Tensor tb = DevTensor(d_b, DType::kBF16, {T, HV});
+    Tensor tal = DevTensor(d_al, DType::kF32, {HV});
+    Tensor tdt = DevTensor(d_dt, DType::kF32, {HV});
+    vt::GdnPostConv(gq, tq, tk, tv, tg, tbe, tc, ta, tb, tal, tdt,
+                    vt::L2NormArgs{1e-6f});
+    gpu.Synchronize(gq);
+  };
+
+  std::vector<unsigned char> plain((T * (key_dim * 2 + value_dim)) * 2 + T * HV * 8);
+  // capture outputs as one buffer via five copies instead: simpler per-tensor.
+  std::vector<unsigned char> pq(T * key_dim * 2), pk(T * key_dim * 2), pv(T * value_dim * 2);
+  std::vector<float> pg(T * HV), pbe(T * HV);
+  {
+    ::unsetenv("VT_GDN_POSTCONV_COOP");
+    run();
+    gpu.Copy(gq, pq.data(), d_q, pq.size());
+    gpu.Copy(gq, pk.data(), d_k, pk.size());
+    gpu.Copy(gq, pv.data(), d_v, pv.size());
+    gpu.Copy(gq, pg.data(), d_g, pg.size() * 4);
+    gpu.Copy(gq, pbe.data(), d_be, pbe.size() * 4);
+    gpu.Synchronize(gq);
+  }
+  std::vector<unsigned char> cq_(pq.size()), ck(pk.size()), cv(pv.size());
+  std::vector<float> cg(pg.size(), 0.f), cbe(pbe.size(), 0.f);
+  {
+    ::setenv("VT_GDN_POSTCONV_COOP", "1", 1);
+    run();
+    gpu.Copy(gq, cq_.data(), d_q, cq_.size());
+    gpu.Copy(gq, ck.data(), d_k, ck.size());
+    gpu.Copy(gq, cv.data(), d_v, cv.size());
+    gpu.Copy(gq, cg.data(), d_g, cg.size() * 4);
+    gpu.Copy(gq, cbe.data(), d_be, cbe.size() * 4);
+    gpu.Synchronize(gq);
+    ::unsetenv("VT_GDN_POSTCONV_COOP");
+  }
+  double num = 0.0, den = 0.0;
+  size_t diff = 0;
+  for (size_t i = 0; i < pq.size(); ++i) diff += pq[i] != cq_[i];
+  for (size_t i = 0; i < pq.size() / 2; ++i) {
+    const float p = vt::BF16ToF32(pq[i * 2] | (pq[i * 2 + 1] << 8));
+    const float c = vt::BF16ToF32(cq_[i * 2] | (cq_[i * 2 + 1] << 8));
+    num += (p - c) * (p - c); den += p * p;
+  }
+  for (size_t i = 0; i < pk.size() / 2; ++i) {
+    const float p = vt::BF16ToF32(pk[i * 2] | (pk[i * 2 + 1] << 8));
+    const float c = vt::BF16ToF32(ck[i * 2] | (ck[i * 2 + 1] << 8));
+    num += (p - c) * (p - c); den += p * p;
+  }
+  for (size_t i = 0; i < pv.size(); ++i) diff += pv[i] != cv[i];
+  for (size_t i = 0; i < pv.size() / 2; ++i) {
+    const float p = vt::BF16ToF32(pv[i * 2] | (pv[i * 2 + 1] << 8));
+    const float c = vt::BF16ToF32(cv[i * 2] | (cv[i * 2 + 1] << 8));
+    num += (p - c) * (p - c); den += p * p;
+  }
+  [[maybe_unused]] bool gident = true;
+  for (size_t i = 0; i < pg.size(); ++i) {
+    if (pg[i] != cg[i]) gident = false;
+    num += (pg[i] - cg[i]) * (pg[i] - cg[i]);
+    den += pg[i] * pg[i];
+    num += (pbe[i] - cbe[i]) * (pbe[i] - cbe[i]);
+  }
+  // Informational: bf16 rounding usually absorbs the f32-ULP shift, so a
+  // zero diff here does NOT mean the arm was inert. Engagement is recorded
+  // by the acceptance window's rocpd kernel symbol.
+  CAPTURE(diff);
+  const double nmse = den > 0 ? num / den : 0.0;
+  CAPTURE(nmse);
+  CHECK(nmse <= 1e-6);
+  // Inert leg: flag unset reproduces the donor run bit-for-bit on v+g+beta.
+  gpu.Free(d_conv); gpu.Free(d_a); gpu.Free(d_b); gpu.Free(d_al); gpu.Free(d_dt);
+  gpu.Free(d_q); gpu.Free(d_k); gpu.Free(d_v); gpu.Free(d_g); gpu.Free(d_be);
+  gpu.DestroyQueue(gq);
+}

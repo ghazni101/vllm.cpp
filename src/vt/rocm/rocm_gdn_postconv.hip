@@ -185,6 +185,91 @@ inline bool GdnPostConvChunkedEnabled() {
   return on;
 }
 
+// ── T10 (GFX1100-TG200): warp-per-item remap (VT_GDN_POSTCONV_COOP=1) ───────
+// The chunked decomposition still hands every item to ONE thread: decode
+// launches ~t*(hk+v_chunks+1) ≈ 21 items, each walking its dk=128 range
+// serially twice (sumsq + normalize re-read) — 27.9us/call measured against
+// a sub-microsecond memory floor (~35 KB moved per call). This arm gives
+// each item a whole WARP: lanes walk the ranges strided (the coalesced
+// pattern), the two sumsq reductions go through shfl_down trees, and stores
+// stay lane-strided. The sumsq association CHANGES, so q/k outputs may move
+// within float ULPs — opt-in flag, NMSE-gated op, adjudication owed per
+// campaign doctrine. Same slots decomposition and elementwise math otherwise.
+template <typename Tqkv, typename Tconv, typename Tgate>
+__global__ void GdnPostConvWarpK(Tqkv* q_out, Tqkv* k_out, Tqkv* v_out,
+                                 float* g_out, float* beta_out, const Tconv* conv,
+                                 const Tgate* araw, const Tgate* braw,
+                                 const float* a_log, const float* dt_bias, int64_t t,
+                                 int64_t hk, int64_t dk, int64_t hv, int64_t dv,
+                                 int64_t a_row_stride, int64_t b_row_stride, float eps,
+                                 int64_t v_chunk, int64_t v_chunks) {
+  constexpr int NWARPS = 256 / 32;
+  const int64_t key_dim = hk * dk;
+  const int64_t value_dim = hv * dv;
+  const int64_t slots = hk + v_chunks + 1;
+  const int64_t item =
+      static_cast<int64_t>(blockIdx.x) * NWARPS + (threadIdx.x >> 5);
+  if (item >= t * slots) return;
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+  const int64_t tok = item / slots;
+  const int64_t slot = item % slots;
+  const int64_t row = tok * (key_dim + value_dim);
+  if (slot < hk) {
+    const int64_t head = slot;
+    const Tconv* qin = conv + row + head * dk;
+    const Tconv* kin = conv + row + key_dim + head * dk;
+    float qss = 0.0f, kss = 0.0f;
+    for (int64_t j = lane; j < dk; j += 32) {
+      const float qv = Ld(qin, j);
+      const float kv = Ld(kin, j);
+      qss += qv * qv;
+      kss += kv * kv;
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+      qss += __shfl_down(qss, off);
+      kss += __shfl_down(kss, off);
+    }
+    qss = __shfl(qss, 0);
+    kss = __shfl(kss, 0);
+    const float qinv = 1.0f / sqrtf(qss + eps);
+    const float kinv = 1.0f / sqrtf(kss + eps);
+    Tqkv* qo = q_out + (tok * hk + head) * dk;
+    Tqkv* ko = k_out + (tok * hk + head) * dk;
+    for (int64_t j = lane; j < dk; j += 32) {
+      St(qo, j, Ld(qin, j) * qinv);
+      St(ko, j, Ld(kin, j) * kinv);
+    }
+  } else if (slot < hk + v_chunks) {
+    const int64_t c = slot - hk;
+    const Tconv* vin = conv + row + 2 * key_dim;
+    Tqkv* vo = v_out + tok * value_dim;
+    const int64_t j0 = c * v_chunk;
+    const int64_t j1 = (j0 + v_chunk) < value_dim ? (j0 + v_chunk) : value_dim;
+    for (int64_t j = j0 + lane; j < j1; j += 32) St(vo, j, Ld(vin, j));
+  } else {
+    for (int64_t h = lane; h < hv; h += 32) {
+      const int64_t idx = tok * hv + h;
+      const float av = Ld(araw, tok * a_row_stride + h);
+      const float bv = Ld(braw, tok * b_row_stride + h);
+      const float x = av + dt_bias[h];
+      const float sp = x > 20.0f ? x : log1pf(expf(x));
+      g_out[idx] = -expf(a_log[h]) * sp;
+      beta_out[idx] = 1.0f / (1.0f + expf(-bv));
+    }
+  }
+}
+
+// T10 opt-in (read once per process like the sibling arms): warp-per-item
+// mapping. Default OFF keeps the chunked decomposition.
+inline bool GdnPostConvWarpEnabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("VT_GDN_POSTCONV_COOP");
+    return e != nullptr && e[0] == '1' && e[1] == '\0';
+  }();
+  return on;
+}
+
 }  // namespace
 
 void GdnPostConvKernelRocm(Queue& q, Tensor& q_out, Tensor& k_out, Tensor& v_out,
@@ -214,6 +299,18 @@ void GdnPostConvKernelRocm(Queue& q, Tensor& q_out, Tensor& k_out, Tensor& v_out
     using Tqkv = decltype(qkv_tag);
     using Tconv = decltype(conv_tag);
     using Tgate = decltype(gate_tag);
+    if (GdnPostConvWarpEnabled()) {
+      constexpr int NWARPS = 256 / 32;
+      const unsigned wgrid =
+          static_cast<unsigned>((items_chunked + NWARPS - 1) / NWARPS);
+      GdnPostConvWarpK<Tqkv, Tconv, Tgate><<<wgrid, kBlock, 0, s>>>(
+          q_out.Ptr<Tqkv>(), k_out.Ptr<Tqkv>(), v_out.Ptr<Tqkv>(),
+          g_out.Ptr<float>(), beta_out.Ptr<float>(), conv.Ptr<Tconv>(),
+          araw.Ptr<Tgate>(), braw.Ptr<Tgate>(), a_log.Ptr<float>(),
+          dt_bias.Ptr<float>(), t, hk, dk, hv, dv, araw.stride[0],
+          braw.stride[0], args.eps, v_chunk, v_chunks);
+      return;
+    }
     if (GdnPostConvChunkedEnabled()) {
       GdnPostConvChunkedK<Tqkv, Tconv, Tgate><<<GridFor(items_chunked), kBlock, 0, s>>>(
           q_out.Ptr<Tqkv>(), k_out.Ptr<Tqkv>(), v_out.Ptr<Tqkv>(), g_out.Ptr<float>(),
