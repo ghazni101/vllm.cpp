@@ -19,9 +19,8 @@ void RopeCosSinCacheKernelRocm(Queue& q, Tensor& cos_sin, const Tensor& pos,
 void GreedyArgmaxKernelRocm(Queue& q, Tensor& out, const Tensor& logits);
 void CastBf16KernelRocm(Queue& q, Tensor& out, const Tensor& in);
 void CastF32KernelRocm(Queue& q, Tensor& out, const Tensor& in);
-// The NARROWING third sibling (rocm_dense_basic.hip). BACKEND-ROCM-EXL3 / #2433:
-// one of the exactly two ops an EXL3 checkpoint ran on the CPU reference tier.
-void CastF16KernelRocm(Queue& q, Tensor& out, const Tensor& in);
+void PermuteVHeadsKernelRocm(Queue& q, Tensor& out, const Tensor& in,
+                             int64_t T, int64_t num_k, int64_t rpk, int64_t dv);
 void QkvSplitKernelRocm(Queue& q, Tensor& q_out, Tensor& k_out, Tensor& v_out,
                         const Tensor& qkv);
 void LayerNormKernelRocm(Queue& q, Tensor& out, const Tensor& x, const Tensor* weight,
@@ -108,20 +107,6 @@ void RmsNormGatedKernelRocm(Queue& q, Tensor& out, const Tensor& x, const Tensor
                             const Tensor& w, const RmsNormGatedArgs& args);
 void SigmoidGateBf16KernelRocm(Queue& q, Tensor& out, const Tensor& attn,
                                const Tensor& gate);
-// BACKEND-ROCM-EXL3 (rocm_exl3.hip): the fused EXL3 trellis linear, transcribed
-// from the PORTABLE CPU reference (cpu_exl3_kernels.cpp / cpu_exl3_dequant.cpp)
-// and not from the CUDA kernel, whose 90 KiB shared-memory budget, m16n8k16 mma,
-// ldmatrix and cp.async have no gfx1151 form. See .agents/specs/backend-rocm-exl3.md.
-void Exl3GemmKernelRocm(Queue& q, Tensor& c, const Tensor& a, const Tensor& trellis,
-                        const Tensor& suh, const Tensor& svh, Tensor& a_had,
-                        const Exl3GemmArgs& args);
-// ROCM-FUSED-NORM-ROPE (rocm_mla_fused_norm_rope.hip, #2564): the MLA
-// norm-rope fold. Registering it is what makes `mla_attention.cpp`'s `fused_nr`
-// predicate true on this backend, and that predicate -- not the op call -- is
-// what a keep-quant MLA checkpoint depends on.
-void FusedNormRopeKernelRocm(Queue& q, Tensor& latent_out, Tensor& pe_out, const Tensor& x,
-                             const Tensor& w, const Tensor& positions, const Tensor& cache,
-                             const RmsNormArgs& norm_args, const RopeArgs& rope_args);
 void AttnQkNormRopeGateKernelRocm(Queue& q, Tensor& q_out, Tensor& k_out, Tensor& gate_out,
                                   const Tensor& qgate, const Tensor& kf,
                                   const Tensor& q_norm, const Tensor& k_norm,
@@ -158,10 +143,11 @@ struct Registrar {
                    static_cast<GreedyArgmaxFn>(&GreedyArgmaxKernelRocm)));
     RegisterOp(OpId::kCastBf16, DeviceType::kROCM,
                reinterpret_cast<void*>(static_cast<CastBf16Fn>(&CastBf16KernelRocm)));
-    RegisterOp(OpId::kCastF16, DeviceType::kROCM,
-               reinterpret_cast<void*>(static_cast<CastF16Fn>(&CastF16KernelRocm)));
     RegisterOp(OpId::kCastF32, DeviceType::kROCM,
                reinterpret_cast<void*>(static_cast<CastF32Fn>(&CastF32KernelRocm)));
+    RegisterOp(OpId::kPermuteVHeads, DeviceType::kROCM,
+               reinterpret_cast<void*>(
+                   static_cast<PermuteVHeadsFn>(&PermuteVHeadsKernelRocm)));
     RegisterOp(OpId::kQkvSplit, DeviceType::kROCM,
                reinterpret_cast<void*>(static_cast<QkvSplitFn>(&QkvSplitKernelRocm)));
     RegisterOp(OpId::kLayerNorm, DeviceType::kROCM,
@@ -257,11 +243,6 @@ struct Registrar {
     RegisterOp(OpId::kSigmoidGateBf16, DeviceType::kROCM,
                reinterpret_cast<void*>(
                    static_cast<SigmoidGateBf16Fn>(&SigmoidGateBf16KernelRocm)));
-    RegisterOp(OpId::kExl3Gemm, DeviceType::kROCM,
-               reinterpret_cast<void*>(static_cast<Exl3GemmFn>(&Exl3GemmKernelRocm)));
-    RegisterOp(
-        OpId::kFusedNormRope, DeviceType::kROCM,
-        reinterpret_cast<void*>(static_cast<FusedNormRopeFn>(&FusedNormRopeKernelRocm)));
     RegisterOp(OpId::kAttnQkNormRopeGate, DeviceType::kROCM,
                reinterpret_cast<void*>(
                    static_cast<AttnQkNormRopeGateFn>(&AttnQkNormRopeGateKernelRocm)));
