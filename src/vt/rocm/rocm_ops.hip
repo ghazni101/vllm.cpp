@@ -19,6 +19,8 @@ void RopeCosSinCacheKernelRocm(Queue& q, Tensor& cos_sin, const Tensor& pos,
 void GreedyArgmaxKernelRocm(Queue& q, Tensor& out, const Tensor& logits);
 void CastBf16KernelRocm(Queue& q, Tensor& out, const Tensor& in);
 void CastF32KernelRocm(Queue& q, Tensor& out, const Tensor& in);
+void PermuteVHeadsKernelRocm(Queue& q, Tensor& out, const Tensor& in,
+                             int64_t T, int64_t num_k, int64_t rpk, int64_t dv);
 void QkvSplitKernelRocm(Queue& q, Tensor& q_out, Tensor& k_out, Tensor& v_out,
                         const Tensor& qkv);
 void LayerNormKernelRocm(Queue& q, Tensor& out, const Tensor& x, const Tensor* weight,
@@ -143,6 +145,9 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<CastBf16Fn>(&CastBf16KernelRocm)));
     RegisterOp(OpId::kCastF32, DeviceType::kROCM,
                reinterpret_cast<void*>(static_cast<CastF32Fn>(&CastF32KernelRocm)));
+    RegisterOp(OpId::kPermuteVHeads, DeviceType::kROCM,
+               reinterpret_cast<void*>(
+                   static_cast<PermuteVHeadsFn>(&PermuteVHeadsKernelRocm)));
     RegisterOp(OpId::kQkvSplit, DeviceType::kROCM,
                reinterpret_cast<void*>(static_cast<QkvSplitFn>(&QkvSplitKernelRocm)));
     RegisterOp(OpId::kLayerNorm, DeviceType::kROCM,
