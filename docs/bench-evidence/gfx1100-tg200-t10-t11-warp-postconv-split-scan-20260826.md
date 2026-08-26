@@ -180,3 +180,28 @@ MEMORY BANDWIDTH from the sibling services' pinned-core workloads, not
 core competition; launch-bound decode cannot be isolated by core
 selection. Idle-host conditions remain the only valid state for absolute
 numbers.
+
+## T13 implementation plan (scoped for the next session)
+
+Goal: recover part of the ~1.9 ms/step non-kernel time. Two candidate
+mechanisms, in preference order:
+
+1. SYNC-LOOP DEFERRED D2H (contained): `EngineCore::step`
+   (src/vllm/v1/engine/core.cpp:150-200) already supports depth-2
+   batch-queue pipelining via `sample_tokens_async` — but
+   `GPUModelRunner::sample_tokens_async` (runner.cpp:1876) degenerates to
+   the synchronous `ReadyModelRunnerOutput` unless `async_input_combine_`
+   is set (runner.cpp:411/462), which requires
+   `QueueSupportsAsyncInputCombine` -> backend capability — NOW TRUE on
+   ROCm with the real event primitives landed here. Plan: enable
+   VT_ASYNC_RUNNER=1 in the acceptance config, verify LLMEngine::step
+   drains depth-2 (the batch_queue_ path engages independent of scheduler
+   type), A/B paired x5 through the CLI.
+2. ASYNC-SERVING PATH (fallback): measure through vllm-server with
+   AsyncScheduler mcb=2 — works correctly since the event fix — but first
+   attribute the server path's own ~40% overhead vs CLI so the comparison
+   isolates the lever.
+
+Validation either way: body-content coherence per arm (the committed
+rule), engagement witness from rocpd kernel symbols, and paired deltas
+under matched host load recorded per rep.
