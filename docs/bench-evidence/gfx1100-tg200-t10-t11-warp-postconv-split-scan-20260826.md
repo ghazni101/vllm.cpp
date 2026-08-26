@@ -89,3 +89,23 @@ every latency-class kernel added or remapped this session sits at
 the ~290 us sampling round trip plus per-op launch gaps — T13 scope,
 requiring the async-serving engine path (the blocking CLI cannot engage
 AsyncScheduler), which is the next session's scoped item.
+
+## Async-serving measurement attempt (T13 scope closure, same day)
+
+With real event primitives landed, `VT_ASYNC_RUNNER=1` now resolves
+`async_sched_supported=1` (debug-print verified) and the server engages
+AsyncScheduler mcb=2 with COHERENT output — the R9700-class garbage is
+fixed at the source. But the throughput A/B through the OpenAI endpoint is
+a WASH (sync 55.9 vs async 55.7 medians) because the SERVER PATH ITSELF
+runs at ~55 tok/s where the CLI reads 92.9 on identical flags: HTTP +
+serving-layer overhead dominates and masks any scheduler-overlap gain.
+Also noted: two simultaneous engines cannot share the GPU (second load
+OOMs / "stopped AsyncLLM"), so dual-server interleaving is unavailable.
+
+Conclusion: the sampling-round-trip lever cannot be measured through the
+serving path until the server's own ~40% overhead is attributed, and the
+blocking CLI cannot engage AsyncScheduler by construction. The contained
+alternative for a future session: one-step-deferred D2H inside
+LLLMEngine::step (double-buffer the sampled-id host read) so the sync loop
+overlaps detokenization with the next forward — no scheduler change, no
+server dependency.
