@@ -149,3 +149,17 @@ launch-config sweep (kYtile/wvPrGrp/split factor) on gfx1100 for exactly
 these three (N,K) shapes is the concrete next lever, priced at up to
 ~+0.5 ms/tok. ArgmaxSplitPhaseA (34 us) and the two-phase argmax total
 44.7 us are separate items already recorded.
+
+## T16 launch-config sweep (VT_WVSPLIT_YTILE / VT_WVSPLIT_PRGRP)
+
+Implemented: kYtile templated {1,2,4} with per-call dispatch, plus a
+runtime work-groups-per-grouping override. Sweep under host load ~5
+(medians of 3): default 50.99; PRGRP=8 51.32; PRGRP=4 50.19; PRGRP=2
+46.19 (-9%); YTILE=1 50.57; **YTILE=4 53.55 (+5%)**.
+
+Paired same-window verification x5: baseline median 52.57 vs YTILE=4
+53.21 (+1.2%) — distributions overlap; directionally positive but NOT
+conclusive under contention. Knob kept default-OFF-equivalent (env unset
+= donor config); idle-host re-sweep owed before any adoption. The
+position-resolved audit's ~0.45-0.6 ms/tok headroom estimate stands;
+the sweep so far captured only a fraction of it.
