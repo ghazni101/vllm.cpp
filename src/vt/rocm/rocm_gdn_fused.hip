@@ -67,16 +67,31 @@ __global__ void RmsNormGatedK(Tout* out, const Tx* x, const Tx* gate,
                               const Tx* w, int64_t rows, int64_t d,
                               int64_t gate_group, int64_t gate_outer, float eps,
                               bool sigmoid_gate) {
-  const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t i = static_cast<int64_t>(blockIdx.x);
   if (i >= rows) return;
+  const int tid = threadIdx.x;
+  const int bd = blockDim.x;
+
+  // Partial sum of squares — each thread handles d/bd elements
   float sumsq = 0.0f;
-  for (int64_t j = 0; j < d; ++j) {
+  for (int64_t j = tid; j < d; j += bd) {
     const float v = Ld(x, i * d + j);
     sumsq += v * v;
   }
-  const float inv = 1.0f / sqrtf(sumsq / static_cast<float>(d) + eps);
+
+  // Shared memory tree reduction
+  __shared__ float ssumsq[256];
+  ssumsq[tid] = sumsq;
+  __syncthreads();
+  for (int s = bd / 2; s > 0; s >>= 1) {
+    if (tid < s) ssumsq[tid] += ssumsq[tid + s];
+    __syncthreads();
+  }
+  const float inv = 1.0f / sqrtf(ssumsq[0] / static_cast<float>(d) + eps);
+
+  // Normalize and apply gate
   const int64_t gbase = (i / gate_group) * gate_outer + (i % gate_group) * d;
-  for (int64_t j = 0; j < d; ++j) {
+  for (int64_t j = tid; j < d; j += bd) {
     const float z = Ld(gate, gbase + j);
     const float act = sigmoid_gate ? Sigmoid(z) : Silu(z);
     St(out, i * d + j, Ld(x, i * d + j) * inv * Ld(w, j) * act);
@@ -216,97 +231,102 @@ __global__ void AttnQkNormRopeGateK(Tqk* q_out, Tqk* k_out, Tgate* gate_out,
     }
   }
 }
-// ── Cooperative preamble (TG200 T6b, opt-in VT_ATTN_PREAMBLE_COOP=1) ───────
-// Donor mapping prices decode at ~88us/call: items = t*(hq+hkv) = 24 at
-// batch 1, so 24 of 256 threads run, each doing three serial dh-loops
-// (gate copy, sumsq, rope/norm store) through private cache lines. Here one
-// WARP handles one item: lanes stride j for the gate copy and the stores,
-// the sumsq reduces through a fixed shfl_down tree and inv is broadcast.
-// NUMERIC CONTRACT: every element's math is the donor's given inv; only the
-// ss summation ORDER changes (tree vs serial), so outputs are NMSE-equal,
-// not bit-exact — op is cross_device NMSE-gated, engine A/B records near-tie
-// adjudication per campaign doctrine.
+
+// Multi-threaded version: 128 threads per head (1 thread per element).
+// Warp shuffle reduction for RMS norm. Much faster than 1-thread-per-head.
 template <typename Tsrc, typename Tqk, typename Tgate>
-__global__ void AttnQkNormRopeGateCoopK(Tqk* q_out, Tqk* k_out, Tgate* gate_out,
-                                        const Tsrc* qgate, const Tsrc* kf,
-                                        const float* q_norm, const float* k_norm,
-                                        const float* cos_sin, int64_t t, int64_t hq,
-                                        int64_t hkv, int64_t dh, int64_t qgate_stride,
-                                        int64_t kf_stride, int rot, float eps,
-                                        bool gemma) {
-  constexpr int NWARPS = kBlock / 32;
+__global__ void AttnQkNormRopeGateK2(Tqk* q_out, Tqk* k_out, Tgate* gate_out,
+                                     const Tsrc* qgate, const Tsrc* kf,
+                                     const float* q_norm, const float* k_norm,
+                                     const float* cos_sin, int64_t t, int64_t hq,
+                                     int64_t hkv, int64_t dh, int64_t qgate_stride,
+                                     int64_t kf_stride, int rot, float eps,
+                                     bool gemma) {
   const int64_t half = rot / 2;
+  const int64_t item = blockIdx.x;
   const int64_t items = t * (hq + hkv);
-  const int lane = static_cast<int>(threadIdx.x) & 31;
-  const int warp = static_cast<int>(threadIdx.x) >> 5;
-  for (int64_t item = warp; item < items; item += NWARPS) {
-    const int64_t tok = item / (hq + hkv);
-    const int64_t h = item % (hq + hkv);
-    const float* cs = cos_sin + tok * rot;
-    if (h < hq) {
-      const int64_t src_off = tok * qgate_stride + h * 2 * dh;
-      const int64_t out_off = (tok * hq + h) * dh;
-      for (int64_t j = lane; j < dh; j += 32)
-        St(gate_out, out_off + j, Ld(qgate, src_off + dh + j));
-      float ss = 0.0f;
-      for (int64_t j = lane; j < dh; j += 32) {
-        const float v = Ld(qgate, src_off + j);
-        ss += v * v;
-      }
-      #pragma unroll
-      for (int off = 16; off > 0; off >>= 1) ss += __shfl_down(ss, off);
-      const float inv =
-          1.0f / sqrtf(__shfl(ss, 0) / static_cast<float>(dh) + eps);
-      for (int64_t j = lane; j < dh; j += 32) {
-        if (j < half) {
-          const float ni = GemmaNormElem(Ld(qgate, src_off + j), inv, q_norm[j], gemma);
-          const float nih =
-              GemmaNormElem(Ld(qgate, src_off + j + half), inv, q_norm[j + half], gemma);
-          St(q_out, out_off + j, ni * cs[j] - nih * cs[half + j]);
-        } else if (j < rot) {
-          const int64_t i = j - half;
-          const float ni = GemmaNormElem(Ld(qgate, src_off + i), inv, q_norm[i], gemma);
-          const float nih =
-              GemmaNormElem(Ld(qgate, src_off + i + half), inv, q_norm[i + half], gemma);
-          St(q_out, out_off + j, ni * cs[half + i] + nih * cs[i]);
-        } else {
-          St(q_out, out_off + j,
-             GemmaNormElem(Ld(qgate, src_off + j), inv, q_norm[j], gemma));
-        }
-      }
+  if (item >= items) return;
+  const int64_t tok = item / (hq + hkv);
+  const int64_t h = item % (hq + hkv);
+  const int j = threadIdx.x;
+  if (j >= dh) return;
+
+  const float* cs = cos_sin + tok * rot;
+  __shared__ float ss_shared[4];
+
+  if (h < hq) {
+    const int64_t src_off = tok * qgate_stride + h * 2 * dh;
+    const int64_t out_off = (tok * hq + h) * dh;
+
+    // Gate passthrough
+    St(gate_out, out_off + j, Ld(qgate, src_off + dh + j));
+
+    // RMS norm: each thread computes one sq, then reduce
+    const float v = Ld(qgate, src_off + j);
+    float ss = v * v;
+    for (int s = 32; s > 0; s >>= 1) ss += __shfl_xor(ss, s);
+    const int wf = j / 64;
+    if (j % 64 == 0) ss_shared[wf] = ss;
+    __syncthreads();
+    if (j == 0) {
+      const int nwf = (static_cast<int>(dh) + 63) / 64;
+      float sum = 0.f;
+      for (int w = 0; w < nwf; ++w) sum += ss_shared[w];
+      ss_shared[0] = sum;
+    }
+    __syncthreads();
+    const float inv = 1.0f / sqrtf(ss_shared[0] / static_cast<float>(dh) + eps);
+
+    // RoPE
+    if (j < half) {
+      const float ni = GemmaNormElem(Ld(qgate, src_off + j), inv, q_norm[j], gemma);
+      const float nih = GemmaNormElem(Ld(qgate, src_off + j + half), inv, q_norm[j + half], gemma);
+      St(q_out, out_off + j, ni * cs[j] - nih * cs[half + j]);
+    } else if (j < rot) {
+      const int64_t i = j - half;
+      const float ni = GemmaNormElem(Ld(qgate, src_off + i), inv, q_norm[i], gemma);
+      const float nih = GemmaNormElem(Ld(qgate, src_off + i + half), inv, q_norm[i + half], gemma);
+      St(q_out, out_off + j, ni * cs[half + i] + nih * cs[i]);
     } else {
-      const int64_t hk_i = h - hq;
-      const int64_t src_off = tok * kf_stride + hk_i * dh;
-      const int64_t out_off = (tok * hkv + hk_i) * dh;
-      float ss = 0.0f;
-      for (int64_t j = lane; j < dh; j += 32) {
-        const float v = Ld(kf, src_off + j);
-        ss += v * v;
-      }
-      #pragma unroll
-      for (int off = 16; off > 0; off >>= 1) ss += __shfl_down(ss, off);
-      const float inv =
-          1.0f / sqrtf(__shfl(ss, 0) / static_cast<float>(dh) + eps);
-      for (int64_t j = lane; j < dh; j += 32) {
-        if (j < half) {
-          const float ni = GemmaNormElem(Ld(kf, src_off + j), inv, k_norm[j], gemma);
-          const float nih =
-              GemmaNormElem(Ld(kf, src_off + j + half), inv, k_norm[j + half], gemma);
-          St(k_out, out_off + j, ni * cs[j] - nih * cs[half + j]);
-        } else if (j < rot) {
-          const int64_t i = j - half;
-          const float ni = GemmaNormElem(Ld(kf, src_off + i), inv, k_norm[i], gemma);
-          const float nih =
-              GemmaNormElem(Ld(kf, src_off + i + half), inv, k_norm[i + half], gemma);
-          St(k_out, out_off + j, ni * cs[half + i] + nih * cs[i]);
-        } else {
-          St(k_out, out_off + j,
-             GemmaNormElem(Ld(kf, src_off + j), inv, k_norm[j], gemma));
-        }
-      }
+      St(q_out, out_off + j, GemmaNormElem(Ld(qgate, src_off + j), inv, q_norm[j], gemma));
+    }
+  } else {
+    const int64_t hk_i = h - hq;
+    const int64_t src_off = tok * kf_stride + hk_i * dh;
+    const int64_t out_off = (tok * hkv + hk_i) * dh;
+
+    // RMS norm
+    const float v = Ld(kf, src_off + j);
+    float ss = v * v;
+    for (int s = 32; s > 0; s >>= 1) ss += __shfl_xor(ss, s);
+    const int wf = j / 64;
+    if (j % 64 == 0) ss_shared[wf] = ss;
+    __syncthreads();
+    if (j == 0) {
+      const int nwf = (static_cast<int>(dh) + 63) / 64;
+      float sum = 0.f;
+      for (int w = 0; w < nwf; ++w) sum += ss_shared[w];
+      ss_shared[0] = sum;
+    }
+    __syncthreads();
+    const float inv = 1.0f / sqrtf(ss_shared[0] / static_cast<float>(dh) + eps);
+
+    // RoPE
+    if (j < half) {
+      const float ni = GemmaNormElem(Ld(kf, src_off + j), inv, k_norm[j], gemma);
+      const float nih = GemmaNormElem(Ld(kf, src_off + j + half), inv, k_norm[j + half], gemma);
+      St(k_out, out_off + j, ni * cs[j] - nih * cs[half + j]);
+    } else if (j < rot) {
+      const int64_t i = j - half;
+      const float ni = GemmaNormElem(Ld(kf, src_off + i), inv, k_norm[i], gemma);
+      const float nih = GemmaNormElem(Ld(kf, src_off + i + half), inv, k_norm[i + half], gemma);
+      St(k_out, out_off + j, ni * cs[half + i] + nih * cs[i]);
+    } else {
+      St(k_out, out_off + j, GemmaNormElem(Ld(kf, src_off + j), inv, k_norm[j], gemma));
     }
   }
 }
+
 }  // namespace
 void RmsNormGatedKernelRocm(Queue& q, Tensor& out, const Tensor& x, const Tensor& gate,
                             const Tensor& w, const RmsNormGatedArgs& args) {
@@ -354,22 +374,22 @@ void RmsNormGatedKernelRocm(Queue& q, Tensor& out, const Tensor& x, const Tensor
   }
   if (x.dtype == DType::kF32) {
     if (out.dtype == DType::kF32) {
-      RmsNormGatedK<float, float><<<grid, 1, 0, s>>>(
+      RmsNormGatedK<float, float><<<grid, 256, 0, s>>>(
           out.Ptr<float>(), x.Ptr<float>(), gate.Ptr<float>(), w.Ptr<float>(), t, d,
           gate_group, gate_outer, args.eps, args.sigmoid_gate);
     } else {
-      RmsNormGatedK<float, __hip_bfloat16><<<grid, 1, 0, s>>>(
+      RmsNormGatedK<float, __hip_bfloat16><<<grid, 256, 0, s>>>(
           out.Ptr<__hip_bfloat16>(), x.Ptr<float>(), gate.Ptr<float>(), w.Ptr<float>(),
           t, d, gate_group, gate_outer, args.eps, args.sigmoid_gate);
     }
   } else {
     if (out.dtype == DType::kF32) {
-      RmsNormGatedK<__hip_bfloat16, float><<<grid, 1, 0, s>>>(
+      RmsNormGatedK<__hip_bfloat16, float><<<grid, 256, 0, s>>>(
           out.Ptr<float>(), x.Ptr<__hip_bfloat16>(), gate.Ptr<__hip_bfloat16>(),
           w.Ptr<__hip_bfloat16>(), t, d, gate_group, gate_outer, args.eps,
           args.sigmoid_gate);
     } else {
-      RmsNormGatedK<__hip_bfloat16, __hip_bfloat16><<<grid, 1, 0, s>>>(
+      RmsNormGatedK<__hip_bfloat16, __hip_bfloat16><<<grid, 256, 0, s>>>(
           out.Ptr<__hip_bfloat16>(), x.Ptr<__hip_bfloat16>(), gate.Ptr<__hip_bfloat16>(),
           w.Ptr<__hip_bfloat16>(), t, d, gate_group, gate_outer, args.eps,
           args.sigmoid_gate);
@@ -412,24 +432,19 @@ void AttnQkNormRopeGateKernelRocm(Queue& q, Tensor& q_out, Tensor& k_out, Tensor
     using Tsrc = decltype(src_tag);
     using Tqk = decltype(qk_tag);
     using Tgate = decltype(gate_tag);
-    // T6b opt-in (read once per process like the sibling arms): warp-per-item
-    // cooperative mapping. Default OFF keeps the donor walk.
-    static const bool preamble_coop = [] {
-      const char* e = std::getenv("VT_ATTN_PREAMBLE_COOP");
-      return e != nullptr && e[0] == '1' && e[1] == '\0';
-    }();
-    if (preamble_coop) {
-      AttnQkNormRopeGateCoopK<Tsrc, Tqk, Tgate><<<GridFor(items), kBlock, 0, s>>>(
+    if (dh == 128 || dh == 256) {
+      // Multi-threaded: 1 thread per element, warp shuffle RMS norm
+      const unsigned nthreads = static_cast<unsigned>(dh);
+      const unsigned grid2 = static_cast<unsigned>(items);
+      AttnQkNormRopeGateK2<Tsrc, Tqk, Tgate><<<grid2, nthreads, 0, s>>>(
           q_out.Ptr<Tqk>(), k_out.Ptr<Tqk>(), gate_out.Ptr<Tgate>(), qgate.Ptr<Tsrc>(),
           kf.Ptr<Tsrc>(), q_norm.Ptr<float>(), k_norm.Ptr<float>(), cos_sin.Ptr<float>(),
-          t, hq, hkv, dh, qgate.stride[0], kf.stride[0], ra.rotary_dim, na.eps,
-          na.gemma);
+          t, hq, hkv, dh, qgate.stride[0], kf.stride[0], ra.rotary_dim, na.eps, na.gemma);
     } else {
       AttnQkNormRopeGateK<Tsrc, Tqk, Tgate><<<GridFor(items), kBlock, 0, s>>>(
           q_out.Ptr<Tqk>(), k_out.Ptr<Tqk>(), gate_out.Ptr<Tgate>(), qgate.Ptr<Tsrc>(),
           kf.Ptr<Tsrc>(), q_norm.Ptr<float>(), k_norm.Ptr<float>(), cos_sin.Ptr<float>(),
-          t, hq, hkv, dh, qgate.stride[0], kf.stride[0], ra.rotary_dim, na.eps,
-          na.gemma);
+          t, hq, hkv, dh, qgate.stride[0], kf.stride[0], ra.rotary_dim, na.eps, na.gemma);
     }
   };
   // Dispatch on the OUTPUT dtype like the CUDA lane (cuda_ops.cu
@@ -448,11 +463,19 @@ void AttnQkNormRopeGateKernelRocm(Queue& q, Tensor& q_out, Tensor& k_out, Tensor
       launch(float{}, float{}, float{});
     }
   } else {
-    VT_CHECK(src_bf16, "rocm attn_qk_norm_rope_gate: bf16 out needs bf16 src");
-    if (gate_out.dtype == DType::kF32) {
-      launch(__hip_bfloat16{}, __hip_bfloat16{}, float{});
+    if (src_bf16) {
+      if (gate_out.dtype == DType::kF32) {
+        launch(__hip_bfloat16{}, __hip_bfloat16{}, float{});
+      } else {
+        launch(__hip_bfloat16{}, __hip_bfloat16{}, __hip_bfloat16{});
+      }
     } else {
-      launch(__hip_bfloat16{}, __hip_bfloat16{}, __hip_bfloat16{});
+      // f32 src, bf16 out — GGUF path (GEMM emits f32, attention wants bf16)
+      if (gate_out.dtype == DType::kF32) {
+        launch(float{}, __hip_bfloat16{}, float{});
+      } else {
+        launch(float{}, __hip_bfloat16{}, __hip_bfloat16{});
+      }
     }
   }
   Check(hipGetLastError(), "attn_qk_norm_rope_gate launch");

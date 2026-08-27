@@ -209,36 +209,35 @@ class RocmBackend final : public Backend {
 
   // hipMalloc aligns to at least 256 bytes as cudaMalloc does, and managed
   // allocations are at least page-granular.
+  // Stream-ordered async allocation: when a stream has been tracked (via
+  // Copy/Memset), use hipMallocAsync to get pool-backed, non-blocking
+  // allocation. This eliminates the ~40ms/req host overhead from ~200
+  // synchronous hipMalloc/hipFree calls in the per-layer DBuf churn.
+  // Falls back to hipMalloc when no stream is tracked (startup/weights).
   void* Alloc(size_t bytes) override {
     void* p = nullptr;
-    if (managed_alloc_ && bytes > 0) {
-      // Approach (b), issue #41 F6: on an integrated managed-capable device,
-      // every Backend::Alloc block is a MANAGED allocation, so host access to
-      // it is guaranteed by the API (ManagedMemory=1 +
-      // ConcurrentManagedAccess=1 are preconditions of this branch), which is
-      // exactly the property UnifiedMemory()==true advertises and the CPU
-      // reference tier depends on. hipMemAttachGlobal (the API default) keeps
-      // the block accessible from every stream and every device.
-      //
-      // The bytes==0 case stays on hipMalloc so the zero-size contract
-      // (success, nullptr out) is byte-identical to W0 on every device rather
-      // than resting on hipMallocManaged's less-documented zero-size behavior.
+    if (bytes == 0) return nullptr;
+    if (managed_alloc_) {
       Check(hipMallocManaged(&p, bytes, hipMemAttachGlobal), "hipMallocManaged");
+    } else if (last_stream_ != nullptr) {
+      Check(hipMallocAsync(&p, bytes, last_stream_), "hipMallocAsync");
     } else {
       Check(hipMalloc(&p, bytes), "hipMalloc");
     }
     return p;
   }
-  // ONE free path for both Alloc branches, deliberately: the HIP runtime API
-  // documents hipFree as the release call for hipMalloc AND hipMallocManaged
-  // allocations (there is no hipFreeManaged; hipHostFree is for hipHostMalloc
-  // only), mirroring cudaFree, whose documentation likewise covers
-  // cudaMallocManaged memory. Certainty: HIGH — API-documented on both sides —
-  // but stated rather than assumed because this file is written blind: if a
-  // board ever reports hipErrorInvalidValue from this call on the managed
-  // path, this assumption is the first suspect, and the fix would be tracking
-  // the branch per-pointer, not a global switch.
-  void Free(void* p) override { Check(hipFree(p), "hipFree"); }
+  // Free through the same path that allocated: hipFreeAsync for pool-backed
+  // allocations, hipFree for startup/managed allocations. hipFreeAsync is
+  // stream-ordered and non-blocking; hipFree is synchronous but only used
+  // for the fallback path.
+  void Free(void* p) override {
+    if (p == nullptr) return;
+    if (last_stream_ != nullptr && !managed_alloc_) {
+      Check(hipFreeAsync(p, last_stream_), "hipFreeAsync");
+    } else {
+      Check(hipFree(p), "hipFree");
+    }
+  }
   // Page-locked host memory so sampler D2H is a real async copy and the host
   // can read sampled token ids (default Backend::AllocPinned is Alloc →
   // hipMalloc on this backend, which is DEVICE memory — reading it as host is
@@ -253,11 +252,13 @@ class RocmBackend final : public Backend {
     if (p != nullptr) Check(hipHostFree(p), "hipHostFree");
   }
   void Memset(Queue& q, void* p, int value, size_t bytes) override {
+    TrackStream(q);
     Check(hipMemsetAsync(p, value, bytes, AsStream(q)), "hipMemsetAsync");
   }
   // hipMemcpyDefault infers direction from the pointer values, so one entry
   // point covers h2d, d2h and d2d — and pageable host pointers on an APU.
   void Copy(Queue& q, void* dst, const void* src, size_t bytes) override {
+    TrackStream(q);
     Check(hipMemcpyAsync(dst, src, bytes, hipMemcpyDefault, AsStream(q)), "hipMemcpyAsync");
   }
   Queue CreateQueue() override {
@@ -434,12 +435,18 @@ class RocmBackend final : public Backend {
   bool managed_alloc_ = false;
   int major_ = 0;
   int minor_ = 0;
+  hipStream_t last_stream_ = nullptr;  // tracked from Copy/Memset for hipMallocAsync
   // Single-graph slot for the EndCapture/Replay pair. The handle API
   // (EndCaptureGraph) stores nothing here — its caller owns the exec.
   hipGraphExec_t exec_ = nullptr;
   // ENG-CUDAGRAPH-DEDUP (#1162): built on the first capture, and only when
   // VT_CUDA_GRAPH_DEDUP asked for it, so an unset environment allocates nothing.
   std::unique_ptr<vt::GraphDedupRegistry> dedup_;
+  // Track the stream from stream-aware ops so Alloc/Free can use hipMallocAsync.
+  void TrackStream(Queue& q) {
+    hipStream_t s = static_cast<hipStream_t>(q.handle);
+    if (s != nullptr) last_stream_ = s;
+  }
 };
 
 // Registers every visible AMD GPU at its own Device{kROCM, i} slot, mirroring

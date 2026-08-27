@@ -5514,7 +5514,13 @@ DBuf FullAttnBlockPaged(Dev d, const FullAttnLayerWeights& w, const HfConfig& cf
       /*decode_r8_on=*/Fa2Decode35BOn(),
       /*spec_decode_on=*/Fa2SpecDecodeOn()};
   const bool fa2_attention = ClassifyDenseFa2(fa2_elig) != DenseFa2Class::kNone;
-  const DType attn_dt = fa2_attention ? DType::kBF16 : DType::kF32;
+  // ROCm: use bf16 attention for Dh=256 with bf16 KV cache to enable the
+  // optimized SharedK prefill kernel (requires bf16 query). FA2 only covers
+  // Dh=256; without this, Dh=128 falls to the slow generic PagedAttnOnline.
+  const bool rocm_bf16_attn = d.q.device.type == vt::DeviceType::kROCM &&
+                               kv.dtype == DType::kBF16 && Dh == 256 &&
+                               FuseAttnPreambleOn(fp4) && sdi.has_attn_cos_sin;
+  const DType attn_dt = (fa2_attention || rocm_bf16_attn) ? DType::kBF16 : DType::kF32;
   DBuf dq3(d, attn_dt, {T, Hq, Dh});
   DBuf dk3(d, attn_dt, {T, Hkv, Dh});
   DBuf gatef(d, DType::kF32, {T, Hq, Dh});
@@ -7096,12 +7102,12 @@ DBuf DenseMlpBlock(Dev d, const DenseMlpWeights& w, const HfConfig& cfg,
                                               gu_sf_sw_p)
               : fp4 ? (Bf16GemmOutEnabled() ? MatmulNvfp4Bf16D(d, dh, w.gate_proj_fp4)
                                             : MatmulNvfp4F32D(d, dh, w.gate_proj_fp4))
-                    : MatmulF32D(d, dh, w.gate_proj);  // [T,I]
+                    : MatmulBf16D(d, dh, w.gate_proj);  // [T,I] bf16
   DBuf up = fuse_gu ? MatmulNvfp4Fp4DirectD(d, gu_ap->t(), gu_as->t(), w.up_proj_fp4, gu_out,
                                             gu_sf_sw_p)
             : fp4 ? (Bf16GemmOutEnabled() ? MatmulNvfp4Bf16D(d, dh, w.up_proj_fp4)
                                           : MatmulNvfp4F32D(d, dh, w.up_proj_fp4))
-                  : MatmulF32D(d, dh, w.up_proj);      // [T,I]
+                  : MatmulBf16D(d, dh, w.up_proj);      // [T,I] bf16
   // FUSED silu-mul + fp4-quant → down GEMM (no bf16 intermediate). Only when the
   // down_proj would have quantized its activation anyway (true-W4A4, CUDA) — same
   // guard as MatmulNvfp4Bf16D's MatmulNvfp4Fp4D route. Bit-identical to the else.
