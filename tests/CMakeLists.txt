@@ -1976,6 +1976,7 @@ target_include_directories(test_rocm_quant_dot PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # conventions as test_rocm_quant_dot: plain C++ through the vt:: seam,
 # runtime-guarded on ROCM availability, never on CUDA.
 vllm_cpp_add_test(test_rocm_skinny_f32 vt/test_rocm_skinny_f32.cpp)
+vllm_cpp_add_test(test_rocm_fp8_kv_cache vt/test_rocm_fp8_kv_cache.cpp)
 # #785 P1 GPU product-seam witness. Executable only — NOT add_test.
 # Ordinary CTest must not see this target. Runner fail-closes on 77/nonzero.
 add_executable(test_ops_paged_attn_sharedk_wmma_p1_gpu
