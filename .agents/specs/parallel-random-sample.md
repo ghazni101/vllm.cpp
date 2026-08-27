@@ -83,4 +83,40 @@ Shared memory: `kBlock * (sizeof(float) + sizeof(int64_t))` = 3 072 bytes.
 
 ## Now
 
-READY — implementation starts after this spec lands.
+DONE — landed on `row/SAMPLE-PARALLEL-RANDOM`.
+
+## Outcome
+
+**What was measured.** End-to-end on the RX 7900 XTX, Qwen3.5-4B-Q4_K_M,
+`vllm-server` at port 6001, 300-token streaming requests through
+`/v1/chat/completions`:
+
+| path | before | after | ratio |
+|---|---|---|---|
+| greedy (temp=0) | 119 tok/s* | 46.2 tok/s | — |
+| sampling (temp=0.7) | 4.3 tok/s | 42.3 tok/s | 9.8x |
+| sampling vs greedy gap | 27.7x | 1.09x | closed |
+
+\* The prior 119 tok/s was measured in a different container session with
+different conditions. The apples-to-apples comparison in this session is
+46.2 (greedy) vs 42.3 (sampling) — the sampling kernel is no longer the
+bottleneck.
+
+**What was rejected and why.** A single-block 256-thread reduction was chosen
+over the CUDA two-pass multi-block approach because the ROCm `ArgmaxK` greedy
+kernel in `rocm_dense_basic.hip` already uses this pattern successfully, and
+248k/256 ≈ 970 elements per thread is well within a single block's capacity.
+The two-pass approach adds scratch allocation complexity for no measurable
+benefit at this vocab size.
+
+**Why the defaults have their values.** `VT_FAST_RANDOM_SAMPLE` defaults to
+on (fast path), mirroring `VT_FAST_ARGMAX`. The serial kernel is retained
+solely as the A/B arm for the equality gate. `kBlock = 256` matches every
+other kernel in the file.
+
+**Gates run.**
+- `test_ops_sample` (CPU): 29/29 passed, 273,893 assertions.
+- `test_ops_sample` (ROCm): 29/29 passed, 278,010 assertions (includes new
+  parity + A/B cases).
+- `test_sampler` (CPU): 21/21 passed, 114 assertions.
+- ROCm A/B: parallel path bit-identical to serial path, same binary.
