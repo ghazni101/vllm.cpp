@@ -1778,13 +1778,13 @@ void PagedAttentionKernelRocm(Queue& q, Tensor& out, const Tensor& query, const 
       query.dtype == DType::kBF16 &&
       k_cache.dtype == DType::kBF16 && v_cache.dtype == DType::kBF16 && out.dtype == DType::kBF16 &&
       kc_hd % 8 == 0;
-
   if (bf16_decode_opt) {
     const int64_t qg = hq / num_kv_heads;
     // GQA fuse: sliding QG=2. Global QG=8: tile as DecodeGqa QG=2 × z=4
     // (proven kernel; halves K/V reloads vs DecodeOpt's 8×). QG=4/8 CTAs lost A/B.
     if (decode_gqa &&
-        ((qg == 2 && (d == 128 || d == 256 || d == 512)) || (qg == 8 && d == 512))) {
+        ((qg == 2 && (d == 128 || d == 256 || d == 512)) || (qg == 4 && d == 256) ||
+         (qg == 8 && d == 512))) {
       // Prefill SharedK (scoreless). Default ON for long single-req prefill (lab win
       // ~1.09× @11k vs DecodeGqa-z4). Set VT_ATTN_PREFILL_FLASH_SHAREDK=0 to disable.
       // SHAREDK_WMMA=1: rocWMMA QK + online V (lab; keep only if beats scalar SharedK).
@@ -1835,17 +1835,44 @@ void PagedAttentionKernelRocm(Queue& q, Tensor& out, const Tensor& query, const 
             return;
           }
         }
-        if (d == 256) {
-          constexpr int BM = 32, BN = 32;  // K+V 32KB; BM32 ~+2% vs BM16 @11k
+        if (d == 128) {
+          // d=128 SharedK: BM32 tiles share K/V across 32 query tokens.
+          // K+V 16KB shared mem.
+          constexpr int BM = 32, BN = 32;
           const unsigned tiles = static_cast<unsigned>((total_q + BM - 1) / BM);
           dim3 grid(tiles, static_cast<unsigned>(num_kv_heads), z_groups);
           dim3 block(static_cast<unsigned>(BM * 32));
-          PagedAttnPrefillSharedK<2, 8, BM, BN><<<grid, block, smem_kv(BN), st>>>(
-              out.Ptr<__hip_bfloat16>(), query.Ptr<__hip_bfloat16>(), k_cache.Ptr<__hip_bfloat16>(),
-              v_cache.Ptr<__hip_bfloat16>(), block_table.Ptr<int32_t>(), seq_lens.Ptr<int32_t>(),
-              query_start_loc.Ptr<int32_t>(), num_reqs, hq, num_kv_heads, d, block_size, bt_row,
-              bt_col, kc_blk, kc_pg, kc_hd, vc_blk, vc_pg, vc_hd, args.scale, args.logits_soft_cap,
-              args.causal, window_left, window_right);
+          PagedAttnPrefillSharedK<2, 4, BM, BN><<<grid, block, smem_kv(BN), st>>>(
+              out.Ptr<__hip_bfloat16>(), query.Ptr<__hip_bfloat16>(),
+              k_cache.Ptr<__hip_bfloat16>(), v_cache.Ptr<__hip_bfloat16>(),
+              block_table.Ptr<int32_t>(), seq_lens.Ptr<int32_t>(),
+              query_start_loc.Ptr<int32_t>(), num_reqs, hq, num_kv_heads, d, block_size,
+              bt_row, bt_col, kc_blk, kc_pg, kc_hd, vc_blk, vc_pg, vc_hd, args.scale,
+              args.logits_soft_cap, args.causal, window_left, window_right);
+        } else if (d == 256) {
+          if (qg == 2) {
+            constexpr int BM = 32, BN = 32;  // K+V 32KB; BM32 ~+2% vs BM16 @11k
+            const unsigned tiles = static_cast<unsigned>((total_q + BM - 1) / BM);
+            dim3 grid(tiles, static_cast<unsigned>(num_kv_heads), z_groups);
+            dim3 block(static_cast<unsigned>(BM * 32));
+            PagedAttnPrefillSharedK<2, 8, BM, BN><<<grid, block, smem_kv(BN), st>>>(
+                out.Ptr<__hip_bfloat16>(), query.Ptr<__hip_bfloat16>(), k_cache.Ptr<__hip_bfloat16>(),
+                v_cache.Ptr<__hip_bfloat16>(), block_table.Ptr<int32_t>(), seq_lens.Ptr<int32_t>(),
+                query_start_loc.Ptr<int32_t>(), num_reqs, hq, num_kv_heads, d, block_size, bt_row,
+                bt_col, kc_blk, kc_pg, kc_hd, vc_blk, vc_pg, vc_hd, args.scale, args.logits_soft_cap,
+                args.causal, window_left, window_right);
+          } else {  // qg == 4 — BM=16 to fit QG=4 register pressure
+            constexpr int BM = 16, BN = 32;  // K+V 32KB; 16 warps × QG=4 × EPL=8
+            const unsigned tiles = static_cast<unsigned>((total_q + BM - 1) / BM);
+            dim3 grid(tiles, static_cast<unsigned>(num_kv_heads), z_groups);
+            dim3 block(static_cast<unsigned>(BM * 32));
+            PagedAttnPrefillSharedK<4, 8, BM, BN><<<grid, block, smem_kv(BN), st>>>(
+                out.Ptr<__hip_bfloat16>(), query.Ptr<__hip_bfloat16>(), k_cache.Ptr<__hip_bfloat16>(),
+                v_cache.Ptr<__hip_bfloat16>(), block_table.Ptr<int32_t>(), seq_lens.Ptr<int32_t>(),
+                query_start_loc.Ptr<int32_t>(), num_reqs, hq, num_kv_heads, d, block_size, bt_row,
+                bt_col, kc_blk, kc_pg, kc_hd, vc_blk, vc_pg, vc_hd, args.scale, args.logits_soft_cap,
+                args.causal, window_left, window_right);
+          }
         } else if (d == 512) {
           constexpr int BM = 16, BN = 16;  // K+V dual 32KB; was BN32 K-only overwrite
           const unsigned tiles = static_cast<unsigned>((total_q + BM - 1) / BM);
