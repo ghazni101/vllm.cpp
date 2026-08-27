@@ -626,13 +626,12 @@ __device__ inline void KQuantGemvMmvqRow(OutT* __restrict__ out,
         const int shift = (seg >> 1) * 4;
         const int hs = seg * 2;
         const int8_t* q8 = yb.qs + c * 32;
-        // 0x20202020 = 32 in each byte; used for Q6_K bias correction.
-        // amd_mixed_dot(char4,char4,...) forces v_dot4 instruction selection;
-        // the scalar Dp4a emulation does NOT auto-lower when the input comes
-        // from a shift+mask expression (compiler cannot prove 8-bit range).
+        // TG150: fuse bias correction into the dot product. Instead of
+        // sub = v·W8 and pre = 32·W8 then (sub - pre), compute
+        // (v - 0x20)·W8 directly. Unsigned byte subtraction wraps to the
+        // correct signed char value (v < 32 → 256+v-32 = signed v-32).
         static constexpr uint32_t kBias32Word = 0x20202020u;
-        const char* const kBias32 = reinterpret_cast<const char*>(&kBias32Word);
-        int sub0 = 0, pre0 = 0, sub1 = 0, pre1 = 0;
+        int sub0 = 0, sub1 = 0;
 #pragma unroll
         for (int w = 0; w < 8; ++w) {
           uint32_t Wq, Wh, W8;
@@ -642,17 +641,15 @@ __device__ inline void KQuantGemvMmvqRow(OutT* __restrict__ out,
           uint32_t v =
               ((Wq >> shift) & 0x0F0F0F0Fu) |
               (((Wh >> hs) & 0x03030303u) << 4);
-          // scales change every 16 elems: words 0-3 -> sc[2c], 4-7 -> sc[2c+1]
+          uint32_t vb = v - kBias32Word;  // signed-correct via wrap
           if (w < 4) {
-            sub0 = amd_mixed_dot(*reinterpret_cast<char4*>(&v), *reinterpret_cast<char4*>(&W8), sub0, false);
-            pre0 = amd_mixed_dot(*reinterpret_cast<const char4*>(kBias32), *reinterpret_cast<char4*>(&W8), pre0, false);
+            sub0 = amd_mixed_dot(*reinterpret_cast<char4*>(&vb), *reinterpret_cast<char4*>(&W8), sub0, false);
           } else {
-            sub1 = amd_mixed_dot(*reinterpret_cast<char4*>(&v), *reinterpret_cast<char4*>(&W8), sub1, false);
-            pre1 = amd_mixed_dot(*reinterpret_cast<const char4*>(kBias32), *reinterpret_cast<char4*>(&W8), pre1, false);
+            sub1 = amd_mixed_dot(*reinterpret_cast<char4*>(&vb), *reinterpret_cast<char4*>(&W8), sub1, false);
           }
         }
-        acc = static_cast<int>(sc[2 * c]) * (sub0 - pre0) +
-              static_cast<int>(sc[2 * c + 1]) * (sub1 - pre1);
+        acc = static_cast<int>(sc[2 * c]) * sub0 +
+              static_cast<int>(sc[2 * c + 1]) * sub1;
       } else {  // Q4_K / Q5_K: d@0 dmin@2 scales@4 [qh@16] qs@16|48
         uint32_t W0, W1, W2;
         memcpy(&W0, blk + 4, 4);
@@ -1076,7 +1073,7 @@ void MatmulBTQuantKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tenso
     auto launch_mvq = [&](auto ot, BlockQ8_K* qact) {
       using OutT = decltype(ot);
       auto* o = static_cast<OutT*>(out.data);
-      constexpr int kGemvWarps = 4;
+      constexpr int kGemvWarps = 8;
       const int64_t ggrid = (n + kGemvWarps - 1) / kGemvWarps;
       dim3 gblock(32, kGemvWarps);
       if (gemv_fused) {
