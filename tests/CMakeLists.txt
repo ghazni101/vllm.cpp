@@ -1970,6 +1970,7 @@ vllm_cpp_add_test(test_rocm_backend vt/test_rocm_backend.cpp)
 # seam, guarded on ROCM availability at runtime — never on CUDA. Skips
 # coherently with no AMD GPU.
 vllm_cpp_add_test(test_rocm_quant_dot vt/test_rocm_quant_dot.cpp)
+target_include_directories(test_rocm_quant_dot PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # GFX1100-TG200 lever B2: the focused ROCm bf16-in/f32-out decode-skinny
 # gate (VT_SKINNY_BF16=1) for the GDN BA projection population. Same
 # conventions as test_rocm_quant_dot: plain C++ through the vt:: seam,

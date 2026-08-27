@@ -25,6 +25,9 @@
 #include <tuple>
 #include <unordered_map>
 #include <vector>
+#include <map>
+#include <type_traits>
+#include <array>
 
 #include "vt/ops.h"
 #include "vt/rocm/rocm_device_bind.h"
@@ -249,6 +252,78 @@ void Bf16GemvBT(hipStream_t s, void* out, const void* a, const void* b, int N, i
         static_cast<__hip_bfloat16*>(out), static_cast<const __hip_bfloat16*>(a),
         static_cast<const __hip_bfloat16*>(b), N, K, alpha, beta);
   }
+}
+
+// F32-in/f32-out variant for tiny decode GEMVs whose activation stays f32
+// (the GDN a/b projections). Same row-per-block geometry as Bf16GemvBTRowKernel.
+template <typename XT>
+__global__ void GemvBTF32OutKernel(float* __restrict__ y,
+                                   const XT* __restrict__ x,
+                                   const __hip_bfloat16* __restrict__ W, int N, int K,
+                                   float alpha, float beta) {
+  const int n = static_cast<int>(blockIdx.x);
+  if (n >= N) return;
+  extern __shared__ float smem[];
+  float* x_cache = smem;
+  const int tid = static_cast<int>(threadIdx.x);
+  constexpr int kBlock = 256;
+  for (int k = tid; k < K; k += kBlock) {
+    if constexpr (std::is_same_v<XT, float>) x_cache[k] = x[k];
+    else x_cache[k] = __bfloat162float(x[k]);
+  }
+  __syncthreads();
+
+  const __hip_bfloat16* wrow = W + static_cast<int64_t>(n) * static_cast<int64_t>(K);
+  float acc = 0.f;
+  const int K16 = K & ~15;
+  for (int k = tid * 16; k < K16; k += kBlock * 16) {
+#pragma unroll
+    for (int t = 0; t < 16; ++t) acc += x_cache[k + t] * __bfloat162float(wrow[k + t]);
+  }
+  for (int k = K16 + tid; k < K; k += kBlock) acc += x_cache[k] * __bfloat162float(wrow[k]);
+
+  __shared__ float red[256];
+  red[tid] = acc;
+  __syncthreads();
+#pragma unroll
+  for (int s = 128; s > 0; s >>= 1) {
+    if (tid < s) red[tid] += red[tid + s];
+    __syncthreads();
+  }
+  if (tid == 0) {
+    float v = alpha * red[0];
+    if (beta != 0.f) v += beta * y[n];
+    y[n] = v;
+  }
+}
+
+// Dispatch the f32-out GEMV when shared memory allows the cached-x form.
+void GemvBTF32OutF32X(hipStream_t s, void* out, const void* a, const void* b, int N, int K,
+                      float alpha, float beta) {
+  constexpr int kBlock = 256;
+  const size_t shmem = static_cast<size_t>(K) * sizeof(float);
+  GemvBTF32OutKernel<float><<<static_cast<unsigned>(N), kBlock, shmem, s>>>(
+      static_cast<float*>(out), static_cast<const float*>(a),
+      static_cast<const __hip_bfloat16*>(b), N, K, alpha, beta);
+}
+void GemvBTF32OutBf16X(hipStream_t s, void* out, const void* a, const void* b, int N, int K,
+                       float alpha, float beta) {
+  constexpr int kBlock = 256;
+  const size_t shmem = static_cast<size_t>(K) * sizeof(float);
+  GemvBTF32OutKernel<__hip_bfloat16><<<static_cast<unsigned>(N), kBlock, shmem, s>>>(
+      static_cast<float*>(out), static_cast<const __hip_bfloat16*>(a),
+      static_cast<const __hip_bfloat16*>(b), N, K, alpha, beta);
+}
+void GemvBTF32Out(hipStream_t s, void* out, const void* a, const void* b, int N, int K,
+                  float alpha, float beta, bool a_is_f32) {
+  constexpr int kBlock = 256;
+  if (K <= 0 || N <= 0) return;
+  const size_t shmem = static_cast<size_t>(K) * sizeof(float);
+  if (shmem > 48 * 1024) return;  // caller falls back to the library path
+  if (a_is_f32)
+    GemvBTF32OutF32X(s, out, a, b, N, K, alpha, beta);
+  else
+    GemvBTF32OutBf16X(s, out, a, b, N, K, alpha, beta);
 }
 
 // VT_ROCM_HIPBLASLT=1 enables. Default OFF — heuristic path aborted on gfx1201 in lab.
@@ -527,6 +602,15 @@ void MatmulBTKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tensor& b)
   }
   const int64_t M = a.shape[0], K = a.shape[1], N = b.shape[0];
   if (M == 0 || N == 0) return;
+  if (std::getenv("VT_MM_TRACE") && M == 1) {
+    static std::map<std::array<int64_t,3>, int> seen;
+    std::array<int64_t,3> key{N, K, static_cast<int64_t>(a.dtype)};
+    if (++seen[key] == 1 || seen[key] % 200 == 0)
+      std::fprintf(stderr, "[mmbt] N=%lld K=%lld a=%d b=%d out=%d count=%d\n",
+                   static_cast<long long>(N), static_cast<long long>(K),
+                   static_cast<int>(a.dtype), static_cast<int>(b.dtype),
+                   static_cast<int>(out.dtype), seen[key]);
+  }
   hipStream_t s = static_cast<hipStream_t>(q.handle);
   if (K == 0) {
     CheckHip(hipMemsetAsync(out.data, 0, out.Bytes(), s), "bt k0");
@@ -579,8 +663,25 @@ void MatmulBTKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tensor& b)
     g_skinny_f32_route_blas.fetch_add(1, std::memory_order_relaxed);
 
   // Decode: M=1 BF16 GEMV
-  if (M == 1 && bf16 && out.dtype == DType::kBF16 && a.stride[0] == K && GemvEnabled()) {
+  // GFX1100-TG150: tiny-N decode GEMVs (the GDN a/b projections, N=32) must
+  // not fall to hipBLASLt — its fixed launch+epilogue cost measured ~78us per
+  // call on the RX 7900 XTX for what is a 164 KB weight read (~4.1 ms/token
+  // across the model). For small N the row-per-block GEMV below wins
+  // regardless of the global VT_ROCM_GEMV A/B (which was decided on large-N
+  // shapes), so it is forced here.
+  if (M == 1 && bf16 && out.dtype == DType::kBF16 && a.stride[0] == K &&
+      (GemvEnabled() || N <= 64)) {
     Bf16GemvBT(s, out.data, a.data, b.data, static_cast<int>(N), static_cast<int>(K), 1.f, 0.f);
+    return;
+  }
+  // F32-out twin: the a/b projections keep an f32 output ("g/beta stay f32",
+  // FLA split); without this arm they fall to hipblasGemmEx → hipBLASLt with
+  // the same ~78us fixed cost per call.
+  if (M == 1 && out.dtype == DType::kF32 &&
+      (a.dtype == DType::kF32 || a.dtype == DType::kBF16) &&
+      b.dtype == DType::kBF16 && N <= 64 && a.stride[0] == K) {
+    GemvBTF32Out(s, out.data, a.data, b.data, static_cast<int>(N),
+                 static_cast<int>(K), 1.f, 0.f, a.dtype == DType::kF32);
     return;
   }
 
