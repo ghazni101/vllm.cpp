@@ -367,72 +367,6 @@ __device__ inline void LoadRowEplBf16(const __hip_bfloat16* p, int64_t base, int
   }
 }
 
-// fp8-e4m3 vectorized row load: EPL bytes per lane, dequant + scale.
-// Mirrors LoadRowEplBf16's vectorized load pattern, adapted for 1-byte elements.
-template <int EPL>
-__device__ inline void LoadRowEplFp8(const uint8_t* p, int64_t base, int lane,
-                                     float scale, float r[EPL]) {
-  static_assert(EPL == 4 || EPL == 8 || EPL == 16, "EPL");
-  if constexpr (EPL == 4) {
-    const uint32_t* u = reinterpret_cast<const uint32_t*>(p + base);
-    const uint32_t w = u[lane];
-#pragma unroll
-    for (int i = 0; i < 4; ++i)
-      r[i] = F8E4M3ToF32Dev(static_cast<uint8_t>((w >> (i * 8)) & 0xFF)) * scale;
-  } else if constexpr (EPL == 8) {
-    const uint2* u = reinterpret_cast<const uint2*>(p + base);
-    const uint2 w = u[lane];
-#pragma unroll
-    for (int i = 0; i < 4; ++i)
-      r[i] = F8E4M3ToF32Dev(static_cast<uint8_t>((w.x >> (i * 8)) & 0xFF)) * scale;
-#pragma unroll
-    for (int i = 0; i < 4; ++i)
-      r[i + 4] = F8E4M3ToF32Dev(static_cast<uint8_t>((w.y >> (i * 8)) & 0xFF)) * scale;
-  } else {
-    const uint4* u = reinterpret_cast<const uint4*>(p + base);
-    const uint4 w0 = u[lane];
-    const uint4 w1 = u[lane + 32];
-#pragma unroll
-    for (int i = 0; i < 4; ++i)
-      r[i] = F8E4M3ToF32Dev(static_cast<uint8_t>((w0.x >> (i * 8)) & 0xFF)) * scale;
-#pragma unroll
-    for (int i = 0; i < 4; ++i)
-      r[i + 4] = F8E4M3ToF32Dev(static_cast<uint8_t>((w0.y >> (i * 8)) & 0xFF)) * scale;
-#pragma unroll
-    for (int i = 0; i < 4; ++i)
-      r[i + 8] = F8E4M3ToF32Dev(static_cast<uint8_t>((w0.z >> (i * 8)) & 0xFF)) * scale;
-#pragma unroll
-    for (int i = 0; i < 4; ++i)
-      r[i + 12] = F8E4M3ToF32Dev(static_cast<uint8_t>((w0.w >> (i * 8)) & 0xFF)) * scale;
-#pragma unroll
-    for (int i = 0; i < 4; ++i)
-      r[i + 16] = F8E4M3ToF32Dev(static_cast<uint8_t>((w1.x >> (i * 8)) & 0xFF)) * scale;
-#pragma unroll
-    for (int i = 0; i < 4; ++i)
-      r[i + 20] = F8E4M3ToF32Dev(static_cast<uint8_t>((w1.y >> (i * 8)) & 0xFF)) * scale;
-#pragma unroll
-    for (int i = 0; i < 4; ++i)
-      r[i + 24] = F8E4M3ToF32Dev(static_cast<uint8_t>((w1.z >> (i * 8)) & 0xFF)) * scale;
-#pragma unroll
-    for (int i = 0; i < 4; ++i)
-      r[i + 28] = F8E4M3ToF32Dev(static_cast<uint8_t>((w1.w >> (i * 8)) & 0xFF)) * scale;
-  }
-}
-
-// Generic KV row load: dispatches to LoadRowEplBf16 or LoadRowEplFp8 based on TKV.
-// For bf16, scale is unused (inert). For fp8, dequant + scale.
-template <int EPL, typename TKV>
-__device__ inline void LoadRowEplKv(const TKV* p, int64_t base, int lane,
-                                    float scale, float r[EPL]) {
-  if constexpr (std::is_same_v<TKV, __hip_bfloat16>) {
-    (void)scale;
-    LoadRowEplBf16<EPL>(p, base, lane, r);
-  } else {
-    LoadRowEplFp8<EPL>(p, base, lane, scale, r);
-  }
-}
-
-
 template <int EPL>
 __device__ inline void StoreRowEplBf16(__hip_bfloat16* p, int64_t base, int lane, const float r[EPL]) {
   static_assert(EPL == 4 || EPL == 8 || EPL == 16, "EPL");
@@ -736,17 +670,16 @@ __global__ void PagedAttnDecodeGqaBf16(__hip_bfloat16* out, const __hip_bfloat16
 }
 
 
-template <int QG, int EPL, int NWARPS, typename TKV = __hip_bfloat16>
+template <int QG, int EPL, int NWARPS>
 __global__ void PagedAttnDecodeGqaF32Q(float* out, const float* query_f32,
-                                       const TKV* k_cache, const TKV* v_cache,
+                                       const __hip_bfloat16* k_cache, const __hip_bfloat16* v_cache,
                                        const int32_t* block_table, const int32_t* seq_lens,
                                        const int32_t* query_start_loc, int64_t num_reqs, int64_t hq,
                                        int64_t num_kv_heads, int64_t d, int64_t block_size,
                                        int64_t bt_row, int64_t bt_col, int64_t kc_blk, int64_t kc_pg,
                                        int64_t kc_hd, int64_t vc_blk, int64_t vc_pg, int64_t vc_hd,
                                        float scale, float softcap, bool causal, int window_left,
-                                       int window_right, float k_scale,
-                                       float v_scale) {
+                                       int window_right) {
   constexpr int kEpl = EPL;
   constexpr int d_expect = kEpl * 32;
   const int64_t t = blockIdx.x;
@@ -813,7 +746,7 @@ __global__ void PagedAttnDecodeGqaF32Q(float* out, const float* query_f32,
     const int64_t blk = block_table[r * bt_row + (j / block_size) * bt_col];
     const int64_t off = j % block_size;
     float k_reg[kEpl];
-    LoadRowEplKv<kEpl, TKV>(k_cache, blk * kc_blk + off * kc_pg + g * kc_hd, lane, k_scale, k_reg);
+    LoadRowEplBf16<kEpl>(k_cache, blk * kc_blk + off * kc_pg + g * kc_hd, lane, k_reg);
 
     float s_h[QG];
 #pragma unroll
@@ -827,7 +760,7 @@ __global__ void PagedAttnDecodeGqaF32Q(float* out, const float* query_f32,
     }
 
     float v_reg[kEpl];
-    LoadRowEplKv<kEpl, TKV>(v_cache, blk * vc_blk + off * vc_pg + g * vc_hd, lane, v_scale, v_reg);
+    LoadRowEplBf16<kEpl>(v_cache, blk * vc_blk + off * vc_pg + g * vc_hd, lane, v_reg);
 #pragma unroll
     for (int hh = 0; hh < QG; ++hh) {
       const float m_new = fmaxf(m[hh], s_h[hh]);
@@ -2252,9 +2185,7 @@ void PagedAttentionKernelRocm(Queue& q, Tensor& out, const Tensor& query, const 
   }();
   if (decode_opt && decode_gqa4_f32q && total_q <= hq &&
       query.dtype == DType::kF32 && out.dtype == DType::kF32 &&
-      (k_cache.dtype == DType::kBF16 && v_cache.dtype == DType::kBF16 ||
-       k_cache.dtype == DType::kI8 && v_cache.dtype == DType::kI8 &&
-       args.kv_cache_dtype != Fp8KVCacheDataType::kAuto) &&
+      k_cache.dtype == DType::kBF16 && v_cache.dtype == DType::kBF16 &&
       (d == 128 || d == 256) && hq == 16 && num_kv_heads == 4) {
     constexpr int kDecWarpsG = 8;
     constexpr int kQgG = 4;
@@ -2267,46 +2198,22 @@ void PagedAttentionKernelRocm(Queue& q, Tensor& out, const Tensor& query, const 
          2 * static_cast<size_t>(kNwarpsG) * kQgG);
     dim3 grid3(static_cast<unsigned>(total_q), static_cast<unsigned>(num_kv_heads), 1);
     dim3 block3(static_cast<unsigned>(kNwarpsG * 32));
-    const bool gqa4_fp8 = k_cache.dtype == DType::kI8;
     if (d == 128) {
-      if (gqa4_fp8) {
-        PagedAttnDecodeGqaF32Q<kQgG, 4, kDecWarpsG, uint8_t><<<grid3, block3, smem, st>>>(
-            out.Ptr<float>(), query.Ptr<float>(), k_cache.Ptr<uint8_t>(),
-            v_cache.Ptr<uint8_t>(), block_table.Ptr<int32_t>(), seq_lens.Ptr<int32_t>(),
-            query_start_loc.Ptr<int32_t>(), num_reqs, hq, num_kv_heads, d, block_size,
-            bt_row, bt_col, kc_blk, kc_pg, kc_hd, vc_blk, vc_pg, vc_hd, args.scale,
-            args.logits_soft_cap, args.causal, window_left, window_right,
-            args.k_scale, args.v_scale);
-      } else {
-        PagedAttnDecodeGqaF32Q<kQgG, 4, kDecWarpsG><<<grid3, block3, smem, st>>>(
-            out.Ptr<float>(), query.Ptr<float>(), k_cache.Ptr<__hip_bfloat16>(),
-            v_cache.Ptr<__hip_bfloat16>(), block_table.Ptr<int32_t>(), seq_lens.Ptr<int32_t>(),
-            query_start_loc.Ptr<int32_t>(), num_reqs, hq, num_kv_heads, d, block_size,
-            bt_row, bt_col, kc_blk, kc_pg, kc_hd, vc_blk, vc_pg, vc_hd, args.scale,
-            args.logits_soft_cap, args.causal, window_left, window_right,
-            1.0f, 1.0f);
-      }
+      PagedAttnDecodeGqaF32Q<kQgG, 4, kDecWarpsG><<<grid3, block3, smem, st>>>(
+          out.Ptr<float>(), query.Ptr<float>(), k_cache.Ptr<__hip_bfloat16>(),
+          v_cache.Ptr<__hip_bfloat16>(), block_table.Ptr<int32_t>(), seq_lens.Ptr<int32_t>(),
+          query_start_loc.Ptr<int32_t>(), num_reqs, hq, num_kv_heads, d, block_size,
+          bt_row, bt_col, kc_blk, kc_pg, kc_hd, vc_blk, vc_pg, vc_hd, args.scale,
+          args.logits_soft_cap, args.causal, window_left, window_right);
     } else {
-      if (gqa4_fp8) {
-        PagedAttnDecodeGqaF32Q<kQgG, 8, kDecWarpsG, uint8_t><<<grid3, block3, smem, st>>>(
-            out.Ptr<float>(), query.Ptr<float>(), k_cache.Ptr<uint8_t>(),
-            v_cache.Ptr<uint8_t>(), block_table.Ptr<int32_t>(), seq_lens.Ptr<int32_t>(),
-            query_start_loc.Ptr<int32_t>(), num_reqs, hq, num_kv_heads, d, block_size,
-            bt_row, bt_col, kc_blk, kc_pg, kc_hd, vc_blk, vc_pg, vc_hd, args.scale,
-            args.logits_soft_cap, args.causal, window_left, window_right,
-            args.k_scale, args.v_scale);
-      } else {
-        PagedAttnDecodeGqaF32Q<kQgG, 8, kDecWarpsG><<<grid3, block3, smem, st>>>(
-            out.Ptr<float>(), query.Ptr<float>(), k_cache.Ptr<__hip_bfloat16>(),
-            v_cache.Ptr<__hip_bfloat16>(), block_table.Ptr<int32_t>(), seq_lens.Ptr<int32_t>(),
-            query_start_loc.Ptr<int32_t>(), num_reqs, hq, num_kv_heads, d, block_size,
-            bt_row, bt_col, kc_blk, kc_pg, kc_hd, vc_blk, vc_pg, vc_hd, args.scale,
-            args.logits_soft_cap, args.causal, window_left, window_right,
-            1.0f, 1.0f);
-      }
+      PagedAttnDecodeGqaF32Q<kQgG, 8, kDecWarpsG><<<grid3, block3, smem, st>>>(
+          out.Ptr<float>(), query.Ptr<float>(), k_cache.Ptr<__hip_bfloat16>(),
+          v_cache.Ptr<__hip_bfloat16>(), block_table.Ptr<int32_t>(), seq_lens.Ptr<int32_t>(),
+          query_start_loc.Ptr<int32_t>(), num_reqs, hq, num_kv_heads, d, block_size,
+          bt_row, bt_col, kc_blk, kc_pg, kc_hd, vc_blk, vc_pg, vc_hd, args.scale,
+          args.logits_soft_cap, args.causal, window_left, window_right);
     }
     Check(hipGetLastError(), "paged_attention decode_gqa_f32q launch");
-
     return;
   }
   auto launch = [&](auto q_tag, auto kv_tag, auto o_tag) {
