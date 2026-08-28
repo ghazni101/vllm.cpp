@@ -2672,6 +2672,10 @@ vllm_cpp_add_test(test_cuda_fp8_kv_cache vt/test_cuda_fp8_kv_cache.cpp)
 vllm_cpp_add_test(test_ops_mla_cache vt/test_ops_mla_cache.cpp)
 # MLA campaign W4: the two-stage split-KV MQA decode over the compressed latent.
 vllm_cpp_add_test(test_ops_mla_attn vt/test_ops_mla_attn.cpp)
+# dots3-note W4b-3c (#699): the DSA "Lightning Indexer" selection pair, gated
+# against the W3 host reference `vllm::deepseek_v4::DsaIndexerLogits` /
+# `DsaTopkSelect` that this op family lifts onto `vt::Tensor`.
+vllm_cpp_add_test(test_ops_dsa_indexer vt/test_ops_dsa_indexer.cpp)
 # MLA campaign W5: the FLASH_ATTN MLA prefill (QK 192 / V 128) ...
 vllm_cpp_add_test(test_ops_mla_prefill vt/test_ops_mla_prefill.cpp)
 # ... and the workspace-bounded chunked-context loop (gather + LSE merge).
@@ -3225,6 +3229,16 @@ target_include_directories(test_qwen4_exp_qsa PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # src/ (the `dots3_note.h` precedent), hence the explicit src/ grant.
 vllm_cpp_add_test(test_qwen4_exp_hc vllm/models/test_qwen4_exp_hc.cpp)
 target_include_directories(test_qwen4_exp_hc PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+# MODEL-MM-QWEN4-EXP W5b-2 (#2031) — the DEVICE arm of the same stream:
+# vt::Qwen4ExpGatedResidual / vt::Qwen4ExpGatedResidualWriteBack against the SAME
+# lane-pinned goldens the host reference is gated on, so the two arms answer to
+# one oracle rather than to each other, plus a MODEL-WIDTH (hidden_size 2560,
+# hc_count 4, hc_lowrank 320) agreement check the golden shapes cannot make. CPU
+# only: no CUDA arm of this op exists and one written on a CPU host could not be
+# gated. Reaches the model-private `qwen4_exp_hc.h`, hence the src/ grant.
+vllm_cpp_add_test(test_qwen4_exp_hc_device vllm/models/test_qwen4_exp_hc_device.cpp)
+target_include_directories(test_qwen4_exp_hc_device PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
 # The five suites that reach src/vllm/support/platform_compat.h, granted per
 # target rather than globally: the file already carries 123 explicit
