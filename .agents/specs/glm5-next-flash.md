@@ -2772,6 +2772,31 @@ Debts this row carries, each visible rather than waived:
   checker change that AGENTS.md requires to carry its own spec, a red-before
   mutation, and a decision about which keys a lane record requires.
   [#2099](https://github.com/mudler/vllm.cpp/issues/2099) owns it.
+- **O14 — `vt::KdaChunkPrefill` cannot serve this model, so both KDA paths run
+  the recurrence.** The chunked prefill op takes the RAW gate projection and
+  FUSES the gate, `-exp(a_log)*softplus(g_raw + dt_bias)`, inside the vendored
+  FLA Triton-AOT cubins (`include/vt/ops.h`) and inside its CPU reference
+  (`src/vt/cpu/cpu_ops.cpp:1779-1786`). That is the SOFTPLUS branch.
+  GLM-5.3-Flash needs the sigmoid branch, and no `(a_log, dt_bias, g_raw)`
+  reproduces it: inverting the fused softplus needs
+  `g_raw = log(exp(-target) - 1)`, which diverges to `-inf` as the gate
+  approaches 0, which is where most channels of 34 layers sit. W2 therefore
+  routes BOTH prefill and decode through `vt::KdaGatedDeltaRule`, which consumes
+  an already-computed per-K-channel log-decay and is branch-agnostic. Closing
+  this needs a chunk op that accepts a precomputed `g`, which is a change to a
+  shared kernel family this row has no gate for. No correctness consequence; a
+  named speed cliff on top of the one §Our baseline "KDA" already records for
+  the 64-head geometry. [#2097](https://github.com/mudler/vllm.cpp/issues/2097)
+  records it.
+- **O15 — the KDA arm is NOT REACHED from a production entry point.** W2 lands
+  `glm5_next_kda.{h,cpp}`, and `Glm5NextForConditionalGeneration::Forward`
+  still refuses by name (O10), so the only call sites at that merge commit are
+  the focused gate's. This is the staged-slice disclosure AGENTS.md "Nothing
+  lands dead" requires and not an exception claimed by silence: the wiring
+  belongs to **W5**, the assembled text forward, on row
+  `MODEL-MM-glm5-next-glm5-next-for-conditional-generation`, and W5 has no
+  issue of its own yet, so [#1998](https://github.com/mudler/vllm.cpp/issues/1998)
+  tracks it. What W2 buys is that when W5 wires the layer it wires a gated one.
 
 ## Now
 
@@ -2955,8 +2980,7 @@ the architecture; the registry pin stays at `5.14.1` and the vLLM parity pin is
 untouched. **O12 is discharged.** O13 records what W0 measured on the way: no
 checker in this tree parses an `oracle-pin-lane` block, so W0's §Gates line
 means the checker stayed green and not that it validated the fields
-([#2099](https://github.com/mudler/vllm.cpp/issues/2099)). The next actions are
-W2 and, whenever the developer grants a large-asset download, W7b.
+([#2099](https://github.com/mudler/vllm.cpp/issues/2099)).
 
 W1's file also broke the Windows build, repaired here as
 [#2101](https://github.com/mudler/vllm.cpp/issues/2101): seven range-`for` loop
@@ -2983,76 +3007,5 @@ under a k,q,v mutation — and `dt_bias` was optional, which upstream has no
 mode for (`:384` declares it unconditionally, `:393` always adds it), so an
 absent or misshaped tensor is now refused by name. That code is **not reached** from
 any production entry point (O15) and `vt::KdaChunkPrefill` cannot serve this
-model (O14). W0 has since landed the lane pin on `main`.
-
-W4 ([#2098](https://github.com/mudler/vllm.cpp/issues/2098),
-`CLAIM-GLM53-FLASH-W4`) then landed the mHC arm. Three of the topology's four
-pieces reuse DeepSeek-V4 unchanged, because `Glm5NextTextHyperConnection` is a
-bare `pass` over `DeepseekV4HyperConnection`; the fourth does not.
-`Glm5NextTextHyperHead.forward` is `hidden_streams.mean(dim=2)`, so
-`glm5_next::HcHeadCollapseMean` is an UNWEIGHTED mean where V4's
-`HcHeadCollapse` is a sigmoid-gated weighted sum, and the checkpoint carries no
-`hc_head.*` tensor a gated collapse could read. `glm5_next::MhcPre` and
-`MhcPost` add no numerics; they bind this model's five constants in one place.
-Every golden is the RUN output of the unmodified reference modules at
-transformers `v5.16.1`, not a transcription, and the gate was RED first against
-the wrong reuse at 59 of 98 assertions failed. That code is **not reached** from
-any production entry point (O16); **W5b** owns the wiring. W4 wrote "W5" here
-and that was right until W5 split: W5 landed the MoE and the KV-cache spec and
-explicitly did not land the decoder layer, because W3 left no assembled
-attention block for its DSA arm to call, so the layer that reaches this code is
-W5b's ([#2241](https://github.com/mudler/vllm.cpp/issues/2241)). O23 records the
-same split for the MoE.
-
-W3 ([#2213](https://github.com/mudler/vllm.cpp/issues/2213)) then made the NoPE
-MLA geometry representable and ported the DSA k-pool indexer. **O11 is
-discharged.**
-
-W5 ([#2223](https://github.com/mudler/vllm.cpp/issues/2223),
-`CLAIM-GLM53-FLASH-W5`) then landed the 288+1 expert MoE and the heterogeneous
-KV-cache spec — **and this row has its first REACHED capability.**
-`MakeGlm5NextKVCache` replaces a refusal with three published groups, entered
-through `ModelRegistry::Resolve` and the production `make_kv_cache` factory hook;
-unwiring that hook reds the gate, and deleting the row does not compile, because
-`-Werror=unused-function` fires on the function the factory is the only
-reference to. The MoE binds rather than reimplements — `vt::MoeRouterTopK`'s
-grouped `noaux_tc` arm and `deepseek_v4::ClampedSwiGLU` at `alpha=1, beta=0` —
-and is gated at the PUBLISHED 288/top-8 on SET equality of the selected experts
-with the separation margin printed, because top-k error is bimodal.
-
-**W5 SPLIT, and the reason is a gap W3 left rather than a scope decision.** The
-decoder layer and the assembled `Glm5NextTextModel::Forward` need an assembled
-`Glm5NextTextAttention` over W3's indexer, and there is none: the selection
-landed, the block did not. They are **W5b**; the weight tower and `load_weights`
-are **W5c**, and W5c has since LANDED
-([#2242](https://github.com/mudler/vllm.cpp/issues/2242)). The MoE is still not
-reached (O23), but the reason is no longer that nothing on this row can be: when
-W5 was written `ModelRegistry::Forward` was unreachable by construction because
-`load_weights` refused, and that is retired as O24. `load_weights` now returns a
-real `LoadedModel`, so what is missing is the decoder layer W5b owes, not a
-handle.
-
-**The published artifact was measured, not assumed — and the reading has since
-been SUPERSEDED, which is why it is kept as a dated measurement rather than a
-state.** `unsloth/GLM-5.3-Flash-GGUF` rev `d425e572f`, arm `UD-Q2_K_XL`, run
-through `LoadedEngine::FromModelDir` on 2026-08-29: it opened the file, resolved
-`glm5next`, walked the 4-way split, and stopped on
-`blk.3.ffn_gate_exps.weight has unknown ggml type id 17` (IQ2_XS). It does not
-stop there now — [#2245](https://github.com/mudler/vllm.cpp/issues/2245) landed
-that decoder and W5c resolves all 1383 backbone tensors. The arm mixes EIGHT ggml encodings and six are undecodable here —
-Q3_K/Q4_K/Q5_K (O8) and IQ2_XS/IQ3_XXS/IQ4_XS (O5). **"Q2_K" is a floor, not a
-format**, and O7's premise is superseded by a harder debt than the one it named:
-a weight tower alone will not load this file. §W5 carries the census.
-
-W5 also repaired three refusal messages that named landed waves as owing and
-denied an artifact that exists
-([#2230](https://github.com/mudler/vllm.cpp/issues/2230)); the gate had been
-pinning all three, which is why they survived W2, W3 and W4 landing.
-
-No GPU gate has moved: `dgx:gpu0` was held by other sessions throughout W5's
-window, `strix:gpu0` cannot hold the artifact or run a CUDA kernel, and W3's
-committed CUDA arm remains unmeasured (O17). GPU gates stay `PENDING` with the
-reason recorded rather than a result invented.
-
-The next actions are W5b and W5c, then W6, and — whenever the developer grants a
-large-asset download or six quant decoders exist — W7b.
+model (O14). W0 has since landed the lane pin on `main`, so the next actions
+are W3 and W4, and, whenever the developer grants a large-asset download, W7b.
