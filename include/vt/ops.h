@@ -159,7 +159,7 @@ enum class OpId : uint8_t {
   kMoeSiluMul,
   kCastBf16,
   kCastF32,
-  kPermuteVHeads,
+  kCastF16,
   kMulColVecF32,
   kAttnGateSplit,
   kSigmoidGateBf16,

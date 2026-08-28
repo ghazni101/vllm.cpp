@@ -18,37 +18,22 @@ supplies only the trellis format and its kernels.
 
 ## Now
 
-`ACTIVE`. W1a and W1b landed and EXL3 runs a model. **W3 is in flight: the
-device arm was instantiated for ONE `(bits, codebook)` pair and it was the wrong
-one.**
+`ACTIVE`. **W1a has landed and is UNREACHED, deliberately and declared.**
+`vt::CastF16` (the narrowing cast the EXL3 linear needs on the way in, third
+sibling of `CastBf16`/`CastF32`) is a general op, registered for CPU and CUDA.
+`layers::Exl3LinearMethod` binds EXL3 to vLLM's own `LinearMethodBase` seam and
+is gated against the W1a weight-side dequant at `rel_rms 5.146e-4` against a
+stated `2.0e-3` bound, with `bits` resolved from the tensor rather than any
+config.
 
-`cuda_exl3.cu` carried `kInstantiatedBits = 3, kInstantiatedCb = 1`. Codebook 1
-is the SparkInfer DeepSeek-V4 artifact -- the EXCEPTION -- so every stock
-`turboderp/*-exl3` checkpoint refused on the device one projection at a time and
-fell to a single-threaded CPU decode. That is the whole of the 0.040 tok/s the
-W1b run measured: 1,235,746,816 weights re-decoded per token at ~50M/s on one
-core, because the trellis is decoded inside the GEMM and the GEMM never reached
-the GPU.
+**No production path constructs `Exl3LinearMethod` yet.** The loader wiring is
+W1b, owned by this row (`QUANT-EXL3`) and tracked by
+[#2181](https://github.com/mudler/vllm.cpp/issues/2181); it is listed under
+`## Owed` below. `AGENTS.md` §"Nothing lands dead" permits a staged slice to
+land unreached only when it is named this way, and this is that naming.
 
-W3 instantiates three arms -- `(3, 0)` a stock body, `(3, 1)` DeepSeek-V4,
-`(6, 0)` the stock 6-bit `lm_head` -- which needed real porting rather than a
-wider list: `decode_3inst_2` had `static_assert(cb == 1)` and `dq_dispatch` had
-`static_assert(bits == 3)`, and bits 6 needs `dq4` because `dq8` spans
-`16 + bits*7` bits across the two words it merges and overflows the 64-bit
-funnel at 6 bits (upstream routes 5/6/8 through `dq4` for that reason,
-`exl3_dq.cuh:274-293`).
-
-**What this row can and cannot reach.** The speed target named for this work is
-`MiaAI-Lab/DeepSeek-v4-Flash-One-DGX-Spark`: 44-47 tok/s decode at 384k context
-on one GB10. Read from its README, that number is EXL3 weights **plus** DSpark
-K5 speculative decoding with a K64 draft, **plus** an `nvfp4_ds_mla` compressed
-KV cache, **plus** the `B12X_MLA_SPARSE` sparse-attention backend, at
-`MAX_NUM_SEQS=1` and util 0.94. Only the first of those four is this row's. The
-sparse DSA attention is unported and owned by NO row (#1961, #1970, #1976), the
-compressed KV topology is `KV-DSV4-MULTICACHE`'s W5, and the residency that
-stops the artifact loading at all is #2186. This row makes EXL3 fast; it does
-not by itself make that model fast, and no number here should be read as
-approaching theirs.
+Next: W1b — the native-layout reader and the dense container's EXL3 arm, which
+is what makes `turboderp/Llama-3.2-1B-Instruct-exl3` generate.
 
 ## The gap, measured
 
@@ -314,49 +299,12 @@ Stated here before code, per risk 1:
 
 ## Owed
 
-- ~~**W1b: nothing constructs `Exl3LinearMethod` yet.**~~ **RETIRED**: the
-  dense forward constructs it, and a real checkpoint generates through it.
-- ~~**The device arm refuses codebook 0, which is the COMMON case.**~~ **RETIRED
-  by W3**: the arm now instantiates `(3,0)`, `(3,1)` and `(6,0)`, and
-  `kInstantiatedCb` no longer exists. What replaces it is narrower and real:
-  **a stock codebook-0 checkpoint has no GEMV fast path at `m == 1`**, on this
-  tree or upstream's — upstream's envelope refuses `bits != 4 && cb == 0` and
-  its instantiation list omits `(3,0)`. It takes the regular shape table
-  instead, which is upstream's own behaviour rather than a gap.
-- **Bits 6 has NO real-data anchor.** `tests/vt/exl3_real_corner.inc` pins
-  codebook 0 at 3 bits, so `test_exl3_real_decode` ties the 3-bit arm to real
-  exllamav3 output and the 6-bit `lm_head` to nothing but a device-vs-CPU
-  cross-check on RANDOM trellis bytes — where, as that fixture's own header
-  says, any codebook and any tile permutation is self-consistent. The two
-  readers being independent (`Exl3TileCodeword` against `dq4`) makes it a real
-  cross-check and not a tautology, but the only end-to-end evidence for the
-  6-bit head is a coherence read this spec already records as WEAK.
-- **The CPU threading recovers 4.8x of 20 cores, which is ~25% efficiency.**
-  Named as an open gap rather than a result, because AGENTS.md forbids
-  declaring a ceiling. One hypothesis worth testing first: `raw` is a plain
-  `std::vector<float>` and a 16-float stripe is exactly one 64-byte cache line,
-  so adjacent workers' stripes can straddle a line whenever the allocation is
-  not 64-byte aligned.
-- **q/k/v and gate/up run as separate GEMMs.** The bf16 and NVFP4 arms hold ONE
-  merged operand; merging trellis operands joins on the output dim, which
-  INTERLEAVES per input tile rather than row-stacking. It is valid for this
-  family -- `had_r_128` blocks the output in 128s and Llama-3.2-1B's q (2048),
-  k/v (512) and I (8192) are each a multiple of 128, so no block straddles two
-  matrices -- and it is the merged-GEMM seam this row does not yet reach. Owed
-  with its own gate.
-- **`vt::CastF16` is registered on two backends where its siblings have six**
-  (CPU and CUDA against CPU/CUDA/ROCm/Vulkan/Metal/Tenstorrent). Now REACHED, so
-  this is no longer theoretical for a non-CUDA device build.
-- **The two codebook resolutions disagree BY CONSTRUCTION, and W4 owns it.**
-  `LoadExl3` reads tensor PRESENCE, which is what `LinearEXL3` does;
-  `deepseek_v4_weights.cpp` reads the config string
-  `quantization_config.codebook`, which is what the SparkInfer artifact happens
-  to declare. Both are correct for their own artifact and neither generalizes:
-  a stock checkpoint has no such config key, and a rank-sliced one may ship a
-  marker its config does not name. Reconciling them onto presence is part of
-  routing DeepSeek-V4 through this seam.
-- **No speed number.** The e2e run is 0.040 tok/s on a CPU queue at batch 1.
-  That is a functional result and is not offered as a performance one.
+- **W1b: nothing constructs `Exl3LinearMethod` yet.** The method and its cast
+  landed with W1a and are reached only by their own suites. The production path
+  — a native-layout reader, the EXL3 arm on the shared dense container, and the
+  `MakeLinearMethod` call from the dense forward — is W1b, owned by this row and
+  tracked by #2181. Until it lands, this row has a class rather than a
+  capability, which is the distinction `.agents/reachability.md` exists for.
 - **`vt::CastF16` is registered on TWO backends where its siblings have SIX.**
   `kCastBf16` and `kCastF32` are each registered for CPU, CUDA, ROCm, Vulkan,
   Metal and Tenstorrent; `kCastF16` has CPU and CUDA only. The header calls it
