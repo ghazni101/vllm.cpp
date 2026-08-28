@@ -629,98 +629,6 @@ enum class OpId : uint8_t {
   // Appended before kCount so no existing op's id shifts.
   kQwen4ExpQsaCompress,
   kQwen4ExpQsaGatherAttention,
-  // MODEL-MM-QWEN4-EXP W5d-1 (#2249 item 1) — the UNGATED per-group RMS norm.
-  // A SIBLING of kRmsNorm and of kRmsNormGatedGroup, and neither of those two
-  // can stand in for it: `kRmsNorm` reduces over the WHOLE row and has no
-  // group_size, `kRmsNormGated`/`kRmsNormGatedQuantFp8` fold a gate in, and
-  // `kRmsNormGatedGroup` groups correctly but always multiplies by
-  // `silu(gate)` first, so there is no way to ask any of them for a plain
-  // grouped norm. The only grouped reduction this tree had was FUSED inside
-  // `kQwen4ExpGatedResidual` and could not be called on its own, which is the
-  // gap `include/vt/ops.h` states in its own words at the kQwen4ExpGatedResidual
-  // comment above ("There is no ungated per-group RMS norm").
-  //
-  // Adding `group_size` to `RmsNormArgs` instead was REJECTED, and the reason is
-  // the silent-wrong-answer shape this row keeps meeting. `kRmsNorm` is
-  // registered on five backends; a new field on its args struct is ignored by
-  // every kernel that is not taught to read it, so a CUDA or Metal caller would
-  // get a whole-row norm back from a grouped request, with no crash and no
-  // refusal. A separate OpId cannot do that: an unregistered device refuses BY
-  // NAME. `kRmsNormGatedGroup` is the in-tree precedent for exactly this split
-  // ("SIBLING of RmsNormGatedArgs, not a mode of it").
-  //
-  // Registered on kCPU only (src/vt/cpu/cpu_ops.cpp). The CUDA arm is OWED, not
-  // written: it cannot be gated on a CPU-only host, and an ungated kernel is
-  // worse than an absent one — the same call W5b-3 and W5b-4 made.
-  // Appended before kCount so no existing op's id shifts.
-  kRmsNormGroup,
-  // MODEL-MM-QWEN4-EXP W5e-1 (#2336) — the Qwen4-Exp PLE GATE: the signed
-  // square root of the hyper-connection score, and the sigmoid of it applied to
-  // a per-token `value` row broadcast across the hc streams.
-  // `Qwen4ExpTextPLELayer.forward`, transformers v5.16.0
-  // `models/qwen4_exp/modeling_qwen4_exp.py:1181-1182` (+ the :1184 flatten):
-  //
-  //     gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign()
-  //     gated_value = torch.sigmoid(gate) * value.unsqueeze(-2)
-  //
-  // WHAT IS **NOT** HERE, AND THAT IS THE POINT. The DOT that produces `gate`
-  // (:1180) is NOT this op. `vt::BatchedMatmul` already computes it — `[T*hc, 1,
-  // H] x [T*hc, H, 1]` over VIEWS of the two `[T, hc*H]` buffers, since only the
-  // innermost dim must be unit-stride and `stride[0]`/`stride[1]` are free — so
-  // a private scoring loop beside it would be the parallel path AGENTS.md
-  // "Shared seams" forbids. `test_qwen4_exp_ple_gate.cpp` RUNS that composition
-  // against the same lane-pinned golden this op is gated on, so the reuse is
-  // measured rather than asserted. The `/ math.sqrt(hidden_size)` that :1180
-  // ends with has no op and no home in `BatchedMatmul`, so it rides here as
-  // `Qwen4ExpPleGateArgs::gate_divisor`.
-  //
-  // WHY A FUSED OP RATHER THAN A COMPOSITION for what is left. The shared
-  // surface has no `abs`, no `clamp`, no `sqrt`, no `sign` and no standalone
-  // `sigmoid` — the same absence `kQwen4ExpGatedResidual` above already
-  // enumerates — so the middle line alone would need four new general ops. The
-  // multiply then needs a fifth, and no existing one can serve, because BOTH of
-  // its operands broadcast: `gate` is `[T, hc, 1]` and `value.unsqueeze(-2)` is
-  // `[T, 1, H]`. `vt::SigmoidGateBf16` refuses it by count
-  // ("sigmoid_gate_bf16: out/attn/gate must have the same element count") and
-  // `vt::MulColVecF32` scales per output COLUMN, where this scales per (t, j)
-  // ROW of the flattened `[T, hc*H]`. Composing it anyway means tiling `value`
-  // to `[T*hc, H]` with `vt::IndexSelect` first, which materialises exactly the
-  // broadcast a fused op exists to avoid.
-  //
-  // WHY A NEW OpId RATHER THAN A FIELD on an existing args struct. Same
-  // arithmetic as `kRmsNormGroup` above: the candidate hosts are registered on
-  // MORE THAN ONE backend, so a new field would be silently IGNORED by every
-  // arm that does not learn it and the caller would get a wrong answer with no
-  // crash and no refusal. `kSigmoidGateBf16` has FOUR registered arms — kCPU
-  // (cpu_ops.cpp), kROCM (rocm_ops.hip), kVULKAN (vulkan_ops.cpp) and
-  // kTENSTORRENT (tenstorrent_ops.cpp) — and `kMulColVecF32` has TWO (kCPU,
-  // kCUDA). Three arms and one arm respectively would answer a broadcast
-  // request with an elementwise product. An unregistered device refuses BY NAME
-  // instead.
-  //
-  // THE CLAMP ORDER IS THE TRAP. `clamp_min` is applied BEFORE the square root,
-  // so the floor on |output| is sqrt(1e-6) = 1e-3 and not 1e-6, and tiny scores
-  // are AMPLIFIED. Exactly zero is the one exception and it is not a special
-  // case in the code: `sign(0) == 0` kills the floor, so the origin maps to 0
-  // and the function is genuinely discontinuous there. A fully masked row
-  // reaches it.
-  //
-  // A NaN SCORE PROPAGATES, and that is a guard rather than a fall-through.
-  // Upstream returns NaN here (`sign(NaN) == 0`, but `NaN * 0.0 == NaN`), while
-  // every comparison in a naive signed-sqrt is FALSE for NaN, so the sign
-  // branches miss and the zero arm returns 0 — turning poison into a plausible
-  // `0.5 * value`. The kernel tests `isnan` first. `+/-inf` and `+/-0.0` need
-  // no guard and get none; they already match the pin term for term.
-  //
-  // Registered on kCPU (src/vt/cpu/cpu_qwen4_exp_ple.cpp) and, since W6-CUDA,
-  // on kCUDA (src/vt/cuda/cuda_qwen4_exp_ple.cu). THE NaN OBLIGATION ABOVE IS
-  // DISCHARGED ON BOTH ARMS: the device kernel tests `isnan` first for the same
-  // reason, and `tests/vllm/models/test_qwen4_exp_cuda.cpp` carries the case
-  // that separates a NaN from the plausible `0.5 * value` a missing guard
-  // returns. No other device is registered, so the dispatcher still refuses
-  // those BY NAME.
-  // Appended before kCount so no existing op's id shifts.
-  kQwen4ExpPleGate,
   kCount
 };
 
@@ -1135,43 +1043,6 @@ struct Qwen4ExpQsaAttnArgs {
   // A host pointer, on the `GdnArgs::query_start_loc_host` precedent; a CUDA arm
   // owes a device-side counter and its copy-back.
   int64_t* keys_visited = nullptr;
-
-  // ─── THE PAGED ADDRESS MODE (row MODEL-MM-QWEN4-EXP W5d-3, #2249 item 2) ───
-  //
-  // WHY IT IS HERE AND NOT A SECOND OP. The engine allocates this model's QSA
-  // K/V as a PAGED `FullAttentionSpec` group (`MakeQwen4ExpKVCache`), so the
-  // contiguous `[max_kv, Hkv, Dh]` arm above could not serve from the cache the
-  // runner actually hands a forward. What differs between the two is the
-  // resolution of ONE address — the key/value row for logical position `p` —
-  // and nothing else: the expansion, the visit ORDER, the two softmax passes and
-  // the f32 accumulation are the same body, so a second op would be the parallel
-  // path AGENTS.md "Shared seams" forbids.
-  //
-  // `nullptr` keeps the contiguous arm byte-for-byte. When set, `key`/`value`
-  // are the rank-4 `[num_pages, kv_block_size, num_kv_heads, head_dim]` unbind
-  // views of the runner's flash cache (`dense_attn::KvSlice`), STRIDED rather
-  // than contiguous because K and V interleave at dim 1, and logical position
-  // `p` resolves as vLLM's paged read does
-  // (`vllm/v1/attention/backends/flash_attn.py::FlashAttentionImpl.forward`,
-  // mirrored in this tree's `vt::PagedAttention` contract):
-  //
-  //     page = kv_block_table[p / kv_block_size]
-  //     row  = key[page, p % kv_block_size, kv_head, :]
-  //
-  // TWO THINGS ARE CALLED A "BLOCK" IN THIS OP AND THEY ARE NOT THE SAME
-  // OBJECT. `block_ids` names QSA's COMPRESS blocks of `compress_ratio` tokens
-  // (4 at the released config); `kv_block_table`/`kv_block_size` name the KV
-  // CACHE PAGE (the engine's `block_size`, 16 or more). The `kv_` prefix is what
-  // keeps them apart, and `MakeQwen4ExpKVCache` refuses a `block_size` the
-  // compress ratio does not divide, so a compress block never straddles a page.
-  //
-  // ONE REQUEST. `kv_block_table` is `[1, max_pages]` i32: this op is called per
-  // QSA layer for one sequence, exactly as the contiguous arm is, and a ragged
-  // multi-request batch needs the per-request `query_start_loc` plumbing the
-  // block does not carry yet. Recorded under the spec's `## Owed`.
-  const Tensor* kv_block_table = nullptr;
-  // Tokens per KV cache page. Must be > 0 exactly when `kv_block_table` is set.
-  int64_t kv_block_size = 0;
 };
 
 // Mamba2 SSD args, shared by the chunked prefill scan and the decode state
@@ -3913,11 +3784,7 @@ void Qwen4ExpQsaCompress(Queue& q, Tensor& block_keys, const Tensor& raw_keys,
 // say. The expansion is address arithmetic and belongs inside the consumer.
 //
 // SHAPES. query [T, num_q_heads, head_dim] f32/bf16; key and value
-// [max_kv, num_kv_heads, head_dim] f32/bf16, the raw KV cache — or, in the PAGED
-// address mode, the rank-4 [num_pages, kv_block_size, num_kv_heads, head_dim]
-// unbind views of the runner's flash cache, which are STRIDED (see
-// `Qwen4ExpQsaAttnArgs::kv_block_table` for the resolution and for why the two
-// arms are one op);
+// [max_kv, num_kv_heads, head_dim] f32/bf16, the raw KV cache;
 // block_ids [T, block_topk] i32, ascending, `-1` = no block;
 // kv_lens [T] i32, the causal visible length per query token;
 // out [T, num_q_heads, head_dim] f32/bf16. GQA: num_q_heads % num_kv_heads == 0.
