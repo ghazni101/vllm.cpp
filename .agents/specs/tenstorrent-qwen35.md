@@ -21,47 +21,13 @@ tok/s (+70%), `Numel()` 27.09% → 1.76%, review PASS; lever 3 (batch
 per-layer staging) NOT taken, the residual attributed to per-upload
 tt-metal-internal work (`#2107`) — are all landed; see `## Evidence`.
 The #1486 teardown fix and the #2115 opt-out-arm golden pair (each arm
-gates its own captured pair; both legs doctest 146/146) landed after it,
-as did the **W3 leftovers** (the two missing d2h `fetch_add`s and the
-scoped `conv_transposed` refusal; #2201 via #2217, `a456e6eaf`), with
-the suite at 44 cases / 4340 assertions. The `docs/USAGE.md` weights
-entry is complete (file, bytes, repo @ revision, sha256, refused arms).
-**W5** (the per-slot persistent buffer written through the mesh command
-queue, [#2244](https://github.com/mudler/vllm.cpp/issues/2244)) landed
-2026-08-29: allocation-free uploads proven (residual allocation 0.02% of
-the profile; suite 45 cases / 5062 assertions; sacred pair byte-identical)
-and the wall HONESTLY UNMOVED — the A/B trace split the W4 hypothesis:
-per-upload allocation was never the wall; the wall is the per-CQ-operation
-tt-metal stack (context queries, `Cluster::get_chip`, `read_cq_host_ptr`
-polling) plus threadpool spin. Owed next: **W6 — lever 3, batch per-layer
-staging** ([#2273](https://github.com/mudler/vllm.cpp/issues/2273)) is
-RESOLVED 2026-08-29: named UNREACHABLE with the trace (see `## Evidence`,
-W6) — the pinned tt-metal write API targets exactly one `MeshBuffer`
-per write (offset views are publicly constructible through
-`MeshBuffer::create`, but each view still needs its own write, so a
-merged write cannot exist), and the production staging
-fan-in is causally interleaved (each restage is produced by a host
-round-trip between writes), so a merged write would carry bytes that do
-not exist yet. **W7**
-([#2282](https://github.com/mudler/vllm.cpp/issues/2282)) — the
-round-trip-elimination lever — landed 2026-08-30 as a **measured null
-with an inverted premise, plus the safety rule the attempt proved
-necessary**: on both production workloads the staging write count is
-byte-identical before/after and the wall is unchanged (e2e ambient:
-`pwrite`=989 per 8640 steps in both arms, wall 1385.53 s vs 1385.93 s
-mean; vllm-cli: identical counters, wall noise), so the residency state
-does NOT manufacture the writes — they are the causally required ones
-W6 already identified (each produced by a host round-trip). The first
-gate run caught a REAL latent defect in the reservation arm (it served
-a stale persistent buffer over a live device shadow — wrong tokens on
-the default decode path); the fix spends the reservation on every
-content-establishing transition and refuses to serve when
-`device_current` is set (`d2fd05c6e`); suite 51/51 · 5852, sacred pair
-16/16 STRICT both legs. The review's latent geometry finding landed as its
-own red-first fix ([#2294](https://github.com/mudler/vllm.cpp/issues/2294));
-see `## Evidence`. The tt-metal-side residual (a multi-destination
-write that reaches several offset views at once) stays recorded as the
-upstream-shaped alternative.
+gates its own captured pair; both legs doctest 146/146) landed after it.
+The `docs/USAGE.md` weights entry is complete (file, bytes, repo @
+revision, sha256, refused arms). Owed next: **W3 leftovers** (d2h
+counter completeness, `conv_transposed` fast-path check, tests for
+both), then the W4 record's named next lever: a per-slot persistent
+device buffer written through the mesh command queue, which needs the
+tt-metal-internal half of W4's lever 2.
 
 ## Scope
 
@@ -396,10 +362,9 @@ the row.
 ## Git integration
 
 One pull request for spec and implementation (row claim answer 2026-08-23, recorded
-in `.agents/developer-preferences.md`). Base `origin/main` @ `c31b2496e` (rebased
-2026-08-30 for the PR's up-to-date requirement; the previous base `785d4304f`
-carried W6 #2273 via #2280). Branch
-`row/BACKEND-TENSTORRENT-QWEN35`, worktree
+in `.agents/developer-preferences.md`). Base `origin/main` @ `3fe34e2c6` (bumped
+2026-08-28; W4 #2118 and the #2115 opt-out-arm pair landed since the previous
+`8f5d4e4ed`). Branch `row/BACKEND-TENSTORRENT-QWEN35`, worktree
 `/home/lu_zero/Sources/vllmcpp-tt-qwen35`.
 
 ## Evidence
