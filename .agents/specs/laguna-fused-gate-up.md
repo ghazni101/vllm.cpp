@@ -229,71 +229,6 @@ every ratio from it remain superseded under #1003.
 prompt's token 2 was one. A prompt whose margins are wider might never diverge,
 and a longer generation might diverge more; neither was measured.
 
-## W4 — the wider sweep, COMPLETE: 6 of 6 prompts diverge, at widely varying depth
-
-Run on `dgx:gpu0` against `unsloth/Laguna-S-2.1-GGUF` `UD-Q4_K_XL` @ `750f92f9`.
-Six prompts, 256 tokens each, both arms, same binary and weights, differing only
-in `VT_LAGUNA_FUSED_GATEUP`. `SWEEP_DIVERGED=6 SWEEP_TOTAL=6 SWEEP_NTOK=256`.
-
-| # | Prompt | First divergence |
-|---|---|---:|
-| 0 | "The capital of France is" | **2** |
-| 1 | "List three prime numbers greater than one hundred:" | **73** |
-| 2 | "def quicksort(arr):" | **115** |
-| 3 | "If a train leaves at 3pm travelling 60km/h, and another" | **55** |
-| 4 | "Write a short paragraph about the sea in winter." | **13** |
-| 5 | "La capitale de l'Italie est" | **49** |
-
-Positions 2, 13, 49, 55, 73, 115 — median 52, min 2, max 115.
-
-### What this settles
-
-**The divergence is universal across these prompts, not a property of one.** W3's
-result came from prompt 0 alone, and the honest worry was that it might be that
-prompt's peculiarity. It is not: every prompt tried, across factual recall, a
-numbered list, code, arithmetic reasoning, free prose and a non-English factual,
-eventually hits a near-tie where the 2-ULP epilogue flips an argmax.
-
-**W3's position 2 was the WORST case, not the typical one.** Five of six ran
-between 13 and 115 tokens before splitting, and the code prompt reached 115. A
-reader who saw only W3 would have concluded the arm diverges immediately; it
-usually does not. That distinction is why this sweep reports the POSITION rather
-than a boolean, and it is the one thing the earlier single measurement got
-misleadingly right.
-
-**It does NOT establish a per-token probability, and the spread forbids
-estimating one from six samples.** A 2-to-115 range over n=6 supports "varies
-widely" and nothing sharper. No claim is made about prompts outside this set, and
-the prompts were chosen by hand rather than sampled.
-
-### What it means for the default
-
-The question W3 left open was whether the near-tie might be rare enough to
-reconsider shipping the arm ON. **It is not rare: 6 of 6.** The option is closed
-on the evidence rather than on preference, and `## Gates`'s advance commitment to
-refuse a near-tie stands unchanged. **The arm stays default-OFF.**
-
-### Cost, recorded because it was disproportionate
-
-Eight harness and environment faults were fixed to get this run, every one the
-author's: `xxd` absent; `--token-ids` read as an output flag when it is an input;
-`decode_hp` timings inside the token diff, which would have reported FAIL on every
-run; a 40-minute idle timeout against a measured 37.9-minute cadence, which killed
-a healthy job; an unverified `nvcc` install that produced a silently CPU-only
-build; a `lib64` glob that missed `targets/sbsa-linux/lib`; a `find | head -1`
-that selected a link-time STUB which cmake accepted with rc=0; and a cublasLt
-guard promoted to FATAL that then rejected dgx, the box that had always built.
-
-They share one root: **each fix encoded an assumption taken from the box last
-seen.** The general rule the last one states is that a guard must not be stricter
-than the thing it guards. The cheapest correction was also the latest: one
-12-minute diagnostic job established that the container had no CUDA and no NVIDIA
-apt repo, which seven earlier leases of inference had failed to determine.
-
-Also measured, and worth keeping: **Thor cannot run this sweep.** It loads this
-checkpoint in 2887 s against dgx's 14-24 min, so thirteen loads is 10.4 hours
-there against ~3.5 on dgx.
-
 ## Now
 
 `ACTIVE`, and the row's question is answered. W1 measured the dtype pairing
@@ -303,8 +238,9 @@ warm. **The arm ships default-OFF and the two-call path remains the reference.**
 
 What is owed, and neither is a blocker on the above:
 
-- ~~The wider token sweep~~ **DONE (`## W4`): 6 of 6 prompts diverge.** The
-  question of whether the near-tie is rare enough to reconsider the default is
-  answered and closed.
+- A wider token sweep. One prompt at 32 tokens established that a divergence
+  EXISTS; it cannot show how often. If several prompts at longer generations came
+  back identical, the near-tie would look rare enough to reconsider the default —
+  that is a decision for the developer, not for this spec to pre-empt.
 - A ratified speed number, if the arm is ever defaulted on: n=2 on one prompt is
   a direction. That needs repeats on an idle box.
