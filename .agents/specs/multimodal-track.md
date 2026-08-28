@@ -980,12 +980,9 @@ comparing the two arms must set the flag on both sides or state that it did not.
   *Read the fall in this number honestly: it is the defect leaving, not the
   saving shrinking.* Half of the pre-#1359 threshold was the host-f32 storage of
   a bf16 tower. The flag now frees the tower the checkpoint ships instead of the
-  tower plus our widening, so a rerun reads about 0.774 GiB where the 2026-08-24
-  run read 1.542, and that halving is CORRECT rather than a regression. **That
-  is no longer a prediction: the 2026-08-28 rerun recorded below measured
-  826916864 B = 0.770 GiB, which is 0.499x the 2026-08-24 saving, and MET this
-  threshold on both pairs.** The pre-declaration that authorises moving the
-  threshold with it is
+  tower plus our widening, so a rerun should read about 0.774 GiB where the
+  2026-08-24 run read 1.542, and that halving is CORRECT rather than a
+  regression. The pre-declaration that authorises moving the threshold with it is
   `.agents/specs/vision-tower-dtype-polarity.md` §6.2: the threshold was not
   renegotiated after a number arrived, it was re-derived because the fixed loader
   changed the quantity it is stated against. `muse-glimmer` still widens, its
@@ -1046,11 +1043,10 @@ comparing the two arms must set the flag on both sides or state that it did not.
      host f32. That is
      [#1359](https://github.com/mudler/vllm.cpp/issues/1359), which the operator
      has confirmed also affects the Qwen3.6-27B path. **#1359's Qwen3-VL half
-     has since LANDED, and the 2026-08-28 rerun recorded below MEASURED the
-     consequence: 826916864 B = 0.770 GiB, 0.499x this figure. The HALVING IS
-     CORRECT rather than a regression** — the flag now frees the tower the
-     checkpoint actually ships. The figure recorded above is what the run at
-     `41ab550b9` measured and it stays as that record.
+     has since LANDED, so this leg rerun should read about 0.774 GiB rather than
+     1.542, and that HALVING IS CORRECT rather than a regression** — the flag now
+     frees the tower the checkpoint actually ships. The figure recorded above is
+     what the run at `41ab550b9` measured and it stays as that record.
      `muse-glimmer-30b`'s tower is still held in host f32, so its own
      90%-of-7.161-GiB threshold is unchanged; that half is blocked on
      [#2166](https://github.com/mudler/vllm.cpp/issues/2166).
@@ -2128,25 +2124,13 @@ L4 (§1.6); the second while landing L3 (§1.5).
   MODEL.** The `qwen3-vl` figure below does not stand in for it and is 4.2x
   below this threshold.
 - **[#607](https://github.com/mudler/vllm.cpp/issues/607) L3 — the
-  `qwen3_vl.cpp` site is MEASURED, half 1 only, remeasured 2026-08-28.** It has
-  run twice and MET on both pairs both times.
-
-  The CURRENT figure is the 2026-08-28 rerun on `dgx:gpu0` under an `rc` lease
-  at `main` `525d2b991`, after #1359's Qwen3-VL half landed: **826916864 B and
-  826576896 B, 0.770 GiB**, against the live 747625881 B threshold, 99.5% of the
-  830695424 B tower the checkpoint ships, spread 339968 B against a leg-to-leg
-  24576 B. That run is also what VERIFIES #1359's Qwen3-VL half — the default
-  arm recovered 828219392 B = 99.7% of prediction, while the tower-free
-  `--language-model-only` control arm moved only +655360 B = +0.0077% against a
-  2% bound, which is what makes the cross-host attribution sound.
-
-  The 2026-08-24 run on `thor:gpu0` at `41ab550b9` is HISTORY and is kept as
-  such: it MET the threshold that stood then — 1495251763 B, SUPERSEDED by #1359
-  and NOT applicable to a rerun — with 1655791616 B and 1655992320 B, 1.542 GiB,
-  99.7% of the 1661390848 B resident tower that binary carried, spread 200704 B
-  against a leg-to-leg 192512 B. The fall between the two runs is 0.499x and is
-  CORRECT rather than a regression. The full result of each, its conditions and
-  its caveats are in §1.5 L3 under "THE RESULT" and "THE RERUN", and the
+  `qwen3_vl.cpp` site is MEASURED, half 1 only, 2026-08-24.** The run happened
+  on `thor:gpu0` under an `rc` lease at `main` `41ab550b9` and **MET** the
+  threshold that stood then — 1495251763 B, SUPERSEDED by #1359 and not
+  applicable to a rerun — on BOTH pairs of the swapped assignment: 1655791616 B
+  and 1655992320 B, 1.542 GiB, 99.7% of the 1661390848 B resident tower that
+  binary carried, spread 200704 B against a leg-to-leg 192512 B. The full result, its
+  conditions and its three caveats are in §1.5 L3 under "THE RESULT", and the
   evidence is
   `docs/bench-evidence/tower-skip-rss-qwen3vl-thor-20260824{,.legs}.log` and
   `docs/bench-evidence/tower-skip-rss-qwen3vl-dgx-20260828{,.legs}.log`.

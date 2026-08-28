@@ -605,9 +605,7 @@ benchmark ID is added, removed, or changes disposition — a rerun of an existin
 ## Now
 
 `ENG-MM-INPUT-PIPELINE` remains `READY`. #1359 stays OPEN: its Qwen3-VL half
-landed and is now MEASURED (2026-08-28, both §6.1 halves MET), its Muse Glimmer
-half did not land, and its Gemma-4 half landed unreached. An issue closes when
-the work lands; two thirds of this one has not.
+landed, its Muse Glimmer half did not.
 
 **Landed.** `Qwen3VLVisionWeights` (and therefore Qwen3-VL-4B, the
 Qwen3.5/3.6-27B dense path and the Qwen3.6-35B MoE path, which share
@@ -640,34 +638,19 @@ way. [#2166](https://github.com/mudler/vllm.cpp/issues/2166) owns it.
 of two kinds, not two policies, and keeping the surviving `* 2` visible is what
 stops the Muse Glimmer half from being forgotten.
 
-**MEASURED for `qwen3-vl`, 2026-08-28. §6.1 and §6.2 are MET; §6.3 is still
-PENDING.** The run is `scripts/mm/tower_skip_rss.sh --model-kind qwen3-vl
---device cpu` at `525d2b991` on `dgx:gpu0` under an `rc` lease, read against the
-2026-08-24 `41ab550b9` run on `thor:gpu0`.
+**Nothing is measured yet.** §6.1, §6.2 and §6.3 are all PENDING: the RSS gate
+needs a leased host and the staged `qwen3-vl-4b-instruct` checkpoint. The
+implementing wave produced the code, the CPU-runnable gates and the harness;
+the operator runs
 
-- **§6.1 half 1, the default arm: MET.** 10,209,501,184 B → 9,381,281,792 B, a
-  reduction of **828,219,392 B (0.771 GiB)** against a 747,625,881 B floor —
-  **99.7% of what this row's header arithmetic predicted.**
-- **§6.1 half 2, the `--language-model-only` control: MET.** 8,553,709,568 B →
-  8,554,364,928 B, **+655,360 B = +0.0077%** against a 2% band. That arm loads
-  no tower and did not move, which is what makes half 1 attributable to this row
-  rather than to the host.
-- **§6.2, the re-declared skip threshold: MET on both pairs.** 826,916,864 B and
-  826,576,896 B = 0.770 GiB, against 747,625,881 B. The published saving fell to
-  **0.499x** of 1.542 GiB, which is the declared halving and is correct.
-- **§6.3, the latency band: still PENDING.** No tower-encode timing was taken.
+```sh
+scripts/mm/tower_skip_rss.sh --model-kind qwen3-vl --device cpu
+```
 
-**One deviation, argued in §6.1 rather than absorbed:** the pre-fix figure comes
-from a different host and a commit that is not this one's parent, so half 2 is
-carrying the attribution. §6.1 records why the margins make that admissible, and
-`## Owed` keeps a same-host pre/post pair listed as the better evidence.
-
-Evidence: `docs/bench-evidence/tower-skip-rss-qwen3vl-dgx-20260828{,.legs}.log`,
-with the superseded run kept beside it at `…-thor-20260824{,.legs}.log`.
-
-**#1359 is NOT closed by this.** Its Qwen3-VL half is done and now verified; its
-Muse Glimmer half has not landed and its Gemma-4 half landed unreached. Both are
-under `## Owed`.
+on `thor:gpu0` or `dgx:gpu0` under an `rc` lease, at this commit and at its
+parent, and applies §6.1's two halves to the per-leg `peak RSS default` and
+`peak RSS lang-model-only` keys. MET is a default-arm reduction of at least
+747,625,881 B with the `--language-model-only` arm unchanged within 2%.
 
 ## Owed
 
@@ -676,18 +659,8 @@ under `## Owed`.
   today). Blocked on [#2166](https://github.com/mudler/vllm.cpp/issues/2166),
   which owns the golden regeneration the `kF32` per-stage gate needs, and
   separately on the ~56 GB of worker-local disk its RSS leg wants (§10).
-- **§6.3's latency band** is PENDING a leased host: no tower-encode timing has
-  been taken on either kind. §6.1's two halves and §6.2's re-declared skip
-  threshold are MET for `qwen3-vl` as of 2026-08-28 and are no longer owed; all
-  three remain owed for `muse-glimmer`, whose half has not landed.
-- **A same-host pre/post pair for §6.1.** The 2026-08-28 result reads a
-  `dgx:gpu0` post-fix run against a `thor:gpu0` pre-fix run four days earlier,
-  which is not the "same host" §6.1 declares, and `41ab550b9` is not
-  `525d2b991`'s parent. The `--language-model-only` control arm is what carries
-  the attribution instead, and it does so with a 260x margin, so the axis is MET
-  rather than VOID. Rerunning both arms at this commit and at its parent on one
-  host would replace an argued deviation with a clean one and is worth doing if
-  the figure is ever contested.
+- Both §6.1 halves, §6.2's re-declared skip threshold and §6.3's latency band
+  are PENDING a leased host. Nothing in this row has been measured.
 - [#2173](https://github.com/mudler/vllm.cpp/issues/2173) — **the whole Gemma-4
   vision tower this row narrowed is UNREACHED, and it lands that way.**
   `Gemma4VisionForward` and `Gemma4VisionWeights` have no caller outside
