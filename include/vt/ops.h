@@ -541,13 +541,8 @@ enum class OpId : uint8_t {
   //     too, saying so: "We cannot use the usual functions/kernels here for the
   //     short conv as the conv1d has dilation".
   //
-  // Registered on kCPU (src/vt/cpu/cpu_qwen4_exp_ple.cpp) and, since W6-CUDA,
-  // on kCUDA (src/vt/cuda/cuda_qwen4_exp_ple.cu). The device arm inherits this
-  // kernel's DOUBLE four-tap accumulator rather than choosing a width of its
-  // own, reads `query_start_loc` and `conv_state_indices` on the DEVICE, and is
-  // gated against the same lane-pinned transformers goldens at all three
-  // dilations (tests/vllm/models/test_qwen4_exp_cuda.cpp). No other device is
-  // registered, so the dispatcher still refuses those BY NAME.
+  // Registered on kCPU only (src/vt/cpu/cpu_qwen4_exp_ple.cpp). The CUDA arm is
+  // OWED, not written: it cannot be gated on a CPU-only host.
   // Appended before kCount so no existing op's id shifts.
   kQwen4ExpPleConv,
   // MODEL-MM-QWEN4-EXP W5b (#2031) — the Qwen4-Exp 4-branch GATED-RESIDUAL
@@ -1019,27 +1014,6 @@ struct Qwen4ExpPleConvArgs {
   // believes a different geometry, and deriving would make that agreement
   // unfalsifiable.
   int64_t dilation = 1;
-};
-
-// Qwen4-Exp PLE gate args (vt::Qwen4ExpPleGate). Algorithm oracle: transformers
-// v5.16.0 `models/qwen4_exp/modeling_qwen4_exp.py::Qwen4ExpTextPLELayer.forward`
-// (:1180-1182, flattened at :1184). Both numbers are held here rather than
-// derived from a shape, for the reason Qwen4ExpPleConvArgs::dilation gives: a
-// caller that believes a different geometry must be visible, not interpolated.
-struct Qwen4ExpPleGateArgs {
-  // `math.sqrt(self.hidden_size)`, the DIVISOR upstream ends :1180 with. Held as
-  // the divisor and not as its reciprocal so the op performs the same operation
-  // upstream does; multiplying by a pre-computed 1/sqrt(H) differs in the last
-  // place. 1.0 is the identity, which is what a caller that has already scaled
-  // its scores passes.
-  float gate_divisor = 1.0f;
-  // The `clamp_min(1e-6)` LITERAL at :1181 — not a config key, and upstream has
-  // no knob for it. It is a field so the number appears ONCE for every arm
-  // rather than being re-typed in each kernel, and so a caller that changes it
-  // is visible in the call rather than invisible in a backend. Applied to
-  // |gate| BEFORE the square root, so the floor it puts on the output magnitude
-  // is its own square root; see the kQwen4ExpPleGate comment.
-  float clamp_min = 1e-6f;
 };
 
 struct L2NormArgs {
@@ -2204,9 +2178,6 @@ using Qwen4ExpPleConvFn = void (*)(Queue&, Tensor& /*out*/, const Tensor& /*x*/,
                                    const Tensor& /*query_start_loc*/,
                                    const Tensor* /*conv_state_indices*/,
                                    const Qwen4ExpPleConvArgs&);
-// Qwen4-Exp PLE signed-sqrt gate + broadcast sigmoid scale (vt::Qwen4ExpPleGate).
-using Qwen4ExpPleGateFn = void (*)(Queue&, Tensor& /*out*/, const Tensor& /*score*/,
-                                   const Tensor& /*value*/, const Qwen4ExpPleGateArgs&);
 using L2NormFn = void (*)(Queue&, Tensor&, const Tensor&, const L2NormArgs&);
 using RmsNormGatedFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&,
                                 const RmsNormGatedArgs&);
@@ -3528,40 +3499,6 @@ void CausalConv1dUpdate(Queue& q, Tensor& out, const Tensor& x, const Tensor& we
 void Qwen4ExpPleConv(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight,
                      Tensor& conv_state, const Tensor& query_start_loc,
                      const Tensor* conv_state_indices, const Qwen4ExpPleConvArgs& args);
-
-// The Qwen4-Exp PLE GATE — `Qwen4ExpTextPLELayer.forward` :1181-1182, with the
-// :1184 flatten folded into the output layout. Per (t, j, d):
-//
-//   g       = score[t, j] / args.gate_divisor            // the tail of :1180
-//   gate    = sign(g) * sqrt(max(|g|, args.clamp_min))   // :1181
-//   out[t, j*H + d] = sigmoid(gate) * value[t, d]        // :1182, flattened :1184
-//
-// with sign(0) == 0, so g == 0 gives gate == 0 and out == 0.5 * value — NOT the
-// 1e-3 floor. That discontinuity is upstream's and is reachable: a fully masked
-// row scores exactly zero.
-//
-//   out    [T, hc*H]  f32 or bf16, contiguous
-//   score  [T, hc]    f32, contiguous — the raw per-(t, j) dot from
-//                     vt::BatchedMatmul, BEFORE the sqrt(hidden_size) divide
-//   value  [T, H]     float, contiguous
-//
-// `hc` and `H` are read off `score` and `value`; `out`'s second dim must be
-// their product, which is the check that catches a caller that flattened the
-// two the other way round.
-//
-// SCORE IS F32 AND ONLY F32, for the reason vt::SigmoidGateBf16 gives for its
-// own gate operand: it is the argument of a sigmoid and a transcendental's
-// input must not be rounded. `value` and `out` carry the model's storage width.
-//
-// PRECISION. f32 in, DOUBLE interior — the divide, the clamp, the square root,
-// the sigmoid and the product are all evaluated in double, matching the W2 host
-// reference (`qwen4_exp_ple.cpp::PleForward`) term for term — then ONE store.
-// The same house convention vt::Qwen4ExpPleConv states, and for the same
-// reason: it lets the two arms be bit-identical rather than merely close. A
-// CUDA arm that evaluates in f32 will not inherit that and must be gated
-// against the oracle directly; the spec's `## Owed` records it.
-void Qwen4ExpPleGate(Queue& q, Tensor& out, const Tensor& score, const Tensor& value,
-                     const Qwen4ExpPleGateArgs& args);
 
 // SPECULATIVE multi-token conv step (SPEC-MTP I4). Ported from
 // vllm/model_executor/layers/mamba/ops/causal_conv1d.py @ e24d1b24

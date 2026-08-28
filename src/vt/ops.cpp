@@ -1948,35 +1948,11 @@ void Qwen4ExpPleConv(Queue& q, Tensor& out, const Tensor& x, const Tensor& weigh
                std::to_string(conv_state.shape[2]) + "]");
   VT_CHECK(IsFloat(x.dtype) && IsFloat(weight.dtype) && IsOutFloat(out.dtype),
            std::string(name) + ": float x/weight, f32/bf16 out");
-  // THE STATE CARRIES THE MODEL DTYPE, AND THE ORACLE SETTLES IT (W5k, #2031).
-  // This check read `conv_state.dtype == kF32` and argued that "no CUDA arm of
-  // this op exists, so admitting a dtype nothing can produce would be a promise
-  // with no kernel behind it". The premise was about which KERNELS exist; the
-  // question is what UPSTREAM STORES, and those are different questions. The
-  // second one is now answered from the running oracle rather than from the
-  // shape of this tree.
-  //
-  // transformers 5.16.0 (the `qwen4_exp` lane pin, `.agents/oracles/transformers.md`)
-  // types each cache slot from the tensor that FIRST reaches it, per slot and not
-  // per layer: `cache_utils.py:1019-1023` allocates
-  // `torch.zeros(..., dtype=conv_states.dtype, device=conv_states.device)`. The
-  // tensor reaching the PLE conv slot is `hidden_states`
-  // (`modeling_qwen4_exp.py:1157-1159`, `update_conv_state(..., state_idx=1)`), so
-  // the ring carries the MODEL dtype. Observed, not inferred: the same fixture run
-  // at `dtype=torch.bfloat16` reports `conv_states[1] dtype=torch.bfloat16`, and at
-  // `float32` reports `float32`. It NEVER widens to f32.
-  //
-  // Admitting bf16 is therefore mirroring upstream, and refusing it was the
-  // "dtype that is too wide" AGENTS.md names — the defect class a token gate
-  // cannot see, because the tokens match while the path moves twice the bytes.
-  // The CPU kernel reads and writes the ring through the same `LoadF32At` /
-  // `StoreF32At` accessors it already used for `x` and `out`, so this admits no
-  // dtype that has no kernel behind it. f32 stays accepted and every existing
-  // f32 caller is byte-unchanged.
-  VT_CHECK(conv_state.dtype == DType::kF32 || conv_state.dtype == DType::kBF16,
-           std::string(name) +
-               ": conv_state must be f32 or bf16 (upstream types the slot from "
-               "the model dtype, cache_utils.py:1019-1023)");
+  // f32 state ONLY. `CausalConv1dSpecUpdate` admits bf16 on CUDA because a CUDA
+  // kernel there writes it; no CUDA arm of this op exists, so admitting a dtype
+  // nothing can produce would be a promise with no kernel behind it.
+  VT_CHECK(conv_state.dtype == DType::kF32,
+           std::string(name) + ": conv_state must be f32");
   VT_CHECK(x.IsContiguous() && out.IsContiguous() && weight.IsContiguous() &&
                conv_state.IsContiguous(),
            std::string(name) + ": x/out/weight/conv_state must be contiguous");
@@ -2012,53 +1988,6 @@ void Qwen4ExpPleConv(Queue& q, Tensor& out, const Tensor& x, const Tensor& weigh
   }
   reinterpret_cast<Qwen4ExpPleConvFn>(GetOp(OpId::kQwen4ExpPleConv, q.device.type))(
       q, out, x, weight, conv_state, query_start_loc, conv_state_indices, args);
-}
-
-// vt::Qwen4ExpPleGate — `Qwen4ExpTextPLELayer.forward` :1181-1182 (+ :1184),
-// transformers v5.16.0. The DOT that feeds it is vt::BatchedMatmul and is
-// deliberately not here; see the kQwen4ExpPleGate comment in include/vt/ops.h.
-void Qwen4ExpPleGate(Queue& q, Tensor& out, const Tensor& score, const Tensor& value,
-                     const Qwen4ExpPleGateArgs& args) {
-  constexpr const char* name = "qwen4_exp_ple_gate";
-  VT_CHECK(out.rank == 2 && score.rank == 2 && value.rank == 2,
-           std::string(name) + ": out [T,hc*H], score [T,hc], value [T,H]");
-  const int64_t T = score.shape[0], hc = score.shape[1], h = value.shape[1];
-  VT_CHECK(out.shape[0] == T && value.shape[0] == T,
-           std::string(name) + ": out/score/value must agree on T");
-  VT_CHECK(hc >= 1 && h >= 1, std::string(name) + ": hc and H must be >= 1");
-  // THE ONE CHECK THIS OP EXISTS FOR, after the arithmetic itself. `out` is the
-  // FLATTENED [T, hc*H] the conv and the norm downstream want, and a caller that
-  // flattened (H, hc) instead of (hc, H) produces a buffer of exactly the right
-  // size holding a transposed answer. The product is therefore named against
-  // both factors, so the message says which two numbers were multiplied.
-  VT_CHECK(out.shape[1] == hc * h,
-           std::string(name) + ": out must be [T, hc*H] = [T," + std::to_string(hc) + "*" +
-               std::to_string(h) + "] = [T," + std::to_string(hc * h) + "], got [T," +
-               std::to_string(out.shape[1]) + "]");
-  // f32 score only, the reason SigmoidGateBf16 gives for its own gate operand:
-  // this value is the argument of a sigmoid AND of a square root, and rounding a
-  // transcendental's input is a value change no downstream tolerance owns.
-  VT_CHECK(score.dtype == DType::kF32,
-           std::string(name) + ": score must be f32 (it is the sigmoid/sqrt argument)");
-  VT_CHECK(IsFloat(value.dtype) && IsOutFloat(out.dtype),
-           std::string(name) + ": float value, f32/bf16 out");
-  VT_CHECK(args.gate_divisor > 0.0f,
-           std::string(name) + ": gate_divisor must be > 0 (it is math.sqrt(hidden_size)), got " +
-               std::to_string(args.gate_divisor));
-  // 0 is NOT "no floor". Upstream's literal is 1e-6 and its whole effect is the
-  // 1e-3 floor it puts on |output|; a zero here would silently mean "port the
-  // line without the clamp", which is the defect the op is gated against.
-  VT_CHECK(args.clamp_min > 0.0f,
-           std::string(name) +
-               ": clamp_min must be > 0; 0 is NOT 'no floor'. Upstream's literal is 1e-6 "
-               "(modeling_qwen4_exp.py:1181) and it is applied BEFORE the sqrt, so the "
-               "floor on |out| is its square root");
-  VT_CHECK(out.IsContiguous() && score.IsContiguous() && value.IsContiguous(),
-           std::string(name) + ": out/score/value must be contiguous");
-  VT_CHECK(out.device == q.device && score.device == q.device && value.device == q.device,
-           std::string(name) + ": device mismatch (out/score/value/queue)");
-  reinterpret_cast<Qwen4ExpPleGateFn>(GetOp(OpId::kQwen4ExpPleGate, q.device.type))(
-      q, out, score, value, args);
 }
 
 void CausalConv1dSpecUpdate(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight,
