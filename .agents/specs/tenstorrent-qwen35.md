@@ -1266,22 +1266,3 @@ Gates: opt-out leg 16/16 PASS (9 strict, 7 near-tie, max gap 0.5 nats at
 prompt[15] tok=9) exit 0; ambient leg 16/16 (10 strict, max 0.375) exit 0 —
 unchanged; suite 40/40 / 3757/3757 exit 0. Evidence:
 `docs/bench-evidence/tt-2115-eager-arm-pair-20260828.log`.
-
-### #2294 — the capture-lane copy records the served geometry (2026-08-30)
-
-The W7 review's latent finding, fixed red-first. `CopyDeviceDeviceIfCapture`
-installed a SRC-shaped clone into dst's slot but left `dev_rows`/`dev_cols`
-naming dst's old geometry; its guard checks slot byte sizes only, so equal
-bytes at differing `[rows,cols]` passed, and a later exact-shape
-`EnsureDevice2D` false-hit the fast path and served the wrongly-shaped
-shadow. The red is the ttnn inner-dim throw (`a_shape[-1] == b_shape[-2]`,
-8 vs 16) on the consume matmul — a loud failure, not silent corruption —
-plus the lane's missing avoided-copy counter. Fix: record src's
-`logical_shape()` in the commit block (the same lines W7 put on
-`CopyDeviceDeviceIfResident`) and bump `StagingAvoidedDeviceCopy` so both
-D2D arms are observable (the eager tests' `ForceEager` scopes decline the
-capture lane, so no existing counter assertion shifts). Focused case
-131/131 green; suite 52/52 · 5983 (baseline on the unmodified tree:
-51/51 · 5852 green first). No differing-geometry D2D caller exists in
-production today (the W7-review audit); the test is the guard for the one
-that appears.
