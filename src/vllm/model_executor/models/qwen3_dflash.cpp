@@ -857,7 +857,6 @@ static std::vector<float> ForwardWithCtxKVDev(
       vt::MatmulBT(d.q, k.t(), dhn.t(), wqkv.Slice(0, qdim, qdim + kdim));
       vt::MatmulBT(d.q, v.t(), dhn.t(), wqkv.Slice(0, qdim + kdim, qdim + 2 * kdim));
     }
-    ops.Lap(ops.qkv);
     Tensor q2 = Reshape(q.t(), {Tq * Hq, Dh});
     Tensor k2 = Reshape(k.t(), {Tq * Hkv, Dh});
     Tensor q3 = Reshape(q.t(), {Tq, Hq, Dh});
