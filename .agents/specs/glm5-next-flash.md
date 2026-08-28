@@ -2585,17 +2585,7 @@ Debts this row carries, each visible rather than waived:
   `GLM5V = "glm5v"`, and `tools/mtmd/clip-impl.h:551` accepts it. A vision
   denominator is therefore obtainable by CONVERTING the checkpoint with that
   head, and unobtainable only by pointing it at the published mmproj.
-- **O5 — no i-quant arm is producible on this fleet** (R4). **PRODUCIBLE, not
-  readable — and the wording above misled a reader into concluding the whole
-  i-quant lane was absent.** O5 is about the CONVERTER, the write side: this
-  tree has no i-quant ENCODER and cannot emit one of these arms. The READ side
-  is far better covered and always was: `gguf_dequant.cpp` decodes IQ1_S,
-  IQ1_XXXS, IQ2_XXS, IQ2_S, IQ3_XXS and IQ4_NL, and
-  [#2240](https://github.com/mudler/vllm.cpp/issues/2240) added IQ2_XS (17) and
-  IQ4_XS (23), the last two the staged UD-Q2_K_XL arm needed. Every one of them
-  is gated byte-for-byte against the pinned llama.cpp. The clarification is
-  recorded here rather than in the report that noticed it, because the next
-  reader will land on this line and not on that report.
+- **O5 — no i-quant arm is producible on this fleet** (R4).
 - **O6 — speed.** No number on any axis, and no denominator exists.
 - **O7 — NARROWED by W5c ([#2242](https://github.com/mudler/vllm.cpp/issues/2242)):
   an artifact EXISTS, and what is still owed is a conversion of OURS.** The
