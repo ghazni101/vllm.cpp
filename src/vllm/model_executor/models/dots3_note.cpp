@@ -652,35 +652,29 @@ Dots3NoteWeights LoadDots3NoteWeights(const std::vector<SafetensorsFile>& shards
                "towers " + towers +
                " — see .agents/specs/dots3-note.md and issue #699");
 
-  // W2 owns the materialization. Returning an UNMATERIALIZED model rather than
-  // throwing is deliberate: the accounting above is a real production result
-  // worth having, and the refusal belongs at the forward, where it names the
-  // brick that owes the maths. `materialized` stays false, and every path that
-  // would read a weight goes through `Dots3NoteForward`, which refuses.
-  w.materialized = false;
+  // MATERIALIZATION IS CONDITIONAL, and the condition is the DEVICE FORWARD's
+  // own scope rather than a preference (W4a, #699).
+  //
+  // `Dots3NoteDeviceRefusal` is empty only for a config whose every layer is
+  // FULL attention with a DENSE MLP — the shape W4a put on the decode path.
+  // For that shape the tower is read for real, with every tensor's shape
+  // checked BY NAME, and `materialized` becomes true. For everything else, the
+  // released `dots-studio/dots3-note-prev` config included, nothing changes:
+  // the accounting above is still a real production result, no tensor byte is
+  // read, and the refusal stays at the forward where it names the brick that
+  // owes the maths.
+  //
+  // The alternative — materialize unconditionally — was rejected on a
+  // measurement rather than on taste. The released config's `embed_tokens`
+  // alone is 152064 x 5120 bf16 = 1.5 GiB, and W1/W2's gate drives the WHOLE
+  // 38006-name index through this loader from a synthetic checkpoint of
+  // one-element tensors. Demanding real shapes there would either red the
+  // accounting gate or force a fixture nothing can hold in memory.
+  if (Dots3NoteDeviceRefusal(w.params).empty()) {
+    w.device = MaterializeDots3NoteDevice(shards, w.params);
+    w.materialized = w.device.present;
+  }
   return w;
-}
-
-ForwardLogits Dots3NoteModel::ForwardDevice(
-    const std::vector<int32_t>& token_ids, const std::vector<int32_t>& positions,
-    const v1::CommonAttentionMetadata& attn_meta,
-    const std::vector<PagedKvCache>& attn_kv, const Dots3NoteWeights& weights,
-    vt::Queue& queue, const std::vector<int32_t>& logits_indices) {
-  (void)token_ids;
-  (void)positions;
-  (void)attn_meta;
-  (void)attn_kv;
-  (void)queue;
-  (void)logits_indices;
-  VT_CHECK(false,
-           std::string(
-               "Dots3NoteForCausalLM forward: not ported — the language tower "
-               "needs the sliding-window MLA over 33 of 46 layers (W4), the "
-               "headwise-gated MLA with the lora rescales and "
-               "k_rope_only_layernorm (W3), the ungrouped noaux_tc MoE (W5), "
-               "and the vision/audio towers (W6/W7). Host weights are ") +
-               (weights.materialized ? "materialized" : "not materialized") +
-               ". See .agents/specs/dots3-note.md and issue #699.");
 }
 
 v1::KVCacheConfig MakeDots3NoteKVCache(const HfConfig& config, int block_size,
@@ -693,8 +687,56 @@ v1::KVCacheConfig MakeDots3NoteKVCache(const HfConfig& config, int block_size,
   // read (`attention.py`::Dots3NotePaddedSparseImpl._logical_cache). Reporting
   // 576 here would under-allocate every sliding layer by 512 rows.
   //
-  // The heterogeneous per-layer group split, the DSA index cache and the
-  // windowed metadata are W4's, and are NOT represented here.
+  // Three things are still NOT represented here. W4b-2 changed which brick owes
+  // the first of them, and W4b-3a corrected the owner of the first two: neither
+  // is this row's to do alone. The comment used to say all three were "W4's",
+  // which stopped being true the moment the sliding layers ran, and then said
+  // "W4b-3", which claims another row's work.
+  //
+  //   the heterogeneous per-layer  Row `KV-DSV4-MULTICACHE` W3 (the runner
+  //   KV-cache GROUP SPLIT         carries more than one attention group) and
+  //                                W4 (non-uniform block sizes), issue #1925.
+  //                                dots3-note DEPENDS on that row for this and
+  //                                must not duplicate it: the group-selection
+  //                                loop in `src/vllm/v1/worker/gpu/runner.cpp`
+  //                                (:607-626) keeps the FIRST full-attn/MLA
+  //                                group, and the VT_CHECK at (:685-693) now
+  //                                REFUSES BY NAME every further published
+  //                                group rather than dropping it
+  //                                (KV-DSV4-MULTICACHE W2, #1973, gated at
+  //                                tests/vllm/v1/worker/test_runner.cpp:1621
+  //                                and :1643). Publishing a second spec kind
+  //                                first therefore makes the runner THROW at
+  //                                construction, and does not allocate a silent
+  //                                subset.
+  //                                Upstream gives a sliding layer a
+  //                                `SlidingWindowMLASpec`
+  //                                (`mla_attention.py:1215-1219` @
+  //                                `bc2d63e650`, fed
+  //                                `sliding_window=config.sliding_window_size`
+  //                                at `model.py:457`), which is a SECOND spec
+  //                                kind and therefore a second group. That TYPE
+  //                                now EXISTS here (`SlidingWindowMLASpec`,
+  //                                `kv_cache_interface.h`, landed #1960); what
+  //                                dots3-note owes on top is the per-layer
+  //                                emission. We emit
+  //                                one uniform `MLAAttentionSpec` for all 46
+  //                                layers, so 33 of them hold a full-length
+  //                                latent cache where upstream caps them near
+  //                                the window. No correctness consequence — the
+  //                                window is applied on READ, and W4b-2's gate
+  //                                proves it — but it is the largest memory
+  //                                property of this architecture and a token
+  //                                gate cannot see it. `## Owed` carries it.
+  //   the DSA index cache          The SELECTION is W4b-3, here. The CACHE is a
+  //                                second kind on the same layers, so it has
+  //                                the SAME dependency as the GROUP SPLIT
+  //                                entry: `KV-DSV4-MULTICACHE` W3/W4, #1925.
+  //   the windowed metadata        never, here: `_build_sliding_window_metadata`
+  //                                is upstream's Triton gather bound, and the
+  //                                port walks the paged block table instead
+  //                                (spec §4.8), so there is no metadata to
+  //                                allocate.
   const Dots3NoteParams p = ParseDots3NoteParams(config);
   v1::KVCacheConfig kv;
   kv.num_blocks = num_blocks;

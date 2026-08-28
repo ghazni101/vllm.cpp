@@ -476,6 +476,23 @@ enum class OpId : uint8_t {
   // separate argument list (`exl3_moe.cuh:8-46`). See vt::Exl3MoeMlp below.
   // Appended before kCount so no existing op's id shifts.
   kExl3MoeMlp,
+  // --- The LTX-2.5 CONV VIDEO VAE's device-resident glue table
+  // (LTX25-VAE-DEVICE-RESIDENCY, #1451). The ten stages between the decode's
+  // convolutions that the shared `vt::` surface does NOT express: pixel-norm,
+  // GroupNorm over a channel-major volume, the ada-LN affine, the spatial-noise
+  // broadcast, depth-to-space, a frame slice, a channel repeat, a channel-major
+  // 1x1x1 linear, unpatchify, and the causal/spatial pad.
+  //
+  // It is LONGER than kLtx2's seven because a convolutional decoder is mostly
+  // SHAPE MOVEMENT and this tree has no `vt::` permute, transpose,
+  // depth-to-space or slice op at all, and no GroupNorm and no pixel-norm. What
+  // the decode does reuse is `vt::Conv3d`, kLtx2's `silu` and `vt::Add`.
+  //
+  // Registered on BOTH kCPU (cpu_ltx2_vae.cpp) and kCUDA (cuda_ltx2_vae.cu), so
+  // the RESIDENT STRUCTURE is exercised in CPU CI and a GPU is needed to gate
+  // the KERNELS rather than the port; resolved via ltx2_vae::Ltx2VaeDevice().
+  // Appended before kCount so no existing op's id shifts.
+  kLtx2Vae,
   kCount
 };
 
@@ -939,13 +956,32 @@ struct AttentionRelPosArgs {
 //     so the SWA layer degenerates to plain causal over the block — the mask still
 //     computes the true window bound for fidelity to other DFlash checkpoints.
 // f32 softmax accumulation (max-subtracted), matching vLLM. GQA broadcast as in
-// vt::Attention. query [T,Hq,D], key/value [T,Hkv,D], out [T,Hq,D], T = ΣblockLen.
+// vt::Attention. query [Tq,Hq,D], key/value [T,Hkv,D], out [Tq,Hq,D], T = ΣblockLen
+// and Tq = T unless `cu_seqlens_q` is set (see the field, SPEC-DFLASH2 W12 D1).
 struct DFlashBlockAttentionArgs {
   float scale = 0.0f;              // head_dim^-0.5 (DFlashQwen3Attention.scaling)
   bool causal = false;            // per-layer: false=full(non-causal), true=SWA
   int64_t sliding_window = 0;     // SWA window (>0); 0 = full causal when causal
-  const int32_t* cu_seqlens = nullptr;  // host, length num_reqs+1 (block bounds)
+  const int32_t* cu_seqlens = nullptr;  // host, length num_reqs+1 (KEY/VALUE bounds)
   int num_reqs = 1;               // number of query blocks
+  // SPEC-DFLASH2 W12 D1 (#2087) — the SEPARATE QUERY cu. When null (the default,
+  // and every pre-W12 caller), query and key share `cu_seqlens` and this op is
+  // exactly what it was: T query rows over T key rows, one square block per
+  // request. When set (host, length num_reqs+1, spanning [0, query.shape[0]]),
+  // request r owns query rows [cu_seqlens_q[r], cu_seqlens_q[r+1]) and key rows
+  // [cu_seqlens[r], cu_seqlens[r+1]), and the query block is the BOTTOM-RIGHT
+  // suffix of the key block — query offset `ii` sits at combined key offset
+  // `klen_r - qlen_r + ii`, which is the [context ; block] layout the DFlash
+  // draft materializes (qwen3_dflash.cpp `ForwardWithCtxKVDev`). The mask reads
+  // the COMBINED offset, so causal/SWA sees the context as the past exactly as
+  // vt::DFlashPagedBlockAttention does, and `cu_seqlens_q == cu_seqlens` is
+  // arithmetically the null case (klen == qlen ⇒ the offset is 0).
+  //
+  // WHY IT EXISTS. Without it the caller must build an `Ncomb`-row query buffer
+  // whose context rows are zero, compute attention for every one of them, and
+  // discard the result: `sum_r (ctx_r + 1 + k)^2` pairs per layer per step
+  // instead of `(1+k) x C`. That was the whole c>1 draft cost (#2087).
+  const int32_t* cu_seqlens_q = nullptr;
 };
 
 // SPEC-DFLASH D12 Part B — CAPTURE-SAFE paged variant of DFlashBlockAttention.
@@ -1332,6 +1368,34 @@ struct MlaDecodeAttentionArgs {
   // used to derive `num_kv_splits` when that is 0; an upper bound is safe. When
   // both are 0 the impl falls back to 1 split.
   int32_t max_seq_len = 0;
+  // ─── the SLIDING-WINDOW decode arm (dots3-note W4b-2, #699) ───────────────
+  // OPTIONAL local-attention bounds, the same `AttentionWindow` convention
+  // `PagedAttentionArgs::window_size` already uses: for the bottom-right
+  // aligned absolute query position `p = seq_len - 1` (MLA decode is ONE query
+  // per row), visible keys are `[p - left, p + right]` intersected with
+  // `[0, seq_len)`. `std::nullopt` — every DeepSeek / MiniCPM3 / Kimi-Linear
+  // registration — leaves the full-context loop byte-identical: the window is
+  // not a mask applied afterwards, it is the loop's START BOUND, so an absent
+  // window is a NOT-TAKEN branch rather than a no-op.
+  //
+  // UPSTREAM. `TritonMLAImpl` itself REJECTS a sliding window
+  // (triton_mla.py:165-171); dots3-note SUBCLASSES it —
+  // `Dots3NoteTritonMLAImpl.__init__` passes `sliding_window=None` to super and
+  // keeps the value on itself (`vllm/models/dots3_note/nvidia/attention.py`
+  // :439-468 @ `bc2d63e650`), then `_forward_swa_mqa` (`:470-563`) gathers a
+  // window-bounded slice of the paged latent and masks the scores with
+  // `kv_positions >= query_position - WINDOW_SIZE + 1` (`:152`) and
+  // `kv_positions <= query_position` (`:151`). `WINDOW_SIZE` is
+  // `sliding_window_size` = 513, so `left == sliding_window - 1`, matching the
+  // `window_size=(sliding_window - 1, 0)` upstream hands FlashAttention on the
+  // PREFILL half (`:300`). The gather is upstream's Triton WORKSPACE strategy;
+  // the paged kernels here read the block table directly over the same key
+  // range, which is the same function with no gather and no mask.
+  //
+  // `right` must be 0: an MLA decode query IS the last position of its own
+  // sequence, so a positive right bound could only admit keys that do not
+  // exist. Anything else is refused BY NAME in ops.cpp rather than ignored.
+  std::optional<AttentionWindow> window_size = std::nullopt;
 };
 
 // Arguments for vt::MlaPrefillAttention (MLA campaign W5). Mirrors the scalar
@@ -1354,6 +1418,26 @@ struct MlaPrefillAttentionArgs {
   // same fallback the FA-2 paged prefill launcher uses.
   int32_t max_seqlen_q = 0;
   int32_t max_seqlen_k = 0;
+  // ─── the SLIDING-WINDOW prefill arm (dots3-note W4b-2, #699) ──────────────
+  // OPTIONAL local-attention bounds, the `AttentionWindow` convention. Query
+  // `i` of a request whose query length is `Lq` and key length is `Lk` sits at
+  // the bottom-right aligned position `p = i + (Lk - Lq)`; visible keys are
+  // `[p - left, p + right]` intersected with `[0, Lk)`.
+  //
+  // UPSTREAM is literally this pair: `Dots3NoteFlashAttnPrefillBackend.
+  // run_sliding_window` calls `_flash_attn_varlen_diff_headdims(..., causal=
+  // True, window_size=(sliding_window - 1, 0))`
+  // (`vllm/models/dots3_note/nvidia/attention.py:279-305` @ `bc2d63e650`, the
+  // window at `:300`), so `left == sliding_window - 1` and `right == 0`.
+  //
+  // `causal` must be TRUE whenever this is set, and `right` must be 0. Both are
+  // refused BY NAME in ops.cpp rather than approximated: FlashAttention's local
+  // mask REPLACES the causal specialization (the adapter normalizes
+  // `is_causal = causal && !is_local`, cuda_flash_attn_fa2.cu:472-476), so a
+  // non-causal window would have to be spelled with an infinite right bound,
+  // which this struct cannot say. Upstream never asks for one — every windowed
+  // call it makes is the causal `(W-1, 0)` pair above.
+  std::optional<AttentionWindow> window_size = std::nullopt;
 };
 
 // Router SCORING function. softmax over all E is the Qwen3.6 / DeepSeek-V2

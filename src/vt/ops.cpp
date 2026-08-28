@@ -37,6 +37,7 @@ ScalarTypeId ToScalarType(DType dtype) {
     // scales and packed codes. Kernels consume them through the quant traits
     // table, never through a KernelTensorDesc scalar type.
     case DType::kQ4_0:
+    case DType::kQ5_0:
     case DType::kQ8_0:
     case DType::kQ2_K:
     case DType::kQ3_K:
@@ -49,6 +50,7 @@ ScalarTypeId ToScalarType(DType dtype) {
     case DType::kIQ2_S:
     case DType::kIQ1_S:
     case DType::kIQ1_XXXS:
+    case DType::kIQ4_NL:
     case DType::kMXFP4:
       break;
   }
@@ -1481,8 +1483,27 @@ void Embedding(Queue& q, Tensor& out, const Tensor& table, const Tensor& ids) {
   VT_CHECK(out.shape[0] == ids.shape[0] && out.shape[1] == table.shape[1],
            "embedding: output shape mismatch");
   VT_CHECK(ids.dtype == DType::kI32 || ids.dtype == DType::kI64, "embedding: ids i32/i64");
-  VT_CHECK(IsFloat(table.dtype) && IsOutFloat(out.dtype),
-           "embedding: float table, f32/bf16 out");
+  // A BLOCK-QUANTIZED table is admitted alongside the elementwise ones: the
+  // kernel then dequantizes ONE ROW per gathered id instead of loading it,
+  // mirroring `ggml_compute_forward_get_rows_q` (llama.cpp @ b10451
+  // ggml/src/ggml-cpu/ops.cpp:4850), which dispatches every quantized get_rows
+  // through the type's `to_float`. This is what lets a gather table stay
+  // COMPRESSED in memory; a 20 M-entry n-gram table has no other affordable
+  // residency (Qwen3.8-Flash-Next: 28.8 GB of IQ4_NL against 102.4 GB of bf16).
+  VT_CHECK(IsFloat(table.dtype) || IsBlockQuant(table.dtype),
+           "embedding: table must be float or block-quantized");
+  VT_CHECK(IsOutFloat(out.dtype), "embedding: f32/bf16 out");
+  // `ggml_row_size` asserts a row is a whole number of blocks; a ragged K has no
+  // row stride at all, so it refuses here rather than mis-striding every row
+  // after the first. (This is also the reason the shipped table is IQ4_NL:
+  // its row is 160, and no 256-element K-quant can encode it.)
+  if (IsBlockQuant(table.dtype)) {
+    VT_CHECK(table.shape[1] % BlockElems(table.dtype) == 0,
+             "embedding: block table K must be a whole number of blocks");
+  }
+  // A block table's strides are logical (elements), exactly as for a
+  // `kMatmulBTQuant` weight: they describe [V, K] row-major, and the kernel
+  // converts to bytes through RowSizeBytes.
   VT_CHECK(table.IsContiguous() && ids.IsContiguous() && out.IsContiguous(),
            "embedding: contiguous required");
   VT_CHECK(table.device == out.device && ids.device == table.device && table.device == q.device,
@@ -2855,10 +2876,19 @@ void Conv3d(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight, const 
   if (q.device.type != DeviceType::kCPU) {
     static std::atomic<bool> announced{false};
     if (!announced.exchange(true)) {
-      std::fprintf(stderr,
-                   "[vt] first non-CPU vt::Conv3d dispatch (device type %d). This arm has never "
-                   "been run on real hardware; see issue #1452.\n",
-                   static_cast<int>(q.device.type));
+      // The CUDA arm HAS now been run, so it must not claim otherwise. It was
+      // compiled for sm_121a and executed on a GB10 under #1452, and
+      // tests/vt/test_ops_conv3d.cpp gates it `memcmp`-identical to the CPU
+      // provider over the whole shape table and under catastrophic
+      // cancellation. Every OTHER accelerator type reaching this seam is still
+      // unrun, and the announcement stays for them: that is why this is
+      // narrowed rather than deleted.
+      std::fprintf(stderr, "[vt] first non-CPU vt::Conv3d dispatch (device type %d). %s\n",
+                   static_cast<int>(q.device.type),
+                   q.device.type == DeviceType::kCUDA
+                       ? "The CUDA arm is byte-gated against the CPU provider and was executed "
+                         "on a GB10 (#1452). No SPEED claim attaches to it."
+                       : "This arm has never been run on real hardware; see issue #1452.");
     }
   }
   reinterpret_cast<Conv3dFn>(GetOp(OpId::kConv3d, q.device.type))(q, out, x, weight, bias, args);
@@ -3143,15 +3173,17 @@ void DFlashBlockAttention(Queue& q, Tensor& out, const Tensor& query, const Tens
                           const Tensor& value, const DFlashBlockAttentionArgs& args) {
   VT_CHECK(query.rank == 3 && key.rank == 3 && value.rank == 3 && out.rank == 3,
            "dflash-block-attn: query/key/value/out rank-3 [T,Hq/Hkv,D]");
-  const int64_t t = query.shape[0], hq = query.shape[1], d = query.shape[2];
+  const int64_t tq = query.shape[0], hq = query.shape[1], d = query.shape[2];
+  const int64_t t = key.shape[0];
   const int64_t hk = key.shape[1];
-  VT_CHECK(key.shape[0] == t && value.shape[0] == t,
-           "dflash-block-attn: query/key/value token count must match");
+  VT_CHECK(value.shape[0] == t, "dflash-block-attn: key/value token count must match");
+  VT_CHECK(args.cu_seqlens_q != nullptr || tq == t,
+           "dflash-block-attn: query/key token count must match unless cu_seqlens_q is set");
   VT_CHECK(key.shape[2] == d && value.shape[2] == d,
            "dflash-block-attn: key/value head_dim must match query");
   VT_CHECK(value.shape[1] == hk, "dflash-block-attn: key/value must share the kv-head count");
-  VT_CHECK(out.shape[0] == t && out.shape[1] == hq && out.shape[2] == d,
-           "dflash-block-attn: out must be [T,Hq,D] matching query");
+  VT_CHECK(out.shape[0] == tq && out.shape[1] == hq && out.shape[2] == d,
+           "dflash-block-attn: out must be [Tq,Hq,D] matching query");
   VT_CHECK(hk >= 1 && hq >= 1 && hq % hk == 0,
            "dflash-block-attn: Hq must be a positive multiple of Hk (GQA broadcast)");
   VT_CHECK(args.scale > 0.0f, "dflash-block-attn: scale must be set (> 0), e.g. head_dim^-0.5");
@@ -3159,6 +3191,22 @@ void DFlashBlockAttention(Queue& q, Tensor& out, const Tensor& query, const Tens
            "dflash-block-attn: cu_seqlens (host, num_reqs+1) required");
   VT_CHECK(args.cu_seqlens[0] == 0 && args.cu_seqlens[args.num_reqs] == static_cast<int32_t>(t),
            "dflash-block-attn: cu_seqlens must span [0,T]");
+  if (args.cu_seqlens_q != nullptr) {
+    // D1 (#2087): the query block is the per-request SUFFIX of the key block, so
+    // every request's query run must FIT its key run. A qlen > klen would make the
+    // combined offset negative and read the previous request's keys.
+    VT_CHECK(args.cu_seqlens_q[0] == 0 &&
+                 args.cu_seqlens_q[args.num_reqs] == static_cast<int32_t>(tq),
+             "dflash-block-attn: cu_seqlens_q must span [0,Tq]");
+    for (int r = 0; r < args.num_reqs; ++r) {
+      VT_CHECK(args.cu_seqlens_q[r + 1] >= args.cu_seqlens_q[r] &&
+                   args.cu_seqlens[r + 1] >= args.cu_seqlens[r],
+               "dflash-block-attn: cu_seqlens/cu_seqlens_q must be non-decreasing");
+      VT_CHECK(args.cu_seqlens_q[r + 1] - args.cu_seqlens_q[r] <=
+                   args.cu_seqlens[r + 1] - args.cu_seqlens[r],
+               "dflash-block-attn: per-request query rows must not exceed key rows");
+    }
+  }
   VT_CHECK(IsFloat(query.dtype) && key.dtype == query.dtype && value.dtype == query.dtype,
            "dflash-block-attn: query/key/value must share one float dtype");
   VT_CHECK(IsOutFloat(out.dtype), "dflash-block-attn: out must be f32 or bf16");
@@ -3591,6 +3639,22 @@ void MlaDecodeAttention(Queue& q, Tensor& out, Tensor* lse, const Tensor& query,
            "(the auto cache path; the fp8 KV-cache branch is out of scope)");
   VT_CHECK(args.scale > 0.0f, "mla_decode_attention: args.scale must be > 0");
   VT_CHECK(args.num_kv_splits >= 0, "mla_decode_attention: args.num_kv_splits must be >= 0");
+  // The sliding-window arm (dots3-note W4b-2, #699). `left` is the inclusive
+  // distance behind the query, so the window WIDTH is `left + 1` and upstream's
+  // `sliding_window_size` 513 arrives as `left == 512`. A zero-width window
+  // would leave a decode row with no keys at all, which upstream cannot
+  // produce (`WINDOW_SIZE` is a positive config field), so it is refused rather
+  // than silently emitting zeros.
+  if (args.window_size.has_value()) {
+    VT_CHECK(args.window_size->left >= 0,
+             "mla_decode_attention: window_size.left must be >= 0 (it is the INCLUSIVE "
+             "distance behind the query; sliding_window 513 is left == 512)");
+    VT_CHECK(args.window_size->right == 0,
+             "mla_decode_attention: window_size.right must be 0 — an MLA decode query IS "
+             "the last position of its own sequence, so a positive right bound could only "
+             "admit keys that do not exist. Upstream's dots3-note window is "
+             "(sliding_window - 1, 0) (attention.py:300 @ bc2d63e650).");
+  }
   // Indexing is stride-driven on the leading dims (a cross-layer cache view has
   // gaps — cf. upstream `_page_stride`, triton_decode_attention.py:59-65), so we
   // require only unit innermost strides.
@@ -3660,6 +3724,25 @@ void MlaPrefillAttention(Queue& q, Tensor& out, Tensor* lse, const Tensor& query
   VT_CHECK(args.scale > 0.0f, "mla_prefill_attention: args.scale must be > 0");
   VT_CHECK(args.max_seqlen_q >= 0 && args.max_seqlen_k >= 0,
            "mla_prefill_attention: args.max_seqlen_q/max_seqlen_k must be >= 0");
+  // The sliding-window arm (dots3-note W4b-2, #699). Upstream's only windowed
+  // prefill call is `causal=True, window_size=(sliding_window - 1, 0)`
+  // (attention.py:279-305 @ bc2d63e650). A NON-causal window is refused rather
+  // than approximated: FlashAttention's local mask replaces the causal
+  // specialization entirely, so "all keys forward, windowed backward" would need
+  // an infinite right bound this struct cannot express.
+  if (args.window_size.has_value()) {
+    VT_CHECK(args.window_size->left >= 0,
+             "mla_prefill_attention: window_size.left must be >= 0 (the INCLUSIVE distance "
+             "behind the bottom-right aligned query position)");
+    VT_CHECK(args.window_size->right == 0,
+             "mla_prefill_attention: window_size.right must be 0 — upstream's windowed MLA "
+             "prefill is the causal (sliding_window - 1, 0) pair (attention.py:300)");
+    VT_CHECK(args.causal,
+             "mla_prefill_attention: a window requires causal=true. FlashAttention's local "
+             "mask REPLACES the causal specialization (is_causal = causal && !is_local), so "
+             "a non-causal window cannot be spelled with a finite right bound. Upstream "
+             "never asks for one (attention.py:299-301).");
+  }
   // Stride-driven on the token/head axes (a workspace slice is a strided view);
   // the innermost head_dim must be packed.
   VT_CHECK(query.stride[2] == 1 && key.stride[2] == 1 && value.stride[2] == 1 &&

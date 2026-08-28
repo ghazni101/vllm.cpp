@@ -10,8 +10,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <exception>
+#include <string>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -461,7 +463,7 @@ std::vector<float> Qwen3DFlashModel::ForwardBlockLogits(
   // embedding when present (qwen3_dflash.py:432-438).
   DBuf hidden(d, DType::kBF16, {T, H});
   {
-    Tensor dtab = ResidentWeight(d, weights.embed_tokens, {config.vocab_size, H});
+    Tensor dtab = ResidentWeight(d, weights.EmbedTable(), {config.vocab_size, H});
     DBuf dids(d, DType::kI32, {T}, input_ids.data());
     vt::Embedding(d.q, hidden.t(), dtab, dids.t());
   }
@@ -691,10 +693,12 @@ static std::vector<float> ForwardWithCtxKVDev(
   if (weights.IsDflash2()) CheckDflashConvBatch(weights, cu);
 
   // Combined [context; block] per-request layout for the attention (cu_comb), plus
-  // the DEVICE index maps (D7) that place context/block rows into the combined
-  // buffer with vt::IndexCopy and extract the block-query rows with vt::IndexSelect
-  // — replacing the D5 host download + std::vector interleave + re-upload. These are
-  // tiny integer maps computed once from the cu vectors and uploaded once.
+  // the DEVICE index maps (D7) that place context and block K/V rows into the
+  // combined buffer with vt::IndexCopy — replacing the D5 host download +
+  // std::vector interleave + re-upload. These are tiny integer maps computed once
+  // from the cu vectors and uploaded once. Since W12 D1 (#2087) the QUERY never
+  // enters the combined buffer, so there is no output IndexSelect either: the op
+  // reads the block queries where they already are.
   const int64_t Ncomb = C + Tq;
   std::vector<int32_t> cu_comb(static_cast<size_t>(num_reqs) + 1, 0);
   for (int r = 0; r < num_reqs; ++r) {
@@ -703,9 +707,10 @@ static std::vector<float> ForwardWithCtxKVDev(
     cu_comb[static_cast<size_t>(r) + 1] = cu_comb[static_cast<size_t>(r)] + cl + bl;
   }
   // ctx_dest[j] = combined row for context source row j (ctx_cu order).
-  // blk_idx[i]  = combined row for block source row i (cu order); used BOTH to
-  // scatter block q/k/v in (IndexCopy: comb[blk_idx[i]] = block[i]) AND to gather
-  // block outputs back out (IndexSelect: out[i] = comb[blk_idx[i]]).
+  // blk_idx[i]  = combined row for block source row i (cu order); scatters the
+  // block K/V in (IndexCopy: comb[blk_idx[i]] = block[i]). It is BY CONSTRUCTION
+  // the per-request suffix `cu_comb[r+1] - (cu[r+1]-cu[r]) ...`, which is the
+  // layout `DFlashBlockAttentionArgs::cu_seqlens_q` assumes.
   std::vector<int32_t> ctx_dest(static_cast<size_t>(C));
   std::vector<int32_t> blk_idx(static_cast<size_t>(Tq));
   for (int r = 0; r < num_reqs; ++r) {
@@ -722,7 +727,7 @@ static std::vector<float> ForwardWithCtxKVDev(
   // Embed block tokens; substitute the dedicated mask embedding when present.
   DBuf hidden(d, DType::kBF16, {Tq, H});
   {
-    Tensor dtab = ResidentWeight(d, weights.embed_tokens, {config.vocab_size, H});
+    Tensor dtab = ResidentWeight(d, weights.EmbedTable(), {config.vocab_size, H});
     DBuf dids(d, DType::kI32, {Tq}, block_input_ids.data());
     vt::Embedding(d.q, hidden.t(), dtab, dids.t());
   }
@@ -789,11 +794,9 @@ static std::vector<float> ForwardWithCtxKVDev(
     // The bf16 values are bit-identical to the D5 f32-roundtrip path (bf16->f32->bf16
     // is an identity round-trip), so DFlashBlockAttention sees identical inputs.
     Tensor v3 = Reshape(v.t(), {Tq, Hkv, Dh});
-    DBuf qcb(d, DType::kBF16, {Ncomb, Hq, Dh});
     DBuf kcb(d, DType::kBF16, {Ncomb, Hkv, Dh});
     DBuf vcb(d, DType::kBF16, {Ncomb, Hkv, Dh});
-    qcb.Zero(d);  // context query rows are unused (their attn output is discarded)
-    Tensor qcb3 = qcb.t(), kcb3 = kcb.t(), vcb3 = vcb.t();
+    Tensor kcb3 = kcb.t(), vcb3 = vcb.t();
     if (C > 0) {  // this layer's device context K/V -> combined at ctx_dest
       Tensor ck2 = Reshape(ckv.k[static_cast<size_t>(l)].t(), {C, Hkv, Dh});
       Tensor cv2 = Reshape(ckv.v[static_cast<size_t>(l)].t(), {C, Hkv, Dh});
@@ -801,30 +804,39 @@ static std::vector<float> ForwardWithCtxKVDev(
       vt::IndexCopy(d.q, kcb3, ck2, cdst);
       vt::IndexCopy(d.q, vcb3, cv2, cdst);
     }
-    {  // block q/k/v -> combined at blk_idx
+    {  // block k/v -> combined at blk_idx
       Tensor bidx = blk_idx_d.t();
-      vt::IndexCopy(d.q, qcb3, q3, bidx);
       vt::IndexCopy(d.q, kcb3, k3, bidx);
       vt::IndexCopy(d.q, vcb3, v3, bidx);
     }
-    // Attention over the combined sequence via the UNCHANGED D2 primitive.
-    DBuf acomb(d, DType::kBF16, {Ncomb, Hq, Dh});
+    // SPEC-DFLASH2 W12 D1 (#2087). The QUERY stays [Tq,...] while K/V span the
+    // combined [context; block] sequence: `pa.cu_seqlens_q = cu` tells the op that
+    // request r's (1+k) queries are the SUFFIX of its combined key run, which is
+    // exactly where `blk_idx` put them. What this deletes is not a tidy-up:
+    // before it, the op's grid ran over all `Ncomb` rows, so the draft computed an
+    // attention output for EVERY context row of EVERY request in the batch and then
+    // threw them away — `sum_r (ctx_r + 1 + k)^2` pairs per layer per step against
+    // `(1+k) x C`, ~150x per row at the campaign's context. Gone with it: the
+    // `[Ncomb,Hq,Dh]` query buffer and its zeroing memset, the `[Ncomb,Hq,Dh]`
+    // output buffer, the query IndexCopy and the output IndexSelect.
+    //
+    // The surviving rows' arithmetic is UNCHANGED — same keys, same order, same
+    // mask bound, same f32 recurrence — so this is bit-identical, and the CPU
+    // fixtures in tests/vllm/v1/spec_decode/test_dflash_propose.cpp gate it as an
+    // exact equality rather than a tolerance.
+    DBuf a(d, DType::kBF16, {Tq, Hq * Dh});
+    Tensor a3 = Reshape(a.t(), {Tq, Hq, Dh});
     vt::DFlashBlockAttentionArgs pa;
     pa.scale = scale;
     pa.causal = layer.attn_mode.causal;
     pa.sliding_window = layer.attn_mode.sliding_window;
     pa.cu_seqlens = cu_comb.data();
+    pa.cu_seqlens_q = cu.data();
     pa.num_reqs = num_reqs;
-    vt::DFlashBlockAttention(d.q, acomb.t(), qcb.t(), kcb.t(), vcb.t(), pa);
-    // Extract the block-query rows out of the combined output ON DEVICE (IndexSelect:
-    // a[i] = acomb[blk_idx[i]]), replacing the D5 download + host row-scatter.
-    DBuf a(d, DType::kBF16, {Tq, Hq * Dh});
-    {
-      Tensor acomb2 = Reshape(acomb.t(), {Ncomb, Hq * Dh});
-      Tensor a2 = Reshape(a.t(), {Tq, Hq * Dh});
-      Tensor bidx = blk_idx_d.t();
-      vt::IndexSelect(d.q, a2, acomb2, bidx);
-    }
+    // #2089: the P>1 lane's counter. Read off the tensors that are about to be
+    // passed, so a change to the launch shape moves the number.
+    detail::NoteDflashCombinedAttn(q3.shape[0], kcb3.shape[0]);
+    vt::DFlashBlockAttention(d.q, a3, q3, kcb3, vcb3, pa);
     Tensor wo = ResidentWeight(d, layer.o_proj);
     DBuf attn(d, DType::kBF16, {Tq, H});
     vt::MatmulBT(d.q, attn.t(), a.t(), wo);
@@ -1002,8 +1014,34 @@ std::vector<float> Qwen3DFlashModel::ForwardBlockLogitsWithPrecomputedKV(
 // PrecomputeContextKVDevice, same ascending-position append order) — the bf16 bits are
 // merely placed at fixed paged slots instead of appended chunks; tokens+acceptance are
 // unchanged.
-constexpr int64_t kDflashPageSize = 16;       // rows per paged context page (block_size)
-constexpr int64_t kDflashMaxCtxSlots = 4096;  // fixed store capacity (== max_pages*page)
+constexpr int64_t kDflashPageSize = 16;  // rows per paged context page (block_size)
+
+// #1919: the store's capacity used to be `kDflashMaxCtxSlots = 4096` right here,
+// a compile-time constant unrelated to the `max_model_len` the engine advertises
+// and admits. It is now RESOLVED (ResolveCtxStoreSizing below) and passed in.
+// What remains a constant is the BYTE BUDGET the resolution is capped at,
+// because `max_model_len` alone can be absurd: the pool is per request, per
+// draft layer, bf16, K and V, so a 262144-token context costs about a gigabyte
+// per concurrent request and unbounded device residency has OOM-rebooted this
+// box (#1647).
+//
+// THE BUDGET IS THE AGGREGATE, because the residency is. One store is built per
+// BATCH ROW (`runner.cpp`, the reused-slot rebuild), so what the device holds is
+// `bytes_per_request * max_num_reqs`, and `gpu_memory_utilization` accounts none
+// of it. A 256 MiB PER-REQUEST budget was therefore an 8 GiB peak at the
+// `--max-num-seqs 32` `docs/USAGE.md` itself shows — the same
+// unbounded-residency shape #1647 names, one indirection further out, and a term
+// large enough to move a concurrency ladder that does not know it is there.
+//
+// 8 GiB is a CHOICE and not a measurement, and it is deliberately the aggregate
+// the 256 MiB per-request shape ALREADY allowed at that documented
+// `--max-num-seqs 32`: the default is behaviour-preserving there, it spends less
+// below that concurrency and refuses to spend more above it, and what changed is
+// that the number now bounds what the device actually holds. The startup line
+// states the resolved per-request cost AND that aggregate, so an operator sees
+// the term rather than discovering it. `VT_DFLASH_CTX_MAX_TOKENS` overrides the
+// cap in TOKENS per request.
+constexpr int64_t kDflashCtxTotalBudgetBytes = 8LL * 1024 * 1024 * 1024;
 
 // SPEC-DFLASH2 W11 (#1890): route the draft block's ATTENTION through the SHARED
 // paged seam (vt::ReshapeAndCache into the store's own pages, then
@@ -1089,25 +1127,116 @@ DflashBlockRouteStats& RouteStats() {
 }
 }  // namespace
 DflashBlockRouteStats GetDflashBlockRouteStats() { return RouteStats(); }
+
+std::string FormatDflashBlockRouteStats(const DflashBlockRouteStats& s) {
+  char buf[256];
+  const int n = std::snprintf(
+      buf, sizeof(buf),
+      "[dflash-route] paged_seam=%lld block_kernel=%lld combined=%lld "
+      "last_combined_q=%lld last_combined_k=%lld",
+      static_cast<long long>(s.paged_seam_calls),
+      static_cast<long long>(s.block_kernel_calls),
+      static_cast<long long>(s.materialized_combined_calls),
+      static_cast<long long>(s.last_combined_query_rows),
+      static_cast<long long>(s.last_combined_key_rows));
+  return n > 0 ? std::string(buf, static_cast<size_t>(n) < sizeof(buf)
+                                      ? static_cast<size_t>(n)
+                                      : sizeof(buf) - 1)
+               : std::string();
+}
 void ResetDflashBlockRouteStats() { RouteStats() = DflashBlockRouteStats{}; }
 void NoteDflashBlockRoute(DflashBlockAttnRoute route) {
-  if (route == DflashBlockAttnRoute::kPagedSeam)
-    ++RouteStats().paged_seam_calls;
-  else
-    ++RouteStats().block_kernel_calls;
+  switch (route) {
+    case DflashBlockAttnRoute::kPagedSeam: ++RouteStats().paged_seam_calls; break;
+    case DflashBlockAttnRoute::kMaterializedCombined:
+      ++RouteStats().materialized_combined_calls;
+      break;
+    default: ++RouteStats().block_kernel_calls; break;
+  }
+}
+void NoteDflashCombinedAttn(int64_t query_rows, int64_t key_rows) {
+  NoteDflashBlockRoute(DflashBlockAttnRoute::kMaterializedCombined);
+  RouteStats().last_combined_query_rows = query_rows;
+  RouteStats().last_combined_key_rows = key_rows;
 }
 }  // namespace detail
 
+// #1919: the capacity resolution. Pure host arithmetic over the draft geometry
+// and the engine's own context, so the CPU gate covers CUDA exactly.
+//
+// `want` mirrors upstream's per-step draft bound
+// `min(max_seq_len + num_query_per_req, max_model_len)`
+// (`vllm/v1/worker/gpu/spec_decode/dflash/speculator.py:331-333`) read from the
+// other side: the store must hold the whole advertised context PLUS the (1+k)
+// query block the W11 paged route writes at slots `[C, C+Tq)`.
+Qwen3DFlashModel::DflashCtxStoreSizing Qwen3DFlashModel::ResolveCtxStoreSizing(
+    const HfConfig& config, int64_t max_model_len, int64_t num_query_per_req,
+    int64_t max_num_reqs) {
+  const auto round_up = [](int64_t n) {
+    return ((n + kDflashPageSize - 1) / kDflashPageSize) * kDflashPageSize;
+  };
+  const auto round_down = [](int64_t n) { return (n / kDflashPageSize) * kDflashPageSize; };
+
+  DflashCtxStoreSizing z;
+  z.page_size = kDflashPageSize;
+  // K and V, every draft layer, one context row.
+  z.bytes_per_slot = config.num_hidden_layers *
+                     (config.num_key_value_heads * config.head_dim) *
+                     static_cast<int64_t>(sizeof(uint16_t)) * 2;
+  if (z.bytes_per_slot <= 0) z.bytes_per_slot = 1;
+  z.want_slots = round_up(std::max<int64_t>(max_model_len, 0) +
+                          std::max<int64_t>(num_query_per_req, 0));
+  if (z.want_slots < kDflashPageSize) z.want_slots = kDflashPageSize;
+
+  // One store per BATCH ROW, so the budget is divided by the rows that can hold
+  // one at the same time. A zero or negative count would divide the whole
+  // aggregate into one request, which is the per-request budget this parameter
+  // exists to remove, so it floors at one.
+  z.max_num_reqs = std::max<int64_t>(max_num_reqs, 1);
+  z.budget_bytes = kDflashCtxTotalBudgetBytes;
+  const char* override_env = std::getenv("VT_DFLASH_CTX_MAX_TOKENS");
+  int64_t cap_slots = 0;
+  if (override_env != nullptr && override_env[0] != '\0') {
+    const long long v = std::atoll(override_env);
+    if (v > 0) {
+      z.overridden = true;
+      cap_slots = round_down(static_cast<int64_t>(v));
+    }
+  }
+  if (!z.overridden)
+    cap_slots = round_down(z.budget_bytes / (z.bytes_per_slot * z.max_num_reqs));
+  // A store that cannot hold one page cannot hold one block, which is not a
+  // smaller store but a broken one.
+  if (cap_slots < kDflashPageSize) cap_slots = kDflashPageSize;
+  z.budget_slots = cap_slots;
+  // AFTER the floor, so the reported budget is the one that was actually
+  // applied. Computing it from the pre-floor count let a sub-page override
+  // report a zero-byte budget for a store that in fact holds a page. It is the
+  // AGGREGATE that is reported, because that is the quantity the budget bounds
+  // and the one the device pays.
+  z.budget_bytes = z.budget_slots * z.bytes_per_slot * z.max_num_reqs;
+
+  z.slots = std::min(z.want_slots, z.budget_slots);
+  z.capped = z.slots < z.want_slots;
+  z.bytes_per_request = z.slots * z.bytes_per_slot;
+  z.bytes_total = z.bytes_per_request * z.max_num_reqs;
+  return z;
+}
+
 std::shared_ptr<DflashDeviceKVStore> Qwen3DFlashModel::MakeDeviceKVStore(
-    const HfConfig& config, vt::Queue& queue) {
+    const HfConfig& config, vt::Queue& queue, int64_t max_ctx_slots) {
   Dev d{vt::GetBackend(queue.device.type), queue};
   const int64_t Hkv = config.num_key_value_heads;
   const int64_t Dh = config.head_dim;
   const int64_t L = config.num_hidden_layers;
+  VT_CHECK(max_ctx_slots > 0 && max_ctx_slots % kDflashPageSize == 0,
+           "MakeDeviceKVStore: the context store's capacity must be a positive multiple "
+           "of the page size; resolve it with Qwen3DFlashModel::ResolveCtxStoreSizing "
+           "(SPEC-DFLASH2, #1919)");
   auto s = std::make_shared<DflashDeviceKVStore>();
   s->num_layers = L;
   s->block_size = kDflashPageSize;
-  s->max_pages = kDflashMaxCtxSlots / kDflashPageSize;
+  s->max_pages = max_ctx_slots / kDflashPageSize;
   s->kdim = Hkv * Dh;
   s->pool_k.reserve(static_cast<size_t>(L));
   s->pool_v.reserve(static_cast<size_t>(L));
@@ -1133,6 +1262,10 @@ int64_t Qwen3DFlashModel::DeviceKVNumCtx(const DflashDeviceKVStore& store) {
   return store.num_ctx;
 }
 
+int64_t Qwen3DFlashModel::DeviceKVCapacity(const DflashDeviceKVStore& store) {
+  return store.max_pages * store.block_size;
+}
+
 namespace {
 
 // The shared append TAIL (SPEC-DFLASH2 W8, #1838): the capacity/contiguity
@@ -1149,8 +1282,18 @@ void ScatterProjectedContextRows(Dev d, DflashDeviceKVStore& store, const Contex
            "AppendContextKVDevice: store layer count mismatch (call MakeDeviceKVStore)");
   const int64_t L0 = store.num_ctx;
   const int64_t max_slots = store.max_pages * store.block_size;
+  // #1919: an INTERNAL INVARIANT, not a production refusal. The runner checks
+  // the store's capacity before it appends and drops the request to the
+  // non-speculative path when it no longer fits (`propose_drafts_block`), so
+  // reaching this line means a caller appended without asking. It used to be the
+  // only guard, it fired from inside an EngineCore step on any prompt above 4096
+  // tokens, and it asked the operator to recompile a constant that no longer
+  // exists.
   VT_CHECK(L0 + count <= max_slots,
-           "AppendContextKVDevice: paged store capacity exceeded (raise kDflashMaxCtxSlots)");
+           "AppendContextKVDevice: paged store capacity exceeded — the caller must "
+           "check Qwen3DFlashModel::DeviceKVCapacity before appending, and fall back "
+           "to the non-speculative path for a request that no longer fits "
+           "(SPEC-DFLASH2, #1919)");
   // The runner appends only accepted-prefix rows in ascending order, so the new rows sit
   // at contiguous absolute positions [L0, L0+count) == identity paged slots [L0, L0+count).
   VT_CHECK(new_positions.front() == static_cast<int32_t>(L0) &&
@@ -1502,7 +1645,7 @@ std::vector<float> Qwen3DFlashModel::ForwardBlockLogitsWithDeviceKV(
     if (!graph_ok) {
       DBuf hidden(d, DType::kBF16, {Tq, H});
       {
-        Tensor dtab = ResidentWeight(d, weights.embed_tokens, {config.vocab_size, H});
+        Tensor dtab = ResidentWeight(d, weights.EmbedTable(), {config.vocab_size, H});
         DBuf dids(d, DType::kI32, {Tq}, block_input_ids.data());
         vt::Embedding(d.q, hidden.t(), dtab, dids.t());
       }
@@ -1607,7 +1750,7 @@ std::vector<float> Qwen3DFlashModel::ForwardBlockLogitsWithDeviceKV(
     // this step's block positions into g_dpos. seq_lens/block_table already updated in the
     // store (append), and cu_seqlens is the constant {0,Tq}.
     {
-      Tensor dtab = ResidentWeight(d, weights.embed_tokens, {config.vocab_size, H});
+      Tensor dtab = ResidentWeight(d, weights.EmbedTable(), {config.vocab_size, H});
       DBuf dids(d, DType::kI32, {Tq}, block_input_ids.data());
       vt::Embedding(d.q, st.g_hidden->t(), dtab, dids.t());
     }

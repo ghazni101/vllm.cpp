@@ -645,6 +645,105 @@ std::vector<float> Slice(const std::vector<float>& v, int64_t off, int64_t len) 
 }
 
 // ── 512-wide MLA attention block (W3 + W4 primitives) : [T,H] -> [T,H] ────────
+// #1970 — THE LENGTH CHECK THE DSA PATH NEVER HAD.
+//
+// `AttentionBlock` indexes the DSA tensors at the COLLAPSED synthetic geometry:
+// `comp_wgate` as [head_dim, hidden_size], `comp_ape` as [compress_ratio,
+// head_dim], `idx_wq` as [index_n_heads*index_head_dim, hidden_size], `idx_wk`
+// as [index_head_dim, hidden_size]. Since #1970 the EXL3 loader materializes
+// them at the width the REAL artifact stores — upstream's
+// `coff = 1 + (compress_ratio == 4)` (vllm/models/deepseek_v4/compressor.py:247-248)
+// — so the two can now disagree.
+//
+// AND A DISAGREEMENT HERE IS ANONYMOUS, NOT SILENT. Be exact about what this
+// buys, because overstating it is the defect #1964 was filed for. `Gemm`'s host
+// arm is a `MatVec` whose size assertion is UNCONDITIONAL — `deepseek_v4.cpp:413`
+// is a plain `VT_CHECK`, a throw rather than an `assert`, so `NDEBUG` does not
+// remove it — and its keep-quant arm checks the shape too. A [2*head_dim,
+// hidden_size] weight read at a [head_dim, hidden_size] stride therefore does NOT
+// produce a plausible wrong number. It throws
+//
+//     vt: MatVec weight size mismatch at deepseek_v4.cpp:413
+//
+// which names no tensor, no layer, no geometry and no missing capability, from
+// the middle of a forward, on a checkpoint that loaded successfully.
+//
+// So this is a DIAGNOSTICS improvement, and that is the whole of it: it replaces
+// an anonymous crash with a precise named refusal, listing EVERY mismatched
+// tensor with both counts and naming the composition that is missing. It is not
+// the difference between wrong tokens and a refusal, and it must not be described
+// as one.
+//
+// EVERY mismatch is collected and reported together, not just the first. A
+// refusal that stopped at the first would make the remaining checks
+// unfalsifiable: deleting any one of them would still throw on an earlier one,
+// so a mutation could not tell a live check from a dead one.
+void RequireDsaGeometryOrRefuse(const DeepseekV4LayerHostWeights& L,
+                                const DeepseekV4Params& p, int64_t layer,
+                                bool is_comp, bool is_indexer) {
+  const int64_t H = p.hidden_size;
+  const int64_t hd = p.head_dim;
+  std::string bad;
+  auto want = [&](const char* tensor, const char* indexed_as, size_t got,
+                  int64_t expect) {
+    if (static_cast<int64_t>(got) == expect) return;
+    bad += "\n    - attn." + std::string(tensor) + ": this forward indexes it as " +
+           indexed_as + " = " + std::to_string(expect) +
+           " elements, the checkpoint carries " + std::to_string(got);
+  };
+  if (is_comp) {
+    const int64_t cr = p.compress_ratio(layer);
+    want("compressor.ape", "[compress_ratio, head_dim]", L.comp_ape.size(), cr * hd);
+    want("compressor.wgate.weight", "[head_dim, hidden_size]", L.comp_wgate.size(),
+         hd * H);
+    want("compressor.norm.weight", "[head_dim]", L.comp_norm_weight.size(), hd);
+  }
+  if (is_indexer) {
+    const int64_t inh = p.index_n_heads;
+    const int64_t ihd = p.index_head_dim;
+    want("indexer.wq_b", "[index_n_heads*index_head_dim, hidden_size]",
+         L.idx_wq.size(), inh * ihd * H);
+    want("indexer.compressor.wkv.weight", "[index_head_dim, hidden_size]",
+         L.idx_wk.size(), ihd * H);
+    want("indexer.weights_proj.weight", "[index_n_heads, hidden_size]",
+         L.idx_wproj.size(), inh * H);
+  }
+  VT_CHECK(
+      bad.empty(),
+      std::string("DeepseekV4 forward: REFUSING the DSA path on layer ") +
+          std::to_string(layer) +
+          " — the checkpoint carries this layer's DSA tensors at a geometry this "
+          "forward does not implement. Reading the widened `comp_wgate` at the "
+          "width it DOES index throws an anonymous `MatVec weight size mismatch` "
+          "from inside the forward (deepseek_v4.cpp:413) that names none of this. "
+          "(That is the message the REAL geometry produces, because `comp_wgate`'s "
+          "Gemm runs first. A `comp_ape`- or `comp_norm_weight`-only mismatch "
+          "instead throws `ape size mismatch` / `rms_weight size mismatch` from "
+          "CompressorSaveScoreApe / CompressorPoolNorm "
+          "(deepseek_v4_compressor.cpp:23,54) — equally anonymous.) Refusing on:" + bad +
+          "\n  WHAT IS MISSING: upstream's DSA composition. The extra width is "
+          "`coff = 1 + (compress_ratio == 4)` "
+          "(vllm/models/deepseek_v4/compressor.py:247-248), and its two halves "
+          "are the two OVERLAPPING compression windows a token belongs to — a "
+          "role a row acquires only relative to the window gathering it "
+          "(common/ops/fused_compress_quant_cache.py:164-183), never recoverable "
+          "from the tensor alone. Reaching it needs the coff-overlapped window "
+          "with head_offset role selection, emission at boundary tokens only "
+          "((position + 1) % compress_ratio == 0) into a SEPARATE compressed KV "
+          "cache beside a sliding-window raw cache, and the indexer's query "
+          "projected from `qr` (q_lora_rank) instead of the hidden state "
+          "(vllm/models/deepseek_v4/attention.py:721-726, :835). None of that is "
+          "implemented here, and dense MLA is NOT a substitute for it at any "
+          "sequence length "
+          "(https://github.com/mudler/vllm.cpp/issues/1964).\n"
+          "  The loader accepts this geometry ON PURPOSE, so every NON-DSA "
+          "capability of the artifact is reachable rather than blocked behind a "
+          "path none of them use (MODEL-DSV4-EXL3 option C, "
+          "https://github.com/mudler/vllm.cpp/issues/1970). The DSA port itself "
+          "is OWED and has no owning row — see "
+          ".agents/specs/dsv4-dsa-loader-accept-forward-refuse.md `## Owed`.");
+}
+
 std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
                                   const DeepseekV4GgufLayerWeights* Lq,
                                   const DeepseekV4Params& p,
@@ -677,6 +776,13 @@ std::vector<float> AttentionBlock(const DeepseekV4LayerHostWeights& L,
   const bool dsa_dense = (be.gguf != nullptr);
   const bool is_indexer = p.has_indexer(layer) && !dsa_dense;
   const bool is_comp = p.has_compressor(layer) && !dsa_dense;
+
+  // Gated on the predicates above, so it fires only where this forward is about
+  // to READ one of these tensors. A layer that does not enter the DSA path reads
+  // none of them, and the GGUF arm (`dsa_dense`) enters it on no layer at all —
+  // so that arm's behaviour is byte for byte unchanged by #1970, and its own
+  // separate defect stays owed under #1964.
+  RequireDsaGeometryOrRefuse(L, p, layer, is_comp, is_indexer);
 
   // 1. q [T,nh,hd] and raw kv latent [T,hd] (num_key_value_heads=1 MLA). The MLA
   //    linears (wq_a, wq_b, wkv) run the keep-quant GEMM (Gemm) — the whole batch
@@ -1147,6 +1253,19 @@ std::vector<float> MoeBlock(const DeepseekV4LayerHostWeights& L,
   const bool cfg_hash = p.is_hash_layer(layer);
   const bool hash_route = cfg_hash && miswire != V4Miswire::kAllLayersGated;
   const bool kq = be.gguf != nullptr && Lq != nullptr;
+  // MODEL-DSV4-EXL3 W1c. Neither keep-quant source: the routed experts must then
+  // be in the f32 host tower, and this is the ONE state where they can be absent
+  // — an EXL3 load leaves `exp_w*` empty on purpose, because its routed experts
+  // are the trellis tower. `expert_f32` below indexes those vectors with no
+  // length check, so without this the reachability mutation that deletes the
+  // EXL3 dispatch reads freed memory instead of failing. A refusal is the
+  // verdict; a segfault is not one.
+  VT_CHECK(kq || Le != nullptr || !L.exp_w1.empty(),
+           "DeepseekV4 MoE: no routed-expert weights for this layer. Neither the "
+           "GGUF keep-quant tower nor an EXL3 trellis tower was supplied, and the "
+           "f32 host tower's `exp_w1` is empty. An EXL3 load populates the trellis "
+           "tower and leaves `exp_w*` empty by design (MODEL-DSV4-EXL3 W1c), so "
+           "reaching here over one means the EXL3 dispatch was not taken.");
 
   // router gating logits [T, ne] (keep-quant moe_gate).
   const std::vector<float> gating =
@@ -2861,17 +2980,14 @@ static std::vector<float> DeepseekV4ForwardExl3(const DeepseekV4Weights& weights
                                                 const std::vector<int32_t>& logits_indices) {
   VT_CHECK(weights.has_exl3_weights,
            "DeepseekV4ForwardExl3: no EXL3 tower (the load did not take that arm)");
-  // The artifact re-quantized the ROUTED EXPERTS ONLY; attention, the router,
-  // the shared experts, the compressor/indexer/mHC and the embeddings ship as
-  // the un-requantized `carried-*` tensors. Materialising those is
-  // MODEL-DSV4-EXL3 W1c, and this refusal names the row so a reader is not sent
-  // to the generic host-tower message.
-  VT_CHECK(weights.has_host_weights,
-           "DeepseekV4 forward over an EXL3 load: the routed-expert TRELLIS tower is "
-           "loaded and reachable (MODEL-DSV4-EXL3 W2), but the NON-expert tower it "
-           "composes with is not materialized. On the real artifact those are the "
-           "`carried-*` FP8 tensors and MODEL-DSV4-EXL3 W1c owns materializing them; "
-           "see .agents/specs/model-dsv4-exl3.md `## Owed`.");
+  // W1b's EXL3-specific `has_host_weights` refusal stood HERE and is DELETED as
+  // dead (#1923, `## W1c design` W1c-5). It was already unreachable on the
+  // default path — the runner's default `gather` routes to `ForwardDevice`,
+  // whose generic `kHostPending` check fires first — and W1c makes it
+  // unreachable on every path: `LoadDeepseekV4Exl3` is the only arm that sets
+  // `has_exl3_weights`, and it now materializes the carried tower and sets
+  // `has_host_weights` in the same function before returning, so
+  // `has_exl3_weights && !has_host_weights` cannot come out of a load.
   V4Backend be{/*device=*/false, /*q=*/&queue, /*gguf=*/nullptr};
   be.exl3 = &weights.exl3;
   return ForwardComposeImpl(weights.host, weights.params, token_ids, positions, logits_indices,
