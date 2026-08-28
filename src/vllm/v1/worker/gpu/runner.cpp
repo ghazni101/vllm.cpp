@@ -1338,15 +1338,6 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
         VT_CHECK(mamba_spec != nullptr,
                  "runner: linear-attention layer has no MambaSpec");
         layer_kv_class_[static_cast<size_t>(l)] = LayerKvClass::kRecurrent;
-        // ENG-MULTIKV-BYNAME: the slot this layer's state lands in, recorded
-        // BEFORE the push so it is the index of the entry about to be created.
-        // `gdn_state_` is built one-for-one from `recurrent_state_buf_` at the
-        // end of this function, so this IS the index the by-name channel hands
-        // a forward. It is deliberately not `l`: the mask is over the model's
-        // layers and the buffer is over the recurrent ones, and on every hybrid
-        // in the tree the two differ.
-        recurrent_slot_of_layer[static_cast<size_t>(l)] =
-            static_cast<int32_t>(recurrent_state_buf_.size());
         alloc_recurrent_layer_states(dev, state_dtypes, state_row_elems);
       }
     }
