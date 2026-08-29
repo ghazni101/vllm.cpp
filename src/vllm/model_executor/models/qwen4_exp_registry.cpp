@@ -140,39 +140,70 @@ void PrepareQwen4ExpForConditionalGeneration(LoadedModel& model,
   (void)queue;
 }
 
-// ─── THE PUBLISHED LAYER NAMES, DERIVED ONCE (W5j) ───────────────────────────
-//
-// `MakeQwen4ExpKVCache` PUBLISHES the caches under these names and
-// `ForwardQwen4ExpForConditionalGeneration` RESOLVES them by the same names, so
-// the two must agree or the model is refused at run time with no compile error
-// to catch it. The spec's `## Owed` names the requirement in those words: "it
-// must build its layer names through ONE builder shared with
-// `MakeQwen4ExpKVCache` — two derivations of one name set is the shape that can
-// disagree."
-//
-// A FILE-LOCAL HELPER IS ENOUGH AND A HEADER WOULD BE WORSE. Both the publisher
-// and the consumer live in THIS translation unit, so there is no seam to widen
-// and nothing outside needs the names; exporting them would invite a third
-// derivation somewhere else, which is the failure this exists to remove.
-//
-// The suffixes are not free choices. `.linear_attn` is what
-// `ResolveKVCacheGroupLayerNames` builds for a recurrent layer, so the runner's
-// by-name membership sees the same string either way. `.self_attn.indexer.k_cache`
-// mirrors upstream's own side-cache prefix
-// (`vllm/models/deepseek_v4/attention.py:761-767` registers the indexer key cache
-// under `...indexer.k_cache`); the runner parses the `.layers.<N>.` segment out of
-// it, so the suffix is free to say WHICH cache it is.
-std::string Qwen4ExpLayerPrefix(size_t layer) {
-  return "model.layers." + std::to_string(layer) + ".";
-}
-std::string Qwen4ExpLinearAttnName(size_t layer) {
-  return Qwen4ExpLayerPrefix(layer) + "linear_attn";
-}
-std::string Qwen4ExpQsaAttnName(size_t layer) {
-  return Qwen4ExpLayerPrefix(layer) + "self_attn.attn";
-}
-std::string Qwen4ExpQsaIndexerName(size_t layer) {
-  return Qwen4ExpLayerPrefix(layer) + "self_attn.indexer.k_cache";
+ForwardLogits ForwardQwen4ExpForConditionalGeneration(
+    LoadedModel& model, const ModelForwardInput& input) {
+  (void)model;
+  (void)input;
+  // THE REFUSAL COMES FIRST, AND THERE IS NO DOWNCAST ABOVE IT. That ordering
+  // is what makes it reachable at all, and the first draft had it the other way
+  // round.
+  //
+  // The house shape opens the type-erased handle with
+  // `ModelAs<Qwen4ExpLoadedModel>` before doing anything else, because a bare
+  // `static_cast` down the hierarchy is undefined behaviour on an object that
+  // is not really that type (#775, #730). The ordering stays inverted here, and
+  // the REASON changed at W5a (#2031): the original one was that nothing could
+  // produce a loaded Qwen4-Exp while `load_weights` refused unconditionally, so
+  // every handle was a foreign one. `load_weights` LOADS now, so a caller can
+  // present a genuine `Qwen4ExpLoadedModel`, and a downcast placed first would
+  // simply succeed and then refuse one line later — no worse, but no longer the
+  // argument.
+  //
+  // What still holds is the second half: there is nothing for the opened handle
+  // to be used FOR until W5b writes the forward, so a cast in front of an
+  // unconditional refusal buys the reader nothing and costs the #775 axis its
+  // strictly safer direction — no cast happens, so no type confusion can. W5b
+  // restores `ModelAs` in the same change that gives it something to read.
+  //
+  // `VT_CHECK(false, ...)` IN THE HOOK BODY, and not a bare throw behind a
+  // `Class::ForwardDevice` delegate. Two constraints meet here.
+  //
+  // `scripts/check-runner-routing-consistency.py` recognises a refuse-by-name
+  // stub by exactly this token (`_REFUSE`), and it classifies the hook body
+  // itself. A model it cannot classify lands in the silently-exempt NONE
+  // bucket, which is the hole that checker exists to close — so tripping it
+  // would be the defect, not the gate. The delegate hop dots3-note uses does
+  // not help a model like this one: it resolves `Class::ForwardDevice` across
+  // translation units or through a file-local `ForwardLogits` helper, and this
+  // TU has neither.
+  //
+  // And `[[noreturn]]` on a non-void return type is MSVC C4646, promoted to
+  // C2220 under /W4 /WX; `check-windows-portability.py` caught that on the
+  // first draft of this function.
+  // THE REFUSAL NAMES WHAT IS ACTUALLY MISSING, AND IT IS NOT WHAT IT SAID.
+  // Until #2031's W5b survey this message still owed the n-gram embedding to
+  // W2, the gated residual to W3 and Qwen Sparse Attention to W4 — all three
+  // landed waves. A refusal that names finished work sends the next reader to
+  // rebuild it. The five below are measured against this tree, each one
+  // independently sufficient to stop a token, and each is carried under
+  // `## Owed` in the row spec.
+  VT_CHECK(false,
+           "Qwen4ExpForConditionalGeneration: the forward is not ported yet. "
+           "The ops and block seams ARE on main (W2/W3/W4/W6a/W5a/W5b-1..5, "
+           "W5c-1); what the layer loop still lacks is (1) a standalone grouped "
+           "RMSNorm op — the PLE block needs three and the only grouped "
+           "reduction in this tree is fused inside vt::Qwen4ExpGatedResidual; "
+           "(2) a PAGED Qwen Sparse Attention consumer — RunQwen4ExpQsaBlock "
+           "takes contiguous [max_kv, ...] caches while make_kv_cache publishes "
+           "paged ones; (3) reach for the indexer side cache, whose group-2 "
+           "block table GPUModelRunner::gather_block_table never gathers "
+           "(W5c-2); (4) an adapter from the stacked [E, I, H] qwen4_exp MoE "
+           "tensors onto MoeBlockWeights; and (5) a mRoPE cos/sin builder with "
+           "external linkage — qwen3_5.cpp's BuildMropeCosSinHost is static. "
+           "ModelRegistry::Forward additionally refuses any multi-cache "
+           "topology by name, and this model publishes one. See "
+           ".agents/specs/qwen4-exp-flash-next.md and issues #2031 and #1978.");
+  return ForwardLogits{};  // unreachable; VT_CHECK always throws here
 }
 
 // ─── The KV-cache spec (W5c, #2031) ──────────────────────────────────────────
