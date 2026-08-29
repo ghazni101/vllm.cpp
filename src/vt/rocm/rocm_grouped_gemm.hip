@@ -444,6 +444,68 @@ __global__ void KQuantGemmK(OutT* __restrict__ out, const uint8_t* __restrict__ 
     else out[i * n + j] = DF32ToBF16(partial);
   }
 }
+// --- T36 (GFX1100-TG200): prefill M-tiled arm of KQuantGemmK ----------------
+//
+// The baseline hands ONE WARP to every (i, j) output element. At prefill
+// m > 1 that re-reads every weight row through the cache hierarchy m times
+// (the "m-pass-through" the spec's budget prices at ~0.7 ms/tok recoverable).
+// This arm gives one warp MT CONSECUTIVE ACTIVATION ROWS for ONE weight row:
+// the warp streams the weight row's superblocks once and applies each loaded
+// block to MT activation rows, cutting weight-side traffic and superblock
+// decode work ~MT-fold. Dispatched behind VT_PREFILL_TILE (default OFF) for
+// m > 1 only; the m == 1 GEMV/coop decode arms are untouched.
+//
+// NUMERICS CONTRACT -- BIT-IDENTICAL to KQuantGemmK, not merely in-band: per
+// output element (i, j) the lane->superblock map (sb = lane, lane + 32, ...),
+// the Dot call sequence, the f32 partial accumulation order, and the 16..1
+// __shfl_down_sync reduction tree are UNCHANGED; only the loop nesting gains
+// an inner activation-row pass and each row's partial lives in its own
+// register for the whole superblock loop. Identical adds in identical order
+// => identical bits (the same argument KQuantGemvMmvqRow's contract rests
+// on). Partial tiles (i >= m) compute predicated-off and write nothing.
+template <typename OutT, int Fmt, int MT>
+__global__ void KQuantGemmMTiledK(OutT* __restrict__ out,
+                                  const uint8_t* __restrict__ weight,
+                                  const BlockQ8_K* __restrict__ act, int64_t m,
+                                  int64_t n, int64_t nsb, size_t w_row_bytes,
+                                  size_t w_block_bytes) {
+  const int64_t tile = static_cast<int64_t>(blockIdx.x) * blockDim.y + threadIdx.y;
+  const int64_t tiles_i = (m + MT - 1) / MT;
+  if (tile >= tiles_i * n) return;
+  const int64_t j = tile % n;
+  const int64_t i0 = (tile / n) * MT;
+  const int lane = threadIdx.x;
+  const uint8_t* w_row = weight + static_cast<size_t>(j) * w_row_bytes;
+  float partial[MT];
+#pragma unroll
+  for (int r = 0; r < MT; ++r) partial[r] = 0.0f;
+  for (int64_t sb = lane; sb < nsb; sb += 32) {
+    const void* w_sb = w_row + static_cast<size_t>(sb) * w_block_bytes;
+#pragma unroll
+    for (int r = 0; r < MT; ++r) {
+      const int64_t i = i0 + r;
+      if (i >= m) break;  // partial tile: this and all later rows are out of range
+      const BlockQ8_K* a_row = act + i * nsb;
+      if constexpr (Fmt == 2)
+        partial[r] += DotQ6K(static_cast<const BlockQ6_K*>(w_sb), a_row + sb);
+      else if constexpr (Fmt == 1)
+        partial[r] += DotQ5K(static_cast<const BlockQ5_K*>(w_sb), a_row + sb);
+      else
+        partial[r] += DotQ4K(static_cast<const BlockQ4_K*>(w_sb), a_row + sb);
+    }
+  }
+#pragma unroll
+  for (int r = 0; r < MT; ++r) {
+    float p = partial[r];
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) p += __shfl_down_sync(0xffffffffULL, p, off);
+    const int64_t i = i0 + r;
+    if (lane == 0 && i < m) {
+      if constexpr (sizeof(OutT) == 4) out[i * n + j] = p;
+      else out[i * n + j] = DF32ToBF16(p);
+    }
+  }
+}
 
 // --- cooperative decode arm of KQuantGemmK, Q6_K only (issue #1910) ---
 //
@@ -614,9 +676,9 @@ __device__ inline void KQuantGemvMmvqRow(OutT* __restrict__ out,
         // Chunk c covers dequant elements [c*32, c*32+32). DotQ6K layout:
         // quarter q=c>>2 holds elements [q*128,+128); segment seg=c&3 picks
         // the ql low/high nibble half and the qh 2-bit field. Nibble values
-        // are biased by -32; the bias is removed EXACTLY in the integer
-        // domain with a constant-word dp4a (32*q8 per byte), so `acc`
-        // equals the baseline's exact isum whatever the grouping.
+        // are biased by -32; the bias is folded into the dot product per
+        // byte (see the TG150 note below), so `acc` equals the baseline's
+        // exact isum whatever the grouping.
         // seg 0/1: low nibble of ql bytes l / l+32; seg 2/3: high nibble.
         // qh contributes a 2-bit field per element (mask 0x03030303).
         const int q = c >> 2, seg = c & 3;
@@ -626,13 +688,20 @@ __device__ inline void KQuantGemvMmvqRow(OutT* __restrict__ out,
         const int shift = (seg >> 1) * 4;
         const int hs = seg * 2;
         const int8_t* q8 = yb.qs + c * 32;
-        // 0x20202020 = 32 in each byte; used for Q6_K bias correction.
-        // amd_mixed_dot(char4,char4,...) forces v_dot4 instruction selection;
-        // the scalar Dp4a emulation does NOT auto-lower when the input comes
-        // from a shift+mask expression (compiler cannot prove 8-bit range).
+        // TG150: fuse bias correction into the dot product. Instead of
+        // sub = v·W8 and pre = 32·W8 then (sub - pre), compute
+        // (v - 0x20)·W8 directly on bytes. The bias MUST be applied per
+        // byte: v's bytes are 6-bit (0..63), so a plain `v - 0x20202020`
+        // underflows every byte < 32 and the borrow DECREMENTS the next
+        // byte by 1, corrupting the dp4a sum for ~87% of random words —
+        // that was the issue #9 gate red (Q6_K arm diverging from the
+        // baseline at every nsb). Guard each byte with 0x80: every byte
+        // computes (v_b + 128) - 32 in [96,159], underflow- and carry-
+        // free, and the closing XOR reinterprets the guard as the sign
+        // bit: byte result = (v_b - 32) mod 256, signed-char exact.
         static constexpr uint32_t kBias32Word = 0x20202020u;
-        const char* const kBias32 = reinterpret_cast<const char*>(&kBias32Word);
-        int sub0 = 0, pre0 = 0, sub1 = 0, pre1 = 0;
+        static constexpr uint32_t kBiasGuard = 0x80808080u;
+        int sub0 = 0, sub1 = 0;
 #pragma unroll
         for (int w = 0; w < 8; ++w) {
           uint32_t Wq, Wh, W8;
@@ -642,17 +711,15 @@ __device__ inline void KQuantGemvMmvqRow(OutT* __restrict__ out,
           uint32_t v =
               ((Wq >> shift) & 0x0F0F0F0Fu) |
               (((Wh >> hs) & 0x03030303u) << 4);
-          // scales change every 16 elems: words 0-3 -> sc[2c], 4-7 -> sc[2c+1]
+          uint32_t vb = ((v | kBiasGuard) - kBias32Word) ^ kBiasGuard;
           if (w < 4) {
-            sub0 = amd_mixed_dot(*reinterpret_cast<char4*>(&v), *reinterpret_cast<char4*>(&W8), sub0, false);
-            pre0 = amd_mixed_dot(*reinterpret_cast<const char4*>(kBias32), *reinterpret_cast<char4*>(&W8), pre0, false);
+            sub0 = amd_mixed_dot(*reinterpret_cast<char4*>(&vb), *reinterpret_cast<char4*>(&W8), sub0, false);
           } else {
-            sub1 = amd_mixed_dot(*reinterpret_cast<char4*>(&v), *reinterpret_cast<char4*>(&W8), sub1, false);
-            pre1 = amd_mixed_dot(*reinterpret_cast<const char4*>(kBias32), *reinterpret_cast<char4*>(&W8), pre1, false);
+            sub1 = amd_mixed_dot(*reinterpret_cast<char4*>(&vb), *reinterpret_cast<char4*>(&W8), sub1, false);
           }
         }
-        acc = static_cast<int>(sc[2 * c]) * (sub0 - pre0) +
-              static_cast<int>(sc[2 * c + 1]) * (sub1 - pre1);
+        acc = static_cast<int>(sc[2 * c]) * sub0 +
+              static_cast<int>(sc[2 * c + 1]) * sub1;
       } else {  // Q4_K / Q5_K: d@0 dmin@2 scales@4 [qh@16] qs@16|48
         uint32_t W0, W1, W2;
         memcpy(&W0, blk + 4, 4);
@@ -830,12 +897,6 @@ void* EnsureQuantScratch(size_t need, hipStream_t s) {
 // one by construction, so no output comparison can witness the dispatch).
 std::atomic<uint64_t> g_kq_coop_dispatches{0};
 
-int KQuantDecodeCoopWarps(DType wdt, int64_t m, int64_t nsb) {
-  if (m != 1) return 1;
-  if (nsb > 32) return 1;
-  return wdt == DType::kQ6_K ? 8 : 1;
-}
-
 }  // namespace
 
 // T4a testing hook: fill dst (device ptr, k/256 BlockQ8_K blocks for row a)
@@ -879,7 +940,7 @@ void MmvqQuantScratchForTesting(Queue& q, void* dst, const Tensor& a,
 }
 
 // --- T4a REPAIR-ROUND-2: HOST-side dispatch-route counters (test-only) ------
-// One increment per MatmulBTQuantKernelRocmGdn HOST dispatch, on the branch the
+// One increment per MatmulBTQuantKernelRocm HOST dispatch, on the branch the
 // call took (baseline / non-fused GEMV / fused fold). These make ROUTING
 // observable even though the ON and OFF arms are bit-equal on outputs (the
 // round-2 review gaps F1/F2). Graph-replay reasoning: during stream capture
@@ -961,12 +1022,19 @@ bool NormQuantTakeConsumer(const void* a_ptr, int64_t rows, int64_t h,
       g_nq_token.adt == adt &&
       g_nq_token.stream == static_cast<hipStream_t>(stream)) {
     *scratch_out = g_nq_token.scratch;
-    // token STAYS valid: the attn q/k/v matvecs consume ONE normalized row
-    // three times; only a non-matching consumer invalidates it.
+    // Token STAYS valid across non-matching consumers. The token records the
+    // PRODUCER's output pointer and scratch; a non-matching consumer reads a
+    // DIFFERENT activation buffer that cannot stale this token. The token is
+    // overwritten only when a new producer calls NormQuantRecordProducer.
+    // T22: the prior invalidation forced standalone QuantizeQ8KK launches
+    // when a non-matching GEMV (e.g. attn gate) queried between the norm
+    // producer and a matching GDN in_proj consumer that shares the normed
+    // hidden state — 3 redundant quants per layer at ~13.4 us each.
     g_nq_consumers_fused.fetch_add(1, std::memory_order_relaxed);
     return true;
   }
-  g_nq_valid = false;
+  // Do NOT invalidate: a non-matching consumer reads a different buffer and
+  // cannot stale this token. Only a new producer overwrites it.
   g_nq_consumers_standalone.fetch_add(1, std::memory_order_relaxed);
   return false;
 }
@@ -995,7 +1063,7 @@ const void* NormQuantLastScratchForTesting() {
 
 
 
-void MatmulBTQuantKernelRocmGdn(Queue& q, Tensor& out, const Tensor& a, const Tensor& b) {
+void MatmulBTQuantKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tensor& b) {
   EnsureQueueDevice(q);
   const int64_t m = a.shape[0], k = a.shape[1], n = b.shape[0];
   if (m == 0 || n == 0) return;
@@ -1075,7 +1143,7 @@ void MatmulBTQuantKernelRocmGdn(Queue& q, Tensor& out, const Tensor& a, const Te
     auto launch_mvq = [&](auto ot, BlockQ8_K* qact) {
       using OutT = decltype(ot);
       auto* o = static_cast<OutT*>(out.data);
-      constexpr int kGemvWarps = 4;
+      constexpr int kGemvWarps = 8;
       const int64_t ggrid = (n + kGemvWarps - 1) / kGemvWarps;
       dim3 gblock(32, kGemvWarps);
       if (gemv_fused) {
@@ -1154,12 +1222,35 @@ void MatmulBTQuantKernelRocmGdn(Queue& q, Tensor& out, const Tensor& a, const Te
     }
 
     ++g_mmvq_route_baseline;
+    // T36 (GFX1100-TG200): prefill M-tiled GEMM arm, VT_PREFILL_TILE=1
+    // (default OFF; read PER CALL like the sibling arms so in-process tests
+    // and graph capture pick it up at dispatch time). m > 1 only -- the
+    // m == 1 decode GEMV/coop arms above stay authoritative; this replaces
+    // exactly the m-pass-through baseline launch below. Bit-identical to it
+    // (contract on KQuantGemmMTiledK).
+    const char* pt_e = std::getenv("VT_PREFILL_TILE");
+    const bool prefill_tile =
+        pt_e != nullptr && pt_e[0] == '1' && pt_e[1] == '\0' && m > 1;
     const int64_t grid = (m * n + kWarpsPerBlock - 1) / kWarpsPerBlock;
     dim3 block(32, kWarpsPerBlock);
     auto launch = [&](auto ot) {
       using OutT = decltype(ot);
       auto* o = static_cast<OutT*>(out.data);
-      const int coop = KQuantDecodeCoopWarps(b.dtype, m, nsb);
+      if (prefill_tile) {
+        constexpr int kMT = 16;  // activation rows per warp = weight-pass factor
+        const unsigned tgrid = static_cast<unsigned>(
+            (((m + kMT - 1) / kMT) * n + kWarpsPerBlock - 1) / kWarpsPerBlock);
+        if (fmt == 2)
+          KQuantGemmMTiledK<OutT, 2, kMT><<<tgrid, block, 0, s>>>(
+              o, w, qact, m, n, nsb, w_row_bytes, w_block_bytes);
+        else if (fmt == 1)
+          KQuantGemmMTiledK<OutT, 1, kMT><<<tgrid, block, 0, s>>>(
+              o, w, qact, m, n, nsb, w_row_bytes, w_block_bytes);
+        else
+          KQuantGemmMTiledK<OutT, 0, kMT><<<tgrid, block, 0, s>>>(
+              o, w, qact, m, n, nsb, w_row_bytes, w_block_bytes);
+        return;
+      }
       if (coop == 8 && fmt == 2) {
         // One block per output element, eight warps deep. Only the measured
         // width is instantiated; anything else falls through to the single-warp
@@ -1184,7 +1275,7 @@ void MatmulBTQuantKernelRocmGdn(Queue& q, Tensor& out, const Tensor& a, const Te
 // kMatmulBTQuantGrouped for ROCm: Q8_0 / Q4_K / Q6_K natively (the formats the
 // target GDN-MoE GGUFs carry); anything else throws loudly (never a silent
 // CPU-pointer deref on a discrete card).
-void MatmulBTQuantGroupedKernelRocmGdn(Queue& q, Tensor& out, const Tensor& act,
+void MatmulBTQuantGroupedKernelRocm(Queue& q, Tensor& out, const Tensor& act,
                                     const Tensor& weight, const Tensor& expert_ids) {
   EnsureQueueDevice(q);
   const int64_t P = out.shape[0], n = out.shape[1], k = act.shape[1];
