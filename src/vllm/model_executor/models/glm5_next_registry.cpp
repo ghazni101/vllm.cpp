@@ -43,8 +43,6 @@
 #include <vector>
 
 #include "vllm/model_executor/models/glm5_next.h"
-#include "vllm/model_executor/models/glm5_next_forward.h"
-#include "vllm/model_executor/models/glm5_next_kv.h"
 #include "vllm/model_executor/models/glm5_next_loader.h"
 #include "vllm/model_executor/models/qwen3_5.h"  // ForwardLogits complete type
 #include "vllm/model_executor/models/qwen3_5_common.h"  // HostLogits
@@ -133,77 +131,56 @@ void PrepareGlm5NextForConditionalGeneration(LoadedModel& model,
 
 ForwardLogits ForwardGlm5NextForConditionalGeneration(
     LoadedModel& model, const ModelForwardInput& input) {
-  // `ModelAs<...>` FIRST, never a bare `static_cast` down the hierarchy, which
-  // is undefined behaviour on an object that is not really this type
-  // (#775, #730). W5c made this possible by returning a real
-  // `Glm5NextLoadedModel`; W5b-2b is the change that gives it something to
-  // open it FOR, which is the condition the previous refusal named.
-  auto& g = ModelAs<Glm5NextLoadedModel>(model,
-                                         "Glm5NextForConditionalGeneration");
-  const Glm5NextWeights& w = g.weights();
-
-  // W5b-2c (#2348): THE PAGED CACHES ARE READ, and the house pattern is
-  // deliberately NOT followed here. `NemotronHForCausalLM`
-  // (`nemotron_h_registry.cpp`) and `KimiLinearForCausalLM`
-  // (`kimi_linear_forward.cpp`) each ignore the paged caches and describe
-  // themselves as re-running the whole prefix. O28 measured what the runner
-  // actually hands a forward and that description does not survive it:
-  // `ModelForwardInput::token_ids` is the step's SCHEDULED tokens, so on the
-  // second step of a decode it is ONE id and a forward that treats it as a
-  // sequence attends to an empty prefix. That is fluent wrong text, which is
-  // the one failure this row refuses to ship.
+  (void)model;
+  (void)input;
+  // THE REFUSAL COMES FIRST, AND THERE IS NO DOWNCAST ABOVE IT. The house shape
+  // opens the type-erased handle with `ModelAs<...>` before anything else,
+  // because a bare `static_cast` down the hierarchy is undefined behaviour on
+  // an object that is not really that type (#775, #730).
   //
-  // `positions` is still unread, and that is upstream's arithmetic rather than
-  // an omission: `qk_rope_head_dim` is ZERO on this architecture -- upstream's
-  // own `validate_architecture` requires it -- so there is no rotary embedding
-  // to place and the causal order comes from the cache length
-  // (`glm5_next_dsa.cpp`, `q_pos = current_length - q_length + s`).
-  (void)input.positions;
-
-  // ONE DIVERGENCE FROM THAT PATTERN, in the safe direction. Both precedents
-  // take `token_ids` as a single sequence whatever `num_reqs` says; on a
-  // two-request step that silently attends ACROSS the boundary. For this model
-  // that is a fluent wrong answer no gate on this fleet could detect -- the
-  // spec's §Gates records that no end-to-end token gate for it exists or can
-  // exist here -- so a multi-request step is refused by name instead of
-  // approximated. Ragged batching is `attn_meta.query_start_loc` sliced as at
-  // `kimi_linear_device.cpp`, and it is OWED.
-  VT_CHECK(input.num_reqs <= 1,
-           "Glm5NextForConditionalGeneration: this forward is a SINGLE-SEQUENCE "
-           "host reference and the step carries " +
-               std::to_string(input.num_reqs) +
-               " requests. Concatenating them would attend across the request "
-               "boundary and emit fluent, wrong text that no gate on this fleet "
-               "could detect. Ragged batching (attn_meta.query_start_loc) is "
-               "owed. See .agents/specs/glm5-next-flash.md and issue #2241.");
-
-  // THE BINDING, resolved BY NAME and refusing by name. `glm5_next_kv.h`
-  // carries the whole argument: what the engine hands over, why the MLA latent
-  // is not a K+V pair, and why the recurrent group's correspondence is a count
-  // rather than a name.
-  VT_CHECK(input.multi_kv != nullptr,
-           "Glm5NextForConditionalGeneration: this step arrived with no "
-           "multi-KV channel. `MakeGlm5NextKVCache` publishes THREE groups -- "
-           "the MLA latent, the KDA recurrent state and the DSA indexer side "
-           "cache -- which is a multi-cache topology, so the runner sets "
-           "`ModelForwardInput::multi_kv` on every step of this model. A null "
-           "channel means the topology was classified as uniform, and the "
-           "positional `attn_kv` convention cannot say which of a DSA layer's "
-           "two caches an entry is. Running anyway would attend an empty "
-           "prefix on every step after the first. See "
-           ".agents/specs/glm5-next-flash.md and issue #2348.");
-  const glm5_next::KvBinding binding =
-      glm5_next::ResolveKvBinding(w.params, input);
-  std::vector<glm5_next::LayerCache> caches;
-  glm5_next::LoadCaches(w.params, binding, input, &caches);
-  std::vector<float> logits = glm5_next::Glm5NextHostForward(
-      w, input.token_ids, input.logits_indices, input.queue, &caches);
-  // The new rows go back into the ENGINE's pages, so the next step reads them
-  // through the same block table the block manager owns -- rather than onto
-  // this `LoadedModel`, which would be per-model state the engine cannot
-  // evict, preempt or share.
-  glm5_next::StoreCaches(w.params, binding, caches, input);
-  return HostLogits(std::move(logits), w.params.vocab_size);
+  // W5c CHANGED THE PREMISE HALF-WAY AND THE ORDER STILL STANDS. The earlier
+  // version of this comment argued that nothing could PRODUCE a loaded
+  // GLM-5.3-Flash while `load_weights` refused unconditionally, so the only
+  // handle a caller could present was a foreign one. That is no longer true:
+  // the GGUF arm above returns a real `Glm5NextLoadedModel`. What has not
+  // changed is that there is no forward to open it FOR, so a downcast placed
+  // first would report a type mismatch on a foreign handle and then fall
+  // through to this same refusal on our own -- two messages for one missing
+  // capability, and the refusal reachable only on the path where it says
+  // least. W5b ([#2241](https://github.com/mudler/vllm.cpp/issues/2241))
+  // restores `ModelAs` in the same change that gives it something to read.
+  //
+  // `VT_CHECK(false, ...)` IN THE HOOK BODY, not a bare throw behind a
+  // `Class::ForwardDevice` delegate: `check-runner-routing-consistency.py`
+  // recognises a refuse-by-name stub by exactly this token and classifies the
+  // hook body itself, and a model it cannot classify lands in the silently
+  // exempt NONE bucket. And `[[noreturn]]` on a non-void return type is MSVC
+  // C4646, promoted to C2220 under /W4 /WX.
+  //
+  // WHAT THIS REFUSAL BUYS, exactly: it prevents a plausible-but-wrong forward,
+  // not a wrong number. There is no partial numeric path here to fall back to.
+  // Every primitive named below is unimplemented for THIS model, and two of
+  // them look implemented and are not -- our KDA is Kimi-Linear's softplus
+  // forget gate where this model needs the sigmoid branch, and our
+  // `HcHeadCollapse` is DeepSeek-V4's weighted collapse where this model needs
+  // an unweighted mean. Reusing either would generate fluent, wrong text that
+  // no gate on this fleet could detect.
+  VT_CHECK(false,
+           "Glm5NextForConditionalGeneration: the forward is not ported yet. W2 "
+           "owes the KDA forget gate's SIGMOID branch (`gate_lower_bound` "
+           "-5.0; our kimi_kda.cpp implements the softplus branch and is NOT a "
+           "substitute), the strict-fp32 gated RMSNorm and `l2norm`; W3 the "
+           "NoPE MLA block -- `MlaBlockDims::Validate` still refuses "
+           "`qk_rope_head_dim == 0` -- and the DSA k-pool indexer; W4 the "
+           "UNWEIGHTED mHC head collapse (`deepseek_v4_mhc.cpp`'s "
+           "`HcHeadCollapse` is the weighted DeepSeek-V4 one and is NOT a "
+           "substitute); W5b the decoder layer, the DSA attention block and the "
+           "assembled text forward; W6 the vision tower, processor and "
+           "placeholder expansion. The WEIGHT TOWER is ported and this model "
+           "LOADS -- W5c (#2242) -- so a handle reaching here is real and the "
+           "missing part is the forward, not the load. "
+           "See .agents/specs/glm5-next-flash.md and issue #1998.");
+  return ForwardLogits{};  // unreachable; VT_CHECK always throws here
 }
 
 // ─── The heterogeneous KV-cache spec (W5, #2223) ─────────────────────────────
@@ -291,133 +268,23 @@ ForwardLogits ForwardGlm5NextForConditionalGeneration(
 // KV arithmetic here is re-derived against the runner rather than trusted.
 v1::KVCacheConfig MakeGlm5NextKVCache(const HfConfig& config, int block_size,
                                       int num_blocks) {
-  // The row's own resolve-and-validate, not a second reading of the raw config.
-  // It is what rewrites `full_attention` into `deepseek_sparse_attention`, so
-  // the classification below is upstream's post-`__post_init__` one.
-  const Glm5NextParams p = ParseGlm5NextParams(config);
-
-  VT_CHECK(block_size > 0,
-           "glm5_next KV spec: block_size must be positive, got " +
-               std::to_string(block_size));
-
-  std::vector<std::string> dsa_layers;
-  std::vector<std::string> dsa_indexer_layers;
-  std::vector<std::string> kda_layers;
-  for (size_t l = 0; l < p.layer_types.size(); ++l) {
-    const std::string idx = std::to_string(l);
-    if (p.layer_types[l] == Glm5NextLayerKind::kLinearAttention) {
-      // The name `ResolveKVCacheGroupLayerNames` builds for a recurrent layer,
-      // so the runner's by-name membership sees the same string either way.
-      kda_layers.push_back("model.layers." + idx + ".linear_attn");
-    } else {
-      dsa_layers.push_back("model.layers." + idx + ".self_attn.attn");
-      // Upstream addresses a side cache by its own module prefix
-      // (`vllm/models/deepseek_v4/attention.py:761-767` registers the indexer
-      // key cache under `...indexer.k_cache`); the runner parses the
-      // `.layers.<N>.` segment out of it, so the suffix is free to say which
-      // cache it is.
-      dsa_indexer_layers.push_back("model.layers." + idx +
-                                   ".self_attn.indexer.k_cache");
-    }
-  }
-
-  VT_CHECK(!dsa_layers.empty(),
-           "glm5_next KV spec: the config declares no deepseek_sparse_attention "
-           "layer, so there is no MLA latent to publish. See "
-           ".agents/specs/glm5-next-flash.md and issue #2223.");
-  VT_CHECK(!kda_layers.empty(),
-           "glm5_next KV spec: the config declares no linear_attention layer, "
-           "so there is no KDA recurrent state to publish. See "
-           ".agents/specs/glm5-next-flash.md and issue #2223.");
-
-  const int64_t mla_head_size = p.mla.kv_lora_rank + p.mla.qk_rope_head_dim;
-  VT_CHECK(mla_head_size > 0,
-           "glm5_next KV spec: the MLA latent row is " +
-               std::to_string(mla_head_size) +
-               " wide (kv_lora_rank + qk_rope_head_dim); a non-positive latent "
-               "would publish a zero-byte page the runner allocates and the "
-               "attention block then writes past.");
-
-  const int64_t kda_conv_dim = 3 * p.kda.num_heads * p.kda.head_dim;
-  VT_CHECK(p.kda.num_heads > 0 && p.kda.head_dim > 0 &&
-               p.kda.conv_kernel_dim > 0,
-           "glm5_next KV spec: the config declares " +
-               std::to_string(kda_layers.size()) +
-               " linear_attention layer(s) but no complete `linear_attn_config` "
-               "group, so the KDA recurrent state cannot be sized "
-               "(linear_num_heads=" +
-               std::to_string(p.kda.num_heads) + " linear_head_dim=" +
-               std::to_string(p.kda.head_dim) + " linear_conv_kernel_dim=" +
-               std::to_string(p.kda.conv_kernel_dim) + ").");
-
-  // `2 * index_head_dim + 1` — see the "257 WIDE" note above.
-  const int64_t indexer_row = 2 * p.indexer.head_dim + 1;
-  VT_CHECK(p.indexer.head_dim > 0,
-           "glm5_next KV spec: the config declares " +
-               std::to_string(dsa_layers.size()) +
-               " deepseek_sparse_attention layer(s) but `index_head_dim` is " +
-               std::to_string(p.indexer.head_dim) +
-               ", so the DSA indexer side cache cannot be sized. See "
-               ".agents/specs/glm5-next-flash.md and issue #2223.");
-
-  // KDA, NOT GATED DELTA NET, and the two recurrent dtypes follow from that.
-  // The mirror is `MambaStateShapeCalculator.kda_state_dtype`
-  // (`mamba_utils.py:130-137`), which is the pair
-  // `(get_kv_cache_torch_dtype(mamba_cache_dtype, model_dtype), torch.float32)`
-  // and is exactly what `kimi_linear_registry.cpp:161` publishes for the OTHER
-  // KDA model in this tree. So the CONV half follows the paged-KV storage dtype
-  // -- model-dtype bf16 by default, f32 under `VT_KV_CACHE_F32`, the
-  // fold-identity A/B -- and the RECURRENT half is f32 unconditionally.
-  //
-  // `detail::ResolveMambaSsmCacheDType`, and with it `HfConfig::mamba_ssm_dtype`,
-  // is deliberately NOT called here. That helper mirrors `_mamba_state_dtype`
-  // (`mamba_utils.py:96-108`), the Mamba/GDN calculator, and `kda_state_dtype`
-  // takes no `mamba_ssm_cache_dtype` parameter at all: honouring the key for a
-  // KDA cache would be an invention rather than a port, and a `bfloat16` value
-  // in some future `config.json` would then silently halve a state upstream
-  // keeps in f32. Qwen3.5 (`qwen3_5_common.cpp:54`) and MODEL-MM-QWEN4-EXP
-  // (`qwen4_exp_registry.cpp:433`) call the resolver because their linear layers
-  // ARE gated delta net (`gated_delta_net_state_dtype`, `mamba_utils.py:119-128`),
-  // which does read it. An earlier revision of this comment claimed this
-  // function called that resolver; it never did, and the claim is retired here
-  // rather than made true, because the GDN calculator is the wrong one.
-  //
-  // Why the recurrent f32 is not negotiable: upstream annotates the cast twice.
-  // `cache_params.update_recurrent_state(last_recurrent_state.to(torch.float32),
-  // ...)` casts explicitly (`modeling_glm5_next.py:739`) and `:452` says
-  // "calculations happen in float as states are more susceptible to rounding
-  // errors". The state is a running sum over the whole sequence, so a bf16 store
-  // accumulates an error with no way out -- and a token gate cannot see it.
-  const vt::DType conv_dtype = v1::ResolveKvCacheDType();
-  const vt::DType ssm_dtype = vt::DType::kF32;
-
-  v1::KVCacheConfig kv;
-  kv.num_blocks = num_blocks;
-  kv.kv_cache_groups.emplace_back(
-      std::move(dsa_layers),
-      std::make_shared<v1::MLAAttentionSpec>(
-          block_size, static_cast<int>(mla_head_size), v1::ResolveKvCacheDType()));
-  kv.kv_cache_groups.emplace_back(
-      std::move(kda_layers),
-      std::make_shared<v1::MambaSpec>(
-          block_size,
-          std::vector<std::vector<int64_t>>{
-              // ONE grouped [q; k; v] conv state, `conv_kernel_dim` columns.
-              {kda_conv_dim, p.kda.conv_kernel_dim},
-              // The delta-rule recurrent state, [heads, head_dim, head_dim].
-              {p.kda.num_heads, p.kda.head_dim, p.kda.head_dim}},
-          std::vector<vt::DType>{conv_dtype, ssm_dtype}));
-  kv.kv_cache_groups.emplace_back(
-      std::move(dsa_indexer_layers),
-      std::make_shared<v1::MLAAttentionSpec>(
-          block_size, static_cast<int>(indexer_row), v1::ResolveKvCacheDType(),
-          /*num_kv_heads=*/1, v1::KVQuantMode::kNone,
-          /*page_size_padded=*/std::nullopt,
-          /*indexes_kv_by_block_stride=*/false,
-          /*cache_dtype_str=*/std::nullopt, /*alignment=*/std::nullopt,
-          // ONE stored row PER TOKEN: the k-pool compresses at read time.
-          /*compress_ratio=*/1, /*model_version=*/std::nullopt));
-  return kv;
+  (void)config;
+  (void)block_size;
+  (void)num_blocks;
+  // Unreachable while the loader refuses, and refusing by name anyway rather
+  // than returning an empty config. This model needs THREE distinct cache
+  // shapes in one spec -- a KDA recurrent state plus three separate conv states
+  // on 34 layers, a 512-wide MLA latent on 11, and a DSA indexer side cache
+  // that is 257 floats per token per layer rather than the DeepSeek-V4 parent's
+  // 128 because of the k-pool stage -- and a spec that silently omitted any of
+  // them would allocate a wrong-sized cache that nothing downstream checks.
+  // #1963/#1966 are the standing reason a KV arithmetic here is re-derived
+  // against the runner rather than trusted.
+  throw std::runtime_error(
+      "Glm5NextForConditionalGeneration: the KV-cache spec is not ported yet "
+      "(W3 owes the NoPE MLA latent group and the k-pool indexer side cache, "
+      "W5b the KDA recurrent and three-conv state group). See "
+      ".agents/specs/glm5-next-flash.md and issue #1998.");
 }
 
 const ModelFactory kGlm5NextFactory{
