@@ -3761,14 +3761,30 @@ DType ResidualDType(Dev d) {
 // VT_GDN_PACKED_DECODE=0 and no dtype override, rollback is therefore the
 // legacy F32 BA + decomposed consumer from the same resident owner.
 bool MergedGdnBaEnabled(Dev d) {
-  static const bool enabled = [] {
+  static const bool switches = [] {
     const char* master = std::getenv("VT_GDN_MERGED_PROJ");
     if (master != nullptr && master[0] == '0') return false;
     const char* leaf = std::getenv("VT_GDN_MERGED_BA");
     return leaf == nullptr || leaf[0] != '0';
   }();
-  return enabled &&
-         vllm::platforms::GetPlatform(d.q.device.type).needs_weight_staging();
+  if (!switches) return false;
+  // T35-r3 (GFX1100-TG200): opt-in ROCm arm. needs_weight_staging() is false
+  // on ROCm (a deliberate memory-model policy, rocm.cpp), which confined the
+  // merged single-launch BA projection to CUDA. The merged arm launches ONE
+  // N=2*num_v GEMV where the split arm launches two N=num_v GEMVs on the
+  // same input; per-row weight bytes are identical, but the bf16
+  // skinny-GEMV reduction is launch-geometry dependent, so the ON arm is a
+  // REDUCTION-ORDER CHANGE -- it owes the near-tie adjudication
+  // (tools/tg200-neartie.sh, band <= 500 mnats) before its A/B counts.
+  // Default OFF; VT_GDN_MERGED_BA_ROCM=1 enables (read ONCE,
+  // process-cached like every sibling GDN toggle: a process is one arm,
+  // never a per-request mixture).
+  static const bool rocm_lever = [] {
+    const char* e = std::getenv("VT_GDN_MERGED_BA_ROCM");
+    return e != nullptr && e[0] == '1' && e[1] == '\0';
+  }();
+  if (rocm_lever) return true;
+  return vllm::platforms::GetPlatform(d.q.device.type).needs_weight_staging();
 }
 
 DType MergedGdnBaOutputDType(bool packed_decode) {

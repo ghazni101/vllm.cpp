@@ -1288,21 +1288,62 @@ GdnLayerWeights LoadGdnGguf(const GgufFile& g, int64_t il, const HfConfig& c,
     }
   }
   // in_proj_b <- ssm_beta, in_proj_a <- ssm_alpha [num_v, H]; rows are V heads.
-  for (auto* pr : {&gdn.in_proj_b, &gdn.in_proj_a}) {
-    const std::string nm =
-        Blk(il, pr == &gdn.in_proj_b ? "ssm_beta.weight" : "ssm_alpha.weight");
-    const GgufResidency r = pol.Route(g.Get(nm), proj_role);
-    if (r != GgufResidency::kExpandBf16) {
-      const GgufTensorInfo& ti = g.Get(nm);
-      *pr = OwnGgufKeptSlice(g, pol, ti, r, ti.shape[0], ti.shape[1], 0);
-      continue;
+  // T35-r3 (GFX1100-TG200): load the pair STACKED into in_proj_ba
+  // [2*num_v, H] (the same owner shape the safetensors path builds) so the
+  // forward can issue ONE projection for the b/a pair. Byte-exact per output
+  // row in both arms: a keep residency row-concats whole quant blocks (the
+  // gate_up precedent); the expand arm loads, V-row-reorders, and
+  // concatenates each half exactly as the split loop below does, then
+  // row-concats. With the forward's merged arm disabled
+  // (VT_GDN_MERGED_BA_ROCM unset), ProjectGdnBA slices this owner back into
+  // the SAME two launches the split fields would issue -- byte-identical and
+  // launch-count-identical. The split loads below run only when the stack is
+  // impossible (encoding/K mismatch, a non-nk expand policy, or a keep route
+  // the stacker refuses).
+  const bool merged_ba = [&] {
+    const GgufTensorInfo& tb = g.Get(Blk(il, "ssm_beta.weight"));
+    const GgufTensorInfo& ta = g.Get(Blk(il, "ssm_alpha.weight"));
+    const GgufResidency rb = pol.Route(tb, proj_role);
+    if (ta.ggml_type != tb.ggml_type || ta.shape[1] != tb.shape[1])
+      return false;
+    if (rb == GgufResidency::kKeepQuant || rb == GgufResidency::kKeepF16) {
+      gdn.in_proj_ba = OwnGgufKeptStacked(g, pol, tb, ta);
+      return !gdn.in_proj_ba.Empty();
     }
+    // Expand arm (this checkpoint: proj_role is kTransformedWeight under the
+    // V-row reorder, so both halves expand to bf16). Requires the nk owner
+    // the forward's packed branch checks.
+    if (!pol.gdn_expand_nk) return false;
     const GgufTensorInfo* t = nullptr;
-    std::vector<uint16_t> dq = DqBf16(g, nm, &t);
+    std::vector<uint16_t> dqb = DqBf16(g, Blk(il, "ssm_beta.weight"), &t);
     const int64_t out_dim = t->shape[0];
     const int64_t in_dim = t->shape[1];
-    if (reorder) ReorderVRows(dq, in_dim, 0, num_k, rpk, 1);
-    *pr = MakeGdnProj(dq, out_dim, in_dim, pol.gdn_expand_nk);
+    if (reorder) ReorderVRows(dqb, in_dim, 0, num_k, rpk, 1);
+    std::vector<uint16_t> dqa = DqBf16(g, Blk(il, "ssm_alpha.weight"), &t);
+    VT_CHECK(t->shape[0] == out_dim && t->shape[1] == in_dim,
+             "qwen3_5 gguf: ssm_beta/ssm_alpha shape mismatch for merged b/a");
+    if (reorder) ReorderVRows(dqa, in_dim, 0, num_k, rpk, 1);
+    dqb.insert(dqb.end(), dqa.begin(), dqa.end());
+    gdn.in_proj_ba = MakeGdnProj(dqb, 2 * out_dim, in_dim, pol.gdn_expand_nk);
+    return !gdn.in_proj_ba.Empty();
+  }();
+  if (!merged_ba) {
+    for (auto* pr : {&gdn.in_proj_b, &gdn.in_proj_a}) {
+      const std::string nm =
+          Blk(il, pr == &gdn.in_proj_b ? "ssm_beta.weight" : "ssm_alpha.weight");
+      const GgufResidency r = pol.Route(g.Get(nm), proj_role);
+      if (r != GgufResidency::kExpandBf16) {
+        const GgufTensorInfo& ti = g.Get(nm);
+        *pr = OwnGgufKeptSlice(g, pol, ti, r, ti.shape[0], ti.shape[1], 0);
+        continue;
+      }
+      const GgufTensorInfo* t = nullptr;
+      std::vector<uint16_t> dq = DqBf16(g, nm, &t);
+      const int64_t out_dim = t->shape[0];
+      const int64_t in_dim = t->shape[1];
+      if (reorder) ReorderVRows(dq, in_dim, 0, num_k, rpk, 1);
+      *pr = MakeGdnProj(dq, out_dim, in_dim, pol.gdn_expand_nk);
+    }
   }
   // conv1d <- ssm_conv1d [conv_dim, K]; only V channels reorder. NOT transposed.
   {
