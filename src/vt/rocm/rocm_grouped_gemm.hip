@@ -444,6 +444,68 @@ __global__ void KQuantGemmK(OutT* __restrict__ out, const uint8_t* __restrict__ 
     else out[i * n + j] = DF32ToBF16(partial);
   }
 }
+// --- T36 (GFX1100-TG200): prefill M-tiled arm of KQuantGemmK ----------------
+//
+// The baseline hands ONE WARP to every (i, j) output element. At prefill
+// m > 1 that re-reads every weight row through the cache hierarchy m times
+// (the "m-pass-through" the spec's budget prices at ~0.7 ms/tok recoverable).
+// This arm gives one warp MT CONSECUTIVE ACTIVATION ROWS for ONE weight row:
+// the warp streams the weight row's superblocks once and applies each loaded
+// block to MT activation rows, cutting weight-side traffic and superblock
+// decode work ~MT-fold. Dispatched behind VT_PREFILL_TILE (default OFF) for
+// m > 1 only; the m == 1 GEMV/coop decode arms are untouched.
+//
+// NUMERICS CONTRACT -- BIT-IDENTICAL to KQuantGemmK, not merely in-band: per
+// output element (i, j) the lane->superblock map (sb = lane, lane + 32, ...),
+// the Dot call sequence, the f32 partial accumulation order, and the 16..1
+// __shfl_down_sync reduction tree are UNCHANGED; only the loop nesting gains
+// an inner activation-row pass and each row's partial lives in its own
+// register for the whole superblock loop. Identical adds in identical order
+// => identical bits (the same argument KQuantGemvMmvqRow's contract rests
+// on). Partial tiles (i >= m) compute predicated-off and write nothing.
+template <typename OutT, int Fmt, int MT>
+__global__ void KQuantGemmMTiledK(OutT* __restrict__ out,
+                                  const uint8_t* __restrict__ weight,
+                                  const BlockQ8_K* __restrict__ act, int64_t m,
+                                  int64_t n, int64_t nsb, size_t w_row_bytes,
+                                  size_t w_block_bytes) {
+  const int64_t tile = static_cast<int64_t>(blockIdx.x) * blockDim.y + threadIdx.y;
+  const int64_t tiles_i = (m + MT - 1) / MT;
+  if (tile >= tiles_i * n) return;
+  const int64_t j = tile % n;
+  const int64_t i0 = (tile / n) * MT;
+  const int lane = threadIdx.x;
+  const uint8_t* w_row = weight + static_cast<size_t>(j) * w_row_bytes;
+  float partial[MT];
+#pragma unroll
+  for (int r = 0; r < MT; ++r) partial[r] = 0.0f;
+  for (int64_t sb = lane; sb < nsb; sb += 32) {
+    const void* w_sb = w_row + static_cast<size_t>(sb) * w_block_bytes;
+#pragma unroll
+    for (int r = 0; r < MT; ++r) {
+      const int64_t i = i0 + r;
+      if (i >= m) break;  // partial tile: this and all later rows are out of range
+      const BlockQ8_K* a_row = act + i * nsb;
+      if constexpr (Fmt == 2)
+        partial[r] += DotQ6K(static_cast<const BlockQ6_K*>(w_sb), a_row + sb);
+      else if constexpr (Fmt == 1)
+        partial[r] += DotQ5K(static_cast<const BlockQ5_K*>(w_sb), a_row + sb);
+      else
+        partial[r] += DotQ4K(static_cast<const BlockQ4_K*>(w_sb), a_row + sb);
+    }
+  }
+#pragma unroll
+  for (int r = 0; r < MT; ++r) {
+    float p = partial[r];
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) p += __shfl_down_sync(0xffffffffULL, p, off);
+    const int64_t i = i0 + r;
+    if (lane == 0 && i < m) {
+      if constexpr (sizeof(OutT) == 4) out[i * n + j] = p;
+      else out[i * n + j] = DF32ToBF16(p);
+    }
+  }
+}
 
 // --- cooperative decode arm of KQuantGemmK, Q6_K only (issue #1910) ---
 //
@@ -1156,6 +1218,30 @@ void MatmulBTQuantKernelRocmGdn(Queue& q, Tensor& out, const Tensor& a, const Te
     auto launch = [&](auto ot) {
       using OutT = decltype(ot);
       auto* o = static_cast<OutT*>(out.data);
+    // T36 (GFX1100-TG200): prefill M-tiled GEMM arm, VT_PREFILL_TILE=1
+    // (default OFF; read PER CALL like the sibling arms so in-process tests
+    // and graph capture pick it up at dispatch time). m > 1 only -- the
+    // m == 1 decode GEMV/coop arms above stay authoritative; this replaces
+    // exactly the m-pass-through baseline launch below. Bit-identical to it
+    // (contract on KQuantGemmMTiledK).
+    const char* pt_e = std::getenv("VT_PREFILL_TILE");
+    const bool prefill_tile =
+        pt_e != nullptr && pt_e[0] == '1' && pt_e[1] == '\0' && m > 1;
+      if (prefill_tile) {
+        constexpr int kMT = 16;  // activation rows per warp = weight-pass factor
+        const unsigned tgrid = static_cast<unsigned>(
+            (((m + kMT - 1) / kMT) * n + kWarpsPerBlock - 1) / kWarpsPerBlock);
+        if (fmt == 2)
+          KQuantGemmMTiledK<OutT, 2, kMT><<<tgrid, block, 0, s>>>(
+              o, w, qact, m, n, nsb, w_row_bytes, w_block_bytes);
+        else if (fmt == 1)
+          KQuantGemmMTiledK<OutT, 1, kMT><<<tgrid, block, 0, s>>>(
+              o, w, qact, m, n, nsb, w_row_bytes, w_block_bytes);
+        else
+          KQuantGemmMTiledK<OutT, 0, kMT><<<tgrid, block, 0, s>>>(
+              o, w, qact, m, n, nsb, w_row_bytes, w_block_bytes);
+        return;
+      }
       const int coop = KQuantDecodeCoopWarps(b.dtype, m, nsb);
       if (coop == 8 && fmt == 2) {
         // One block per output element, eight warps deep. Only the measured
