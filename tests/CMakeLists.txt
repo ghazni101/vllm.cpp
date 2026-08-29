@@ -2347,6 +2347,19 @@ add_executable(test_ops_paged_attn_sharedk_wmma_p1_gpu
   vt/test_ops_paged_attn_sharedk_wmma_p1_gpu.cpp)
 target_include_directories(test_ops_paged_attn_sharedk_wmma_p1_gpu PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR})
+# GFX1100-TG200 T37 microbench: decode-GEMV shapes through the real dispatch,
+# sweeping VT_GEMV_WARPS / VT_GEMV_SPLITK. Executable only — NOT add_test
+# (measurement tool, not a gate; the paged-attn-wmma precedent).
+add_executable(t37_gemv_bench vt/t37_gemv_bench.cpp)
+target_include_directories(t37_gemv_bench PRIVATE ${CMAKE_SOURCE_DIR}/src
+                                                  ${CMAKE_SOURCE_DIR}/third_party)
+if(TARGET vllm::sanitize_test_shared)
+  target_link_libraries(t37_gemv_bench PRIVATE vllm::sanitize_test_shared
+                                               vllm_test_main)
+else()
+  target_link_libraries(t37_gemv_bench PRIVATE vllm::vllm vllm_test_main)
+endif()
+vllm_cpp_set_warnings(t37_gemv_bench)
 if(TARGET vllm::sanitize_test_shared)
   target_link_libraries(test_ops_paged_attn_sharedk_wmma_p1_gpu PRIVATE
     vllm::sanitize_test_shared vllm_test_main)
