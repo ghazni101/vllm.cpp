@@ -556,7 +556,7 @@ DBuf Dots3NoteMoeBlock(Dev d, const Dots3NoteMoeWeights& w,
 
   // --- router -------------------------------------------------------------
   // BF16, and that is upstream's dtype rather than ours:
-  // `_get_moe_router_dtype` (deepseek_v2.py:123-133) returns fp32 only for
+  // `_get_moe_router_dtype` (deepseek_v2.py:131-141) returns fp32 only for
   // `model_type == "glm_moe_dsa"` or an explicit `moe_router_dtype:
   // "float32"`, so `GateLinear.out_dtype` is None here and the GEMM runs at the
   // model dtype. Widening it would be silent to every gate this row can build.
@@ -1018,7 +1018,7 @@ Dots3NoteDeviceWeights MaterializeDots3NoteDevice(
     const int64_t E = p.n_routed_experts;
     const int64_t MI = p.moe_intermediate_size;
     // `router_logits, _ = self.gate(hidden_states)` — a plain `GateLinear`
-    // at the MODEL dtype, because `_get_moe_router_dtype` (deepseek_v2.py:127-131)
+    // at the MODEL dtype, because `_get_moe_router_dtype` (deepseek_v2.py:131)
     // returns fp32 only for `glm_moe_dsa` or an explicit
     // `moe_router_dtype: "float32"`, and dots3-note is neither. So the router
     // GEMM is BF16 here exactly as it is upstream; an f32 router would be the
