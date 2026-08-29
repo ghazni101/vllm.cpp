@@ -26,10 +26,18 @@ as did the **W3 leftovers** (the two missing d2h `fetch_add`s and the
 scoped `conv_transposed` refusal; #2201 via #2217, `a456e6eaf`), with
 the suite at 44 cases / 4340 assertions. The `docs/USAGE.md` weights
 entry is complete (file, bytes, repo @ revision, sha256, refused arms).
-Owed next: **W5** — the W4 record's named next lever: a per-slot
-persistent device buffer written through the mesh command queue
-([#2244](https://github.com/mudler/vllm.cpp/issues/2244); the
-tt-metal-internal half of W4's lever 2).
+**W5** (the per-slot persistent buffer written through the mesh command
+queue, [#2244](https://github.com/mudler/vllm.cpp/issues/2244)) landed
+2026-08-29: allocation-free uploads proven (residual allocation 0.02% of
+the profile; suite 45 cases / 5062 assertions; sacred pair byte-identical)
+and the wall HONESTLY UNMOVED — the A/B trace split the W4 hypothesis:
+per-upload allocation was never the wall; the wall is the per-CQ-operation
+tt-metal stack (context queries, `Cluster::get_chip`, `read_cq_host_ptr`
+polling) plus threadpool spin. Owed next: **W6 — lever 3, batch per-layer
+staging** (one CQ write per step divides the per-op tax by the fan-in;
+inside our file set), with the tt-metal-side residual (cached context
+handles, amortized CQ polling) recorded as the upstream-shaped
+alternative.
 
 ## Scope
 
@@ -342,104 +350,6 @@ tt-metal stack (`MetalContext::instance` 11.14%, `Cluster::get_chip` 5.90%,
 per-layer staging, our file set); the tt-metal-side residual is recorded
 beside it. Full log:
 [tt-qwen35-eager-profile-w5-20260829.log](../../docs/bench-evidence/tt-qwen35-eager-profile-w5-20260829.log).
-
-### W6 — the batching lever is not expressible (probe logs `/tmp/w6-probe{,2,3}.log`)
-
-The wave stopped at NEEDS_DECISION from the fresh implementer, and the operator
-verified both findings independently before accepting the verdict; nothing was
-implemented, and the branch carries records only.
-
-1. **The pinned tt-metal write API has no multi-destination write.** Every write
-   primitive targets exactly ONE `MeshBuffer`:
-   `enqueue_write` (MeshBuffer + DistributedHostBuffer), `enqueue_write_mesh_buffer`,
-   `enqueue_write_shards`, `enqueue_write_shard_to_sub_grid` (optional
-   `BufferRegion` sub-ranges ONE buffer's payload; `mesh_command_queue.hpp:89-127`),
-   the two `ttnn::copy_to_device` overloads (`tensor_ops.hpp:35,37`; definitions
-   `tensor_ops.cpp:168`, `:182`), and the experimental `core_subset_write`
-   (`experimental/core_subset_write/mesh_command_queue.hpp:18`). A `BufferRegion`
-   merges SOURCES, never destinations. Offset views ARE publicly constructible:
-   public `MeshBuffer::create` (`mesh_buffer.hpp:94-98`) takes
-   `std::optional<DeviceAddr> address`, and its non-per-core branch
-   (`mesh_buffer.cpp:163-167`) builds the private non-owning view
-   (`mesh_buffer.hpp:163-176`, `ExternallyOwnedState`) — so the W5 per-slot
-   persistent buffers CAN become windows into one arena through public API. That
-   does not make the lever expressible: every write primitive still targets exactly
-   one `MeshBuffer`, so an arena of views would still need one write per view (one
-   CQ op each), and the merged write cannot exist.
-2. **The production per-step staging fan-in is causally interleaved, not
-   co-temporal.** Env-guarded probe instrumentation (temporary, reverted, suite
-   re-run green 45/45 · 5062 after restore) on a real 3-token eager leg
-   (`vllm-cli`, Qwen3.5-0.8B, 17.128 s, 0.175 tok/s): 30 persistent-route restages =
-   `[11,6144]`×17 (the activation hidden buffer, one stable slot) + `[176,128]`×13
-   (three rotating pool bases) ≈ 7-8 writes/step, each separated by ~30-60 ms of
-   other work. Each restage is CAUSED by a fresh host write:
-   `MarkHostWritten` (`tenstorrent_ops.cpp:5654`) → a TT op's d2h round-trip drops
-   the shadow in `CommitHost` (`:1232`) → restage (`:561`). The bytes write N+1 must
-   carry do not exist until a d2h + host compute between N and N+1 completes, and
-   the consuming kernels enqueue between the writes on the single in-order CQ. One
-   write per step would carry not-yet-existing bytes or reorder CQ ops against
-   their consumers — a bit-identity violation, not a speed change.
-
-Operator verification of finding 1: independent read of the pinned tt-metal
-headers (`mesh_command_queue.hpp`, `mesh_buffer.hpp`, `tensor_ops.cpp`) reached
-the same conclusion before the verdict was accepted. **Verdict: W6 is named
-unreachable — not a ceiling**: the successor lever inside our file set is
-round-trip elimination (remove the `CommitHost`/`Backend::Copy` host↔device
-cycle that produces the restages; `vt::FusedChain` seam), and the
-upstream-shaped alternative is a multi-destination write that reaches several
-offset views at once in tt-metal.
-
-### W7 — the staging-write elimination is null: the premise inverts, and the gate failure is the real find (A/B log [tt-qwen35-staging-w7-20260830.log](../../docs/bench-evidence/tt-qwen35-staging-w7-20260830.log))
-
-`bd81430a9` + `d2fd05c6e` (#2282): the reservation state
-(`MarkScratchAcquired` arms `device_reserved` where base called
-`MarkHostWritten`), the `EnsureDevice2D` reservation arm, the eager
-full-slot memset fill and the device-resident D2D copy arms, and the
-rule that every content-establishing transition spends the reservation.
-Red-first implementer, fresh reviewer PASS, repair, scoped re-review
-PASS, full gate rerun on the immutable head.
-
-**The first gate run failed ambient — and the failure was a real latent
-defect, not noise.** LEG B drifted at prompt[1] tok=0 on the W7 head,
-deterministically, with base `785d4304f` green on the identical leg.
-Root cause: the reservation arm served `*s->persistent` whenever
-`device_reserved` was set, even after a producer had committed a live
-device shadow (the pool hands the block to a new tenant → a matmul
-commits `[8,256]` → the next bf16 stage at the block's earlier
-`[5,1024]` geometry received the PREVIOUS tenant's bytes and dropped
-the live shadow). Fixed on two independent layers: every
-content-establishing transition spends the flag, and the arm refuses
-when `device_current` is set. The new suite case pins the joint
-invariant — single-layer mutations pass by design, joint removal is red
-— and reaches the arm through the production staging path. Suite
-51/51 · 5852, sacred 16/16 STRICT both legs on the final head
-`b142a4683`.
-
-**The A/B is a null on both production workloads, and the counter
-identity is the mechanism.** Same method per arm (ambient default leg;
-the symmetric `VT_TT_STAGE_DUMP` atexit probe, temporary, reverted
-before this record; one lock hold; interleaved legs). vllm-cli 3-token:
-the arms never fire (avoided 0/0/0 in every leg), every counter is
-identical before/after (bulk=277 pwrite=169 palloc=139), wall 18.844 s
-vs 18.946 s mean (−0.54%, noise). E2E ambient 16-prompt (8640 GDN
-steps): AFTER `bulk=10205 pwrite=989 palloc=173 pbytes=1459288064
-avoided 0/0/0` vs BEFORE the same four counters to the byte in all four
-legs; wall 1385.527 s vs 1385.927 s mean (−0.03%, noise); per-step
-staging writes 0.114 in both arms. Why: in base the pool-acquire marks
-the slot device-stale, but a content op commits a fresh shadow before
-any restage can fire — the same commit that spends the W7 flag — so
-both worlds restage identically; the arm's serve requires
-`device_reserved && !device_current`, which no production interleaving
-reaches. The W6-probe restages (7-8/step on vllm-cli) are the causally
-required ones W6 already identified, not residency-state manufacture.
-**Verdict: the premise of #2282 is inverted — reported result, not a
-ceiling.** The staging-write-elimination lane is closed with evidence;
-the landed value is the spend/refuse safety rule (the drift proves the
-unguarded reservation was a live wrong-tokens hazard on the default
-path), the test that pins it, and the counters that keep the serve
-observable. The serve arms are production-evaluated but never serve on
-the measured workloads; LEG A was not dump-probed (both named in
-`## Owed`).
 
 ### W0 — refusal sweep (runs 1-8, `/tmp/w0_sweep_run{1..8}.log`)
 
