@@ -4711,6 +4711,7 @@ void PermuteVHeads(Queue& q, Tensor& out, const Tensor& in,
            "permute_v_heads: device mismatch");
   reinterpret_cast<PermuteVHeadsFn>(GetOp(OpId::kPermuteVHeads, q.device.type))(
       q, out, in, T, num_k, rpk, dv);
+}
 void CastF16(Queue& q, Tensor& out, const Tensor& in) {
   VT_CHECK(out.dtype == DType::kF16, "cast_f16: out must be f16");
   VT_CHECK(in.dtype == DType::kF32 || in.dtype == DType::kBF16,

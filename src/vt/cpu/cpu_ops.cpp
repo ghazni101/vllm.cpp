@@ -3468,6 +3468,7 @@ void PermuteVHeadsKernel(Queue&, Tensor& out, const Tensor& in,
             in_p[row * value_dim + g * dv + h];
     }
   }
+}
 // out[i] = F32ToF16(in[i]); out f16, in f32 or bf16, same element count.
 // QUANT-EXL3 W1a (#2181). LoadF32 reads either source width as f32 and StoreF32
 // rounds once to the f16 destination (cpu_ops.cpp:44-51), so the bf16 source
