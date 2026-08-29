@@ -1066,6 +1066,11 @@ struct Glm5NextGgufArrays {
   int64_t value_length_mla = 256;
   int64_t rope_dimension_count = 0;
   int64_t kda_head_dim = 128;
+
+  // `tokenizer.ggml.pre`, when `with_tokenizer` is on. The default is the
+  // pre name every existing case here was written against; the PUBLISHED
+  // artifact states `glm4`, which is what #2277's case selects.
+  std::string tokenizer_pre = "qwen35";
 };
 
 std::string PublishedShapeGguf(int64_t n_layers,
@@ -2101,6 +2106,52 @@ TEST_CASE("glm5_next: pre \"glm4\" gets PAST the tokenizer, to the loader") {
   CHECK(bad_msg.find("unsupported tokenizer.ggml.pre") != std::string::npos);
   CHECK(bad_msg.find("glm5next") != std::string::npos);
   CHECK(bad_msg.find("TEXT-ONLY") == std::string::npos);
+}
+
+// #2277, and it is the production-entry-point half of that fix. `FromGguf`'s
+// pre-tokenizer table refused `glm4`, so `LoadedEngine::FromModelDir` stopped in
+// the TOKENIZER on the staged `unsloth/GLM-5.3-Flash-GGUF` UD-Q2_K_XL artifact
+// and never reached the loader refusal above. The published file's own spelling
+// is `tokenizer.ggml.pre = "glm4"` beside `tokenizer.ggml.model = "gpt2"`, read
+// out of shard 1's kv block.
+//
+// This case is the one that would go RED if the pre name were dropped again: it
+// asserts the load gets STRICTLY PAST the tokenizer, by name, and lands on the
+// weight-loader refusal that W5c owns. The tokenizer's own splitting and BOS
+// behaviour are gated in `test_bpe.cpp`; what is gated here is REACH.
+TEST_CASE("glm5_next: pre \"glm4\" gets PAST the tokenizer, to the loader") {
+  Glm5NextGgufArrays arrays;
+  arrays.tokenizer_pre = "glm4";
+  const gguf_test::TempFile file(PublishedShapeGguf(
+      8, PublishedLayerTypes(8), /*head_count_kv=*/64, /*with_tokenizer=*/true,
+      arrays));
+  const std::string msg = LoadRefusalFor(file.path());
+  REQUIRE_FALSE(msg.empty());
+  CAPTURE(msg);
+
+  // Not the tokenizer's refusal, and specifically not the one this fixes.
+  CHECK(msg.find("unsupported tokenizer.ggml.pre") == std::string::npos);
+  CHECK(msg.find("glm4") == std::string::npos);
+  CHECK(msg.find("tokenizer") == std::string::npos);
+  // It is the WEIGHT LOADER's, which is strictly past the tokenizer read.
+  CHECK(msg.find("Glm5NextForConditionalGeneration") != std::string::npos);
+  CHECK(msg.find("the weight loader is not ported") != std::string::npos);
+  CHECK(msg.find("W5") != std::string::npos);
+
+  // A name the table still does not carry stops in the TOKENIZER, at the same
+  // fixture. Without this the case above would pass on a table that accepted
+  // anything, which is the way a pre-tokenizer gate goes quietly wrong.
+  Glm5NextGgufArrays unknown;
+  unknown.tokenizer_pre = "glm5next";
+  const gguf_test::TempFile bad(PublishedShapeGguf(
+      8, PublishedLayerTypes(8), /*head_count_kv=*/64, /*with_tokenizer=*/true,
+      unknown));
+  const std::string bad_msg = LoadRefusalFor(bad.path());
+  REQUIRE_FALSE(bad_msg.empty());
+  CAPTURE(bad_msg);
+  CHECK(bad_msg.find("unsupported tokenizer.ggml.pre") != std::string::npos);
+  CHECK(bad_msg.find("glm5next") != std::string::npos);
+  CHECK(bad_msg.find("the weight loader is not ported") == std::string::npos);
 }
 
 TEST_CASE("glm5_next: the safetensors LOADER refuses by name through FromModelDir") {
