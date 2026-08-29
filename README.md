@@ -256,8 +256,8 @@ you get on top, most of it borrowed from whichever engine does it best:
   The GPU runner does not pass image features to the model forward
   ([#2300](https://github.com/mudler/vllm.cpp/issues/2300)). No multimodal request is served end
   to end.
-- **Quantization.** NVFP4 W4A4/W4A16, compressed-tensors NVFP4A16, EXL3 trellis, GGUF F32/F16,
-  Q4_0, Q8_0, Q3_K, Q4_K, Q5_K, Q6_K, IQ2_XS, IQ4_XS, and an FP8 W8A8 slice.
+- **Quantization.** NVFP4 W4A4/W4A16, compressed-tensors NVFP4A16, GGUF
+  F32/F16/Q4_0/Q8_0/Q3_K/Q4_K/Q5_K/Q6_K, and an FP8 W8A8 slice.
 - **External KV.** KV offload to CPU/disk and an `lm://` LMCache client, plus KV-cache events for
   external routers. Opt-in, off by default ([docs/KV-OFFLOAD.md](docs/KV-OFFLOAD.md)).
 - **Observability.** Prometheus `/metrics` with vLLM's metric names, `/server_info`, `/tokenize`,
