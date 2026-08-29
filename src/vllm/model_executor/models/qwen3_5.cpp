@@ -1168,7 +1168,9 @@ Tensor ResidentWeight(Dev d, const OwnedTensor& w, std::vector<int64_t> shape = 
     // weights twice. `DeviceStagingFits` asks that question of the BOX, so a
     // model that fits stages and a model that does not keeps the retag.
     // Falling through skips the alias attempt and reaches the staging branch.
-    const bool stage_instead = !w.bytes.empty() && StageOwnedWeightsToDevice();
+    const bool stage_instead =
+        !w.bytes.empty() &&
+        DeviceStagingFits(vt::GetBackend(d.q.device.type), w.bytes.size());
     if (!w.bytes.empty() && !stage_instead) {
       const bool aliased = MakeHostBytesDeviceAliasable(w);
       ReportHostAliasResidency();
