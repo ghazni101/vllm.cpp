@@ -3,14 +3,15 @@
   "role": "GFX1100-TG200 campaign reference continuation: the 256-token greedy body on the gate prompt, plus its token ids, that every reduction-order lever is adjudicated against (tools/tg200-neartie.sh adjudicate).",
   "captured": {
     "date": "2026-08-29",
-    "git_head": "54e40a850884a7c3c7a4e4bbb4f95fd6b61cb84b",
+    "git_head": "8f4167064 (post-issue-#9-fix; the Q6_K MMVQ borrow fix in KQuantGemvMmvqRow, commit 80f4059f6)",
     "tool": "examples/tg200_neartie (capture mode) via tools/tg200-neartie.sh",
     "container": "rocm-dev:10.0.0 (HIP 7.15), gpu-ctl lock held",
-    "body_md5": "783cea1790ae7ebc4a0105fd309a6712",
-    "body_md5_convention": "md5 of the body bytes + one trailing newline (vllm-cli stdout, `md5sum body.txt`); matches the campaign reference recorded in docs/bench-evidence/gfx1100-tg200-t34-host-split-20260829.md and t36",
+    "body_md5": "a0fa1c4aa8cc5de086006111dad7a7bf",
+    "body_md5_convention": "md5 of the body bytes + one trailing newline (vllm-cli stdout, `md5sum body.txt`)",
+    "re_mint_note": "The previous reference 783cea17... was minted at 54e40a850 UNDER the corrupted Q6_K MMVQ arm (issue #9: scalar v-0x20202020 borrow underflow); the repair changes model output (1 token over the 500 mnats band at position 12), so the reference is re-minted on the fixed kernel. Old body/ids remain in git history at 22230889d.",
     "n_tokens": 256,
     "finish_reason": "length",
-    "ids_sha256": "2dcda0e4c0830054603699948e55991aeee77d218ad05cfa50916a720563f439"
+    "ids_sha256": "88f475892562d6b480e0a6a5e7e79a5fdbe579d034b57d0abcd9132bad59151e"
   },
   "model": {
     "path": "/home/ghazni/models/vllm.cpp/Qwen3.5-4B-Q4_K_M.gguf",
@@ -46,6 +47,6 @@
   },
   "self_test": {
     "result": "PASS",
-    "detail": "teacher-forced walk of these ids at the capture commit: divergent=0 over_band=0 max_gap_mnats=0.000, forced body md5 == 783cea17... (raw: agent-artifacts/tg200-neartie/selftest-neartie.json)"
+    "detail": "teacher-forced walk of these ids on the fixed kernel at 8f4167064: divergent=0 over_band=0 max_gap_mnats=0.000, body md5 == a0fa1c4a... (raw: agent-artifacts/tg200-neartie/t96-selftest-remint.json)"
   }
 }
