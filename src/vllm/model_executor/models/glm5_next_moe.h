@@ -147,107 +147,6 @@ struct DenseMlpWeights {
   std::vector<float> down_proj;  // [hidden, intermediate]
 };
 
-// A source of ONE routed expert's host-f32 weights, consulted on demand.
-//
-// ─── WHY THIS EXISTS, AND IT IS ARITHMETIC AND NOT PREFERENCE ────────────────
-//
-// `MoeLayerWeights::expert_gate_up` and `expert_down` are the whole bank. At
-// the published geometry (288 experts, `moe_intermediate_size` 2048,
-// `hidden_size` 4096) that is:
-//
-//   | what | f32 bytes | GiB |
-//   |---|---:|---:|
-//   | one expert's `gate_up`, [2 * 2048, 4096] | 67,108,864 | 0.0625 |
-//   | one expert's `down`, [4096, 2048] | 33,554,432 | 0.03125 |
-//   | **one expert, both** | **100,663,296** | **0.09375** |
-//   | one sparse layer's 288 experts | 28,991,029,248 | 27.0 |
-//   | the 42 sparse layers' experts, all held | 1,217,623,228,416 | **1,134.0** |
-//   | usable on `dgx:gpu0`, the largest device this project reaches | | ~119.63 |
-//
-// A resident float bank is 1,134 GiB against a 119.63 GiB box — 9.5x over — and
-// `glm5_next_bridge.h`'s `kBridgeTensorF32ByteCeiling` already refuses one bank
-// BY NAME at 9.0 GiB, which is that gate working rather than an obstacle to
-// route around. **`num_experts_per_tok` is 8 of 288**, so what a token actually
-// needs is at most 8 experts, and what a step needs is the DISTINCT experts its
-// tokens hit. Decoding one at a time and dropping it makes the peak ONE expert:
-// 0.09375 GiB, 0.078% of the box, and 12,096x under the whole-layer figure.
-//
-// **What this rules out, said positively.** There is no cache and no map keyed
-// by expert index, for the same reason `glm5_next_bridge.h` has no `BridgeTower`:
-// either one turns "one expert" into "every expert this request has ever
-// selected", which is the bank again with a slower ramp. `MoeForward` reuses two
-// buffers across the experts of one call and holds nothing between calls.
-class ExpertSource {
- public:
-  virtual ~ExpertSource() = default;
-
-  // Fill `gate_up` with expert `e`'s [2 * moe_intermediate_size, hidden_size]
-  // (GATE first, then up — the fused order `Glm5NextTextExperts` declares) and
-  // `down` with its [hidden_size, moe_intermediate_size].
-  //
-  // The implementation OVERWRITES both buffers. `MoeForward` hands it the same
-  // two vectors for every expert of a call, which is what makes the peak one
-  // expert; an implementation that appended, or that kept its own copy, would
-  // defeat the whole point of the interface.
-  virtual void Expert(int64_t e, std::vector<float>& gate_up,
-                      std::vector<float>& down) = 0;
-};
-
-// The routed-expert banks in the checkpoint's OWN block encoding, BORROWED.
-//
-// ─── WHY A THIRD RESIDENCY, WHEN THE OTHER TWO ALREADY BOUND THE PEAK ────────
-//
-// `ExpertSource` above bounds the PEAK at one expert and it does that
-// correctly. What it does not bound is the WORK: it decodes an expert's
-// `[2I, H]` + `[H, I]` out of GGUF blocks into host f32 on EVERY step, for
-// every expert that step's tokens hit. The blocks it decodes FROM are 2.20 GiB
-// per sparse layer and are already in the file; the f32 it decodes TO is 27.0
-// GiB per sparse layer and is thrown away before the next step. Reading the
-// blocks where they lie copies nothing and decodes nothing.
-//
-// ─── AND IT IS NOT NEW NUMERICS, WHICH IS THE POINT ──────────────────────────
-//
-// `vt::MoeGateUpSwiGLUGrouped` (`include/vt/ops.h`) is the shared keep-quant
-// seam that DeepSeek-V4's private fused kernel was PROMOTED into, in its own
-// words "so any keep-quant MoE arch inherits it". Its epilogue is specified as
-// `gate = min(F.(gate_w.xq), limit)`, `up = clamp(F.(up_w.xq), -limit, limit)`,
-// `out = gate.sigmoid(gate).up` — clamped SwiGLU at alpha=1, beta=0, which is
-// `ExpertGate` above, which is `deepseek_v4::ClampedSwiGLU` at alpha=1, beta=0,
-// which is `_apply_gate` (`:137-142`). Same function, three spellings, and this
-// arm uses the one that already has two providers. The down projection is
-// `vt::MatmulBTQuantGrouped`. Both dispatch on the queue's device, so this is
-// also the ONLY expert arm a CUDA queue could ever run.
-//
-// ─── THE SHAPES ARE THE CHECKPOINT'S OWN, WITH NO REPACK ─────────────────────
-//
-// `LoadStackedExperts` (`glm5_next_loader.cpp`) builds each bank as
-// `OwnGgufQuantBlocks(t, E * N, K)` and then RESHAPES the record to `[E, N, K]`;
-// its own comment says the bytes are identical either way. `[E * N, K]` is
-// exactly the stacked tower both ops declare, so these views are a rank change
-// over the same pointer and never a copy. Measured on the published artifact:
-// every `ffn_{gate,up}_exps` is `ne = [4096, 2048, 288]` and every
-// `ffn_down_exps` is `[2048, 4096, 288]`.
-//
-// ─── WHAT THIS ARM CHANGES NUMERICALLY, AND IT IS NOT NOTHING ────────────────
-//
-// The seam quantizes the ACTIVATION to Q8_K once per call; the two f32 arms do
-// not. So this arm and the f32 arms do NOT agree bit-for-bit, and a gate
-// between them is an error band and not an equality. The ROUTER is untouched
-// and still runs in f32 (`RouterLogits`), so expert SELECTION is unaffected —
-// which matters, because selection error is bimodal and a tolerance cannot see
-// it, while this one is an ordinary value perturbation that a tolerance can.
-// This is the same activation-quantization the DeepSeek-V4 and Qwen3.5 MoE arms
-// already ship.
-//
-// BORROWED, exactly like `expert_source`: every `data` pointer here aims into
-// the loader's mmap or its owned block bytes, and must outlive every
-// `MoeForward` call that reads the enclosing struct.
-struct MoeQuantBanks {
-  vt::Tensor gate;  // [E * moe_intermediate_size, hidden_size], block-quant
-  vt::Tensor up;    // [E * moe_intermediate_size, hidden_size], the SAME dtype
-  vt::Tensor down;  // [E * hidden_size, moe_intermediate_size], block-quant
-};
-
 // One sparse layer's weights, in the checkpoint's own packing: the routed
 // experts arrive STACKED and gate/up arrive FUSED, which is how
 // `Glm5NextTextExperts` declares them (`:116-117`) and how
@@ -264,23 +163,6 @@ struct MoeLayerWeights {
   std::vector<float> expert_gate_up;
   // [n_routed_experts, hidden, moe_intermediate_size].
   std::vector<float> expert_down;
-  // The ON-DEMAND alternative to the two banks above, BORROWED and not owned.
-  //
-  // Exactly one of the two shapes is admissible per layer and `MoeForward`
-  // refuses the other two states BY NAME: both populated is ambiguous, and
-  // neither populated would run the router and then read an empty bank as a
-  // zero weight — a finite, fluent, wrong block, which is the failure this
-  // row's headers keep naming. The pointer must outlive every `MoeForward`
-  // call that reads this struct.
-  ExpertSource* expert_source = nullptr;
-  // The KEEP-QUANT alternative to both shapes above, and the one `MoeForward`
-  // prefers when it is present. Valid iff `has_quant_banks`; borrowed, with the
-  // lifetime `expert_source` has. A layer may carry this together with an
-  // `expert_source` — that is not the ambiguous state the two f32 shapes are in,
-  // because the two are the same weights in two encodings and the keep-quant one
-  // simply wins. What is refused is BOTH f32 shapes at once, as before.
-  MoeQuantBanks quant_banks;
-  bool has_quant_banks = false;
   // The shared expert, at `shared_intermediate_size()`.
   DenseMlpWeights shared;
 };
@@ -366,15 +248,6 @@ std::vector<float> DenseMlpForward(const DenseMlpWeights& w,
 // because `routed_scaling_factor` is already folded into the router weights by
 // `MoeRouterTopKArgs::routed_scaling_factor`. Passing it in BOTH places would
 // square it.
-//
-// THE EXPERTS ARE VISITED ONCE EACH, grouped by expert before any of them is
-// evaluated. That is upstream's own order (`:120-135` loops over the HIT
-// experts and `index_add_`s each one's tokens, rather than looping over tokens)
-// and it is what bounds the residency when `w.expert_source` is set: a second
-// visit to an already-seen expert would be a second 96 MiB decode. Each [t, j]
-// slot is still computed independently and written to its own row of the
-// combine's `[T, K, H]` operand, so the grouping moves no arithmetic and the
-// resident path is byte-identical to a token-major visit.
 //
 //   hidden : [num_tokens, hidden_size]  row-major
 // Returns  : [num_tokens, hidden_size]  row-major
