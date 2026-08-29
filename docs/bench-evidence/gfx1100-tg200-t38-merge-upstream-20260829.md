@@ -8,12 +8,12 @@ the campaign reference preserved bit-for-bit under the adopted-lever block?
 
 ## Change
 
-- `4262858c4` merge upstream/main into row/GFX1100-TG200. Three content
+- `65d781e69` merge upstream/main into row/GFX1100-TG200. Three content
   conflicts, all in the op seam, all additive: `kPermuteVHeads` (ours, T25)
   vs `kCastF16` (upstream, QUANT-EXL3 W1a #2181) inserted at the same
   anchor of `include/vt/ops.h`, `src/vt/cpu/cpu_ops.cpp`, `src/vt/ops.cpp`.
   Resolved keep-both. No campaign lever rebased; evidence-commit SHAs intact.
-- `69d4243b1` fix: the shared closer had been unified by git across both
+- `69bd0f035` fix: the shared closer had been unified by git across both
   conflict sides, leaving `PermuteVHeadsKernel` and `PermuteVHeads`
   unclosed; adds the two missing `}`. Caught by the build (red-first).
 
@@ -77,5 +77,10 @@ tools/tg200-prompt.txt)" --max-tokens 256 --temperature 0 --seed 0
 
 Correctness PASS: focused gates at the documented baseline, campaign
 reference byte-identical, branch synced to upstream tip `3015aad08` at
-`69d4243b1`. Owed upstream: the `test_placed_moe_roundtrip` /
-`RunMoeBlockPlaced` removal belongs on mudler/vllm.cpp, not here.
+`69bd0f035`. Owed upstream: the `test_placed_moe_roundtrip` /
+`RunMoeBlockPlaced` removal belongs on mudler/vllm.cpp, not here. Owed
+here: the record-anchor ratchet reads stale=29 vs baseline 28 — the
+identical stale set exists at the pre-merge head `8e2f56cb1`, so the
+merge added zero rot; the +1 predates this work and its owner owes the
+citation repair. `check-env-doc` was repaired in-flow by allowlisting
+the three TG200 tuning knobs.
