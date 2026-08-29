@@ -211,16 +211,39 @@ size_t RowSizeBytes(DType dtype, int64_t k) {
          static_cast<size_t>(g->block_bytes);
 }
 
-// The cold half of the now-inline `SizeOf` (include/vt/dtype.h). Both are
-// [[noreturn]] and both keep the exact message the out-of-line SizeOf threw, so
-// nothing that catches or matches on that text changes.
-void ThrowBlockQuantHasNoElementSize(DType dtype) {
-  VT_CHECK(false, std::string("SizeOf: block-quantized dtype ") + Name(dtype) +
-                      " has no per-element size");
-  throw std::runtime_error("unreachable");
-}
-
-void ThrowUnknownDType() {
+size_t SizeOf(DType dtype) {
+  switch (dtype) {
+    case DType::kF32: return 4;
+    case DType::kF16: return 2;
+    case DType::kBF16: return 2;
+    case DType::kI8: return 1;
+    case DType::kI32: return 4;
+    case DType::kI64: return 8;
+    // Block-quantized dtypes are storage-only: there is no per-element size,
+    // so every elementwise path that reaches one fails loudly here rather than
+    // silently mis-striding a packed block buffer.
+    case DType::kQ4_0:
+    case DType::kQ5_0:
+    case DType::kQ8_0:
+    case DType::kQ2_K:
+    case DType::kQ3_K:
+    case DType::kQ4_K:
+    case DType::kQ5_K:
+    case DType::kQ6_K:
+    case DType::kQ8_K:
+    case DType::kIQ2_XXS:
+    case DType::kIQ3_XXS:
+    case DType::kIQ2_S:
+    case DType::kIQ1_S:
+    case DType::kIQ1_XXXS:
+    case DType::kIQ4_NL:
+    case DType::kMXFP4:
+    case DType::kIQ2_XS:
+    case DType::kIQ4_XS:
+      VT_CHECK(false, std::string("SizeOf: block-quantized dtype ") +
+                          Name(dtype) + " has no per-element size");
+      return 0;
+  }
   VT_CHECK(false, "unknown dtype");
   throw std::runtime_error("unreachable");
 }
