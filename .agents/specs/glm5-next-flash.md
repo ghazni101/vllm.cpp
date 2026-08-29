@@ -2852,7 +2852,11 @@ Debts this row carries, each visible rather than waived:
   [#2213](https://github.com/mudler/vllm.cpp/issues/2213) records it.
 
 - **O18 — the three per-layer CONFIG ARRAYS are DISCHARGED, and the loader now
-  stops one geometry key further on. The artifact still does not FIT.** With
+  stops one geometry key further on. The artifact now FITS, and the sentence
+  that said otherwise was true only until
+  [#2247](https://github.com/mudler/vllm.cpp/issues/2247) landed the two
+  keep-quant kernels (see the residency paragraph at the foot of this entry).**
+  With
   [#2240](https://github.com/mudler/vllm.cpp/issues/2240)'s IQ2_XS and IQ4_XS
   decoders in, `LoadedEngine::FromModelDir` opens all four shards of the staged
   `/mnt/nas_share/rc/ckpt/GLM-5.3-Flash-UD-Q2_K_XL/` artifact, sizes all 1412
@@ -2977,20 +2981,41 @@ Debts this row carries, each visible rather than waived:
   #2243 quotes the superseded 35 / 11 and cannot be edited; that row names this
   entry, so this entry is the corrected surface.
 
-  **Reaching config resolution is not the same as the model fitting.** Both new
-  types are DECODE-ONLY. Neither has a keep-quant `vec_dot`, so
-  `HasQuantDotKernel` is false and every GEMM weight of those two types expands
-  to bf16 at load. Measured from the staged artifact's own headers, all four
-  shards and all 1412 tensors: the file is **101.24 GiB on disk and 597.46 GiB
-  as bf16**, an expansion of 5.9x. The resident cost TODAY is **426.72 GiB**,
-  and `dgx:gpu0` has about 119.63 GiB, so it does not fit. A keep-quant
-  `vec_dot` for exactly these two types brings the resident cost to **101.14
-  GiB**, which fits with 18.49 GiB of headroom, and saves **325.58 GiB**. Every
-  other encoding in this file already keeps its quantization, IQ3_XXS
-  (`VecDotIQ3_XXSQ8_K`) included, so these two types are the whole gap.
-  [#2247](https://github.com/mudler/vllm.cpp/issues/2247) owns that work, and
-  the `QUANT-GGUF-IQ2_XS` and `QUANT-GGUF-IQ4_XS` rows of
-  [`quantization-matrix.md`](../quantization-matrix.md) carry it as `C` = `-`.
+  **Reaching config resolution is not the same as the model fitting, and that
+  half is now PAID.** Both types were DECODE-ONLY when this entry was written:
+  neither had a keep-quant `vec_dot`, so `HasQuantDotKernel` was false and every
+  GEMM weight of those two types expanded to bf16 at load. Measured from the
+  staged artifact's own headers, all four shards and all 1412 tensors: the file
+  is **101.24 GiB on disk and 597.46 GiB as bf16**, an expansion of 5.9x, and
+  the resident cost was **426.72 GiB** against about 119.63 GiB on `dgx:gpu0`.
+  [#2247](https://github.com/mudler/vllm.cpp/issues/2247) ported the two
+  kernels, and the same measurement now reads **101.14 GiB**, which fits with
+  18.49 GiB of headroom, for a saving of **325.58 GiB**. Both figures come from
+  driving the production `RouteGgufTensor` over the artifact's real tensor list
+  (§"The measured residency" above), not from arithmetic. Every other encoding
+  in this file already kept its quantization, IQ3_XXS (`VecDotIQ3_XXSQ8_K`)
+  included, so these two types were the whole gap. The `QUANT-GGUF-IQ2_XS` and
+  `QUANT-GGUF-IQ4_XS` rows of
+  [`quantization-matrix.md`](../quantization-matrix.md) now carry `C` = `Y`.
+  **The remaining blockers on a real load are functional, not memory.** This
+  sentence has now been rewritten twice as `origin/main` moved under this
+  branch, so it names the whole chain rather than one milestone. It first named
+  [#2243](https://github.com/mudler/vllm.cpp/issues/2243) /
+  [#2177](https://github.com/mudler/vllm.cpp/issues/2177) (the per-layer
+  `head_count_kv` array), which the first half of this very entry records as
+  DISCHARGED by [#2269](https://github.com/mudler/vllm.cpp/pull/2269); then the
+  rotary-width cross-check
+  ([#2268](https://github.com/mudler/vllm.cpp/issues/2268)), which **O20**
+  discharges by moving both sides onto llama.cpp's `attention.key_length`
+  meaning; then the `glm4` pre-tokenizer
+  ([#2277](https://github.com/mudler/vllm.cpp/issues/2277)), which **O21**
+  discharges. None of the three was a memory blocker, and none is left. The
+  stopping point today is the WEIGHT LOADER itself:
+  `src/vllm/model_executor/models/glm5_next_registry.cpp:78` refuses by name,
+  which is O10's refusal reached from the published artifact, and W5b and W5c
+  own it. **And the residency figure is not a compute claim:** the CUDA arm has no keep-quant kernel for either type,
+  so on `dgx:gpu0` the 101.14 GiB fits with its expert GEMM on the CPU fallback
+  — O19 below.
 
   **O7 is stale beside it and is not corrected here.** "No artifact of this
   model exists" was true when it was written; the UD-Q2_K_XL arm is now staged,
@@ -2999,15 +3024,59 @@ Debts this row carries, each visible rather than waived:
   belongs to W7b, which owns that sentence, rather than to a dequant change that
   merely walked past it.
 
+- **O19 — the 101.14 GiB is a RESIDENCY result. On `dgx:gpu0` the expert GEMM
+  for both new types runs on the CPU, and the fused seam THROWS.**
+  [#2260](https://github.com/mudler/vllm.cpp/issues/2260).
+  [#2247](https://github.com/mudler/vllm.cpp/issues/2247) landed the two CPU
+  keep-quant `vec_dot` kernels, which is what flips the artifact's 82 IQ2_XS and
+  3 IQ4_XS tensors from `kExpandBf16` to `kKeepQuant` and makes it fit. The CUDA
+  arm has no kernel for either:
+  `src/vt/cuda/cuda_quant_dot.cu::IsCudaKeepQuantSupported` admits ten
+  Q8_K-family encodings — IQ2_XXS, IQ3_XXS, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ2_S,
+  IQ1_S, IQ1_XXXS — and neither IQ2_XS nor IQ4_XS is among them, while
+  `src/vllm/model_executor/model_loader/gguf_keep_quant.cpp::DeviceKeepQuantSupported`
+  returns `true` for CUDA on its `default:` arm regardless, on the recorded
+  ground that "CUDA falls back to the CPU kernel for anything it lacks". So the
+  residency measurement holds on a CUDA device and the SPEED does not:
+
+  - `src/vt/cuda/cuda_quant_dot.cu::MatmulBTQuantGroupedKernelCuda` takes the
+    CPU-fallback arm behind a full `cudaStreamSynchronize` ("keepquant-grouped
+    CPU-fallback drain") on every grouped expert GEMM. Correct, and it
+    round-trips the routed-expert weight bytes to the host cores per step.
+  - `src/vt/cuda/cuda_quant_dot.cu::MoeGateUpSwiGLUGroupedCuda` THROWS
+    `gate/up must be the SAME CUDA keep-quant dtype`, because
+    `IsCudaKeepQuantSupported` fails for both operands and `MergedGemm` selects
+    the fused op on device registration alone, with no dtype predicate.
+
+  **Not reached today, which is why this is a disclosure and not a defect in
+  [#2256](https://github.com/mudler/vllm.cpp/pull/2256).** `glm5_next_moe.cpp`
+  is W5's host reference and does not use the fused seam; `laguna.cpp` is the
+  only model reaching `MoeGateUpSwiGLUGrouped`. It becomes live the moment this
+  row obeys AGENTS.md `## Shared seams`, which routes mergeable MLP projections
+  through `layers::MlpGateUpMethodBase` and `vt::MergedGemmGroup` — that is
+  exactly what W5b ([#2241](https://github.com/mudler/vllm.cpp/issues/2241)) and
+  W5c ([#2242](https://github.com/mudler/vllm.cpp/issues/2242)) are for, and at
+  that moment a 101 GiB-resident model throws at first forward.
+
+  #2260 carries the analysis and three options — port the two CUDA kernels (the
+  only one that yields a speed number worth quoting), keep EXPANDING these two
+  on CUDA (honest, but then the artifact does not fit at 426.72 GiB), or refuse
+  by name at load rather than throwing with the model resident. This row owns
+  the consequence; #2260 owns the fix. Until one lands, **no speed or e2e number
+  on this artifact may be quoted as a GPU result**, and the `QUANT-GGUF-IQ2_XS`
+  and `QUANT-GGUF-IQ4_XS` rows of
+  [`quantization-matrix.md`](../quantization-matrix.md) say so in place.
 - **O20 — the MLA key CONVENTION and the KDA head count are DISCHARGED, and the
   loader now stops in the TOKENIZER.** [#2268](https://github.com/mudler/vllm.cpp/issues/2268).
 
   **The number is O20 and not O19 deliberately.** `origin/main` at
-  `c3522bc7d` carries O1 to O18; [#2256](https://github.com/mudler/vllm.cpp/issues/2256)
-  adds an O19 on a branch that has not merged. Two branches that each append an
-  `O19` produce a duplicate rather than a conflict, so this entry skips the
-  number rather than racing for it. The gap is deliberate and is not a missing
-  entry.
+  `c3522bc7d` carried O1 to O18; [#2256](https://github.com/mudler/vllm.cpp/issues/2256)
+  was adding an O19 on a branch that had not merged. Two branches that each
+  append an `O19` produce a duplicate rather than a conflict, so this entry
+  skipped the number rather than racing for it. **That reservation worked and
+  the gap is now CLOSED:** #2256 merged `origin/main` into itself and its O19
+  sits directly above this entry, so O18 to O21 run consecutively and no entry
+  is missing.
 
   **The delta, and it is a delta in MEANING and not in spelling.**
   `%s.attention.key_length` is a name llama.cpp already owns, and for an MLA
@@ -3135,19 +3204,24 @@ Debts this row carries, each visible rather than waived:
   PREPEND it. The conclusion — do not prepend — survives; the mechanism does
   not, and the mechanism is what a port mirrors.
 
-  **Still not loaded.** Reaching the tokenizer is not fitting: O10 (the weight
-  loader refuses by name), O18's 426.72 GiB resident cost and
-  [#2247](https://github.com/mudler/vllm.cpp/issues/2247)'s keep-quant
-  `vec_dot` all stand unchanged. No token was produced and none is claimed.
+  **Still not loaded.** Reaching the tokenizer is not fitting: O10, the weight
+  loader's refusal by name, stands unchanged. **The memory half no longer does,
+  and this paragraph was corrected when
+  [#2247](https://github.com/mudler/vllm.cpp/issues/2247) merged into the branch
+  carrying it.** It said O18's 426.72 GiB resident cost and #2247's keep-quant
+  `vec_dot` both stood; #2247 has since landed the two CPU kernels, and O18 and
+  O19 now read 101.14 GiB. Reaching the tokenizer was never a fitting claim
+  either way. No token was produced and none is claimed.
 
 - **O21 — the `glm4` PRE-TOKENIZER is DISCHARGED, and the loader now stops in the
   WEIGHT LOADER.** [#2277](https://github.com/mudler/vllm.cpp/issues/2277).
 
-  **The number is O21 and not O19.** `origin/main` at `785d4304f` carries O1 to
-  O18 plus O20, and so did `a36add6a8`, the base this branch was cut from; [#2256](https://github.com/mudler/vllm.cpp/issues/2256) adds an
-  O19 on a branch that has not merged. Two branches that each append an `O19`
-  produce a duplicate rather than a conflict, so this entry skips the number for
-  the same reason O20 did. The gap is deliberate.
+  **The number is O21 and not O19.** `origin/main` at `785d4304f` carried O1 to
+  O18 plus O20, and so did `a36add6a8`, the base this branch was cut from; [#2256](https://github.com/mudler/vllm.cpp/issues/2256) was adding an
+  O19 on a branch that had not merged. Two branches that each append an `O19`
+  produce a duplicate rather than a conflict, so this entry skipped the number
+  for the same reason O20 did. **The gap is now CLOSED** — #2256 merged
+  `origin/main` into itself, and O18 to O21 run consecutively above.
 
   **THE SPLITTING RULE IS EXACT, AND THE COMPARISON IS OVER BYTES.**
   `tok::Tokenizer::FromGguf` now maps `glm4` and `chatglm-bpe` — exactly the two
@@ -3233,9 +3307,14 @@ Debts this row carries, each visible rather than waived:
   ([#2242](https://github.com/mudler/vllm.cpp/issues/2242)) owns.
 
   **Still not loaded, and no token is claimed.** Reaching the weight loader is
-  not fitting: O10, O18's 426.72 GiB resident cost and
-  [#2247](https://github.com/mudler/vllm.cpp/issues/2247)'s keep-quant `vec_dot`
-  all stand unchanged.
+  not fitting: O10 stands unchanged. **The memory half does not, and this
+  paragraph was corrected when
+  [#2247](https://github.com/mudler/vllm.cpp/issues/2247) merged into the branch
+  carrying it.** It said O18's 426.72 GiB resident cost and #2247's keep-quant
+  `vec_dot` both stood; #2247 has since landed the two CPU kernels, and O18 and
+  O19 now read 101.14 GiB against ~119.63 GiB. The artifact FITS and still does
+  not LOAD, which are two different sentences: O10 is a weight-tower gap, not a
+  memory one.
 
   **STILL OWED, and filed rather than papered over:
   [#2279](https://github.com/mudler/vllm.cpp/issues/2279).** `FromGguf` never
