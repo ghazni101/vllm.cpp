@@ -160,6 +160,7 @@ enum class OpId : uint8_t {
   kCastBf16,
   kCastF32,
   kPermuteVHeads,
+  kCastF16,
   kMulColVecF32,
   kAttnGateSplit,
   kSigmoidGateBf16,
@@ -502,6 +503,49 @@ enum class OpId : uint8_t {
   // the KERNELS rather than the port; resolved via ltx2_vae::Ltx2VaeDevice().
   // Appended before kCount so no existing op's id shifts.
   kLtx2Vae,
+  // MODEL-MM-QWEN4-EXP W5b-3 (#2156) — the PLE DILATED depthwise causal conv,
+  // `Qwen4ExpTextPLELayer._short_conv` (transformers v5.16.0
+  // modeling_qwen4_exp.py:1150-1167). kernel 4, dilation 3, so output t reads
+  // lags {9, 6, 3, 0} and the persistent state is a 9-deep history read at
+  // stride 3.
+  //
+  // WHY A NEW OpId AND NOT A `dilation` FIELD ON `CausalConv1dArgs`. That was
+  // weighed and rejected on evidence, not on taste:
+  //
+  //   * `CausalConv1dArgs` is READ BY FIVE BACKENDS — cpu_ops.cpp,
+  //     cuda_gdn.cu, rocm_gdn_conv.hip, vulkan_ops.cpp and
+  //     tenstorrent_ops.cpp — across kCausalConv1dFwd, kCausalConv1dUpdate and
+  //     kCausalConv1dSpecUpdate. A new field is silently IGNORED by every
+  //     kernel that does not read it, and this is a CPU-only host: four of
+  //     those five arms could not be gated here, so the field would ship as a
+  //     live wrong-answer path on the Mamba/GDN/KDA/Kimi conv rather than as a
+  //     refusal.
+  //   * The state WIDTH is welded to `K - 1` where it is USED, and naming the
+  //     wrong site would overstate this, so name both. The shared checker's
+  //     width test (`CheckConvCommon`, src/vt/ops.cpp:1732) is
+  //     `conv_state.shape[2] >= k - 1` — a LOWER bound, already widened once so
+  //     the spec-decode cache's `(K-1)+num_spec` row fits. It is NOT the weld: a
+  //     nine-column PLE state passes it (9 >= 3). The weld is
+  //     `const int64_t max_query_len = state_len - (k - 1) + 1;`
+  //     (src/vt/ops.cpp:1997), which reads the state width as `K - 1` plus
+  //     spec-decode slack. Hand it a nine-column dilated state at K = 4 and it
+  //     computes 9 - 3 + 1 = 7, a bound that means nothing, and then feeds that
+  //     nonsense to the per-request query-length and accepted-token checks at
+  //     :2007 and :2009. PLE needs `(K - 1) * dilation`, and there is no value
+  //     of `max_query_len` that describes both geometries. Re-deriving it per
+  //     mode weakens the guard for every existing caller, which is the "never
+  //     make a red gate green by widening its scope" failure.
+  //   * There is nothing to mirror. vLLM has no dilated conv anywhere
+  //     (`git grep -in dilat` at origin/main 6a5e8f5979: zero hits in
+  //     `layers/mamba/`, zero in `csrc/`), so the fused op is not a divergence
+  //     from an upstream that merged the two — upstream hand-rolled this one
+  //     too, saying so: "We cannot use the usual functions/kernels here for the
+  //     short conv as the conv1d has dilation".
+  //
+  // Registered on kCPU only (src/vt/cpu/cpu_qwen4_exp_ple.cpp). The CUDA arm is
+  // OWED, not written: it cannot be gated on a CPU-only host.
+  // Appended before kCount so no existing op's id shifts.
+  kQwen4ExpPleConv,
   // MODEL-MM-QWEN4-EXP W5b (#2031) — the Qwen4-Exp 4-branch GATED-RESIDUAL
   // hyper-connection stream, the one structure the whole forward is threaded
   // through: `Qwen4ExpTextDecoderLayer` reads it twice per layer (attention and
@@ -514,6 +558,10 @@ enum class OpId : uint8_t {
   // gate), no standalone `silu`/`sigmoid`, no elementwise binary multiply and no
   // axis reduction, so a composition would need five NEW general ops and would
   // still materialise the [T, hc, H] broadcast the write-back exists to avoid.
+  // ONE OF THOSE FIVE NOW EXISTS AND THE RATIONALE IS UNCHANGED BY IT: W5d-1
+  // (#2249 item 1) added `kRmsNormGroup` for the PLE block, so the first clause
+  // above reads as the history it is — it is why that op was written — and the
+  // other four are still absent, which is what makes this a fused family op.
   // `.agents/specs/qwen4-exp-flash-next.md` names this exact seam: "A device arm
   // reads `block_out` once per (j, h) tile and `injection_weights[j]` once per
   // row; it never allocates the broadcast." `kDeepseekV4Mhc` is the in-tree
@@ -526,6 +574,80 @@ enum class OpId : uint8_t {
   // Appended before kCount so no existing op's id shifts.
   kQwen4ExpGatedResidual,
   kQwen4ExpGatedResidualWriteBack,
+  // MODEL-MM-QWEN4-EXP W5b-4 (#2167) — Qwen Sparse Attention: the pooled-key
+  // COMPRESSOR that writes the indexer side cache, and the GATHER consumer that
+  // reduces over only the selected raw rows.
+  //
+  // WHAT IS **NOT** HERE, AND THAT IS THE POINT. The MQA block SCORE and the
+  // per-query top-k are NOT new ops, because this tree already has them:
+  // `kDsaIndexerLogits` computes `sum_h fold[t,h] * ReLU(dot(q[t,h,:], k[s,:]))`
+  // over a ONE-key-head MQA cache with a per-query `[win_start, win_end)` window,
+  // which with `weights == 1`, `n_head_scale == 1` and
+  // `softmax_scale == index_head_dim ** -0.5` IS the QSA block score; and
+  // `kDsaTopkSelect` is the same all-select-below-k / ties-to-the-lower-index /
+  // ASCENDING-emission top-k that `Qwen4ExpTextQSAIndexer` needs, over the block
+  // axis instead of the token axis. Writing a QSA-private scoring kernel beside
+  // them would be the parallel path AGENTS.md "Shared seams" forbids, so the
+  // indexer is COMPOSED from those two and only the two things they cannot
+  // express land as ops. `tests/vllm/models/test_qwen4_exp_qsa_device.cpp` gates
+  // that composition against the same lane-pinned transformers goldens the W4
+  // host reference answers to, so the reuse is measured rather than asserted.
+  //
+  // kQwen4ExpQsaCompress — mean-pool `compress_ratio` consecutive RAW index keys
+  // into one, `k_layernorm` the pooled key, and RoPE it at the position of the
+  // block's FIRST token (`compressed_pos = (position // CR) * CR`). Two of the
+  // three stages exist as ops (`vt::RmsNorm` with `gemma=true` is the
+  // `(1.0 + weight)` polarity, `vt::RopeFromCache` rotates a leading slice at
+  // caller-supplied positions) and the POOL does not: this tree has no mean, no
+  // pool, no axis reduction and no transpose, so the window cannot even be faked
+  // as a strided depthwise conv. Fusing all three mirrors upstream, whose own
+  // compressor is ONE kernel
+  // (`_fused_kv_compress_norm_rope_insert_indexer_attn`), and `kFusedNormRope`
+  // is the in-tree precedent for exactly that pair fused into one OpId.
+  //
+  // kQwen4ExpQsaGatherAttention — dense GQA over ONLY the gathered rows. Nothing
+  // upstream supplies it: every DeepSeek-V4 sparse consumer attends the
+  // COMPRESSED MLA KV (one state per four tokens) and MiniMax-M3's consumers
+  // attend raw tokens at KV-PAGE granularity, while QSA attends RAW tokens
+  // selected at ratio-4 granularity. It expands block `b` into tokens
+  // [CR*b, CR*b + CR) as ADDRESSES rather than materialising an index buffer,
+  // appends the always-attended ragged tail, and counts the key rows it actually
+  // READ. That count is the wave's instrument: llama.cpp #27739 records that a
+  // sparse MASK over a dense cache costs what dense attention costs under CUDA
+  // flash attention, so a mask-shaped port passes every value comparison and
+  // forfeits the long-context lever this row exists for.
+  //
+  // Registered on kCPU only (src/vt/cpu/cpu_qwen4_exp_qsa.cpp). The CUDA arm is
+  // OWED, not written: it cannot be gated on a CPU-only host, and an ungated
+  // kernel is worse than an absent one.
+  // Appended before kCount so no existing op's id shifts.
+  kQwen4ExpQsaCompress,
+  kQwen4ExpQsaGatherAttention,
+  // MODEL-MM-QWEN4-EXP W5d-1 (#2249 item 1) — the UNGATED per-group RMS norm.
+  // A SIBLING of kRmsNorm and of kRmsNormGatedGroup, and neither of those two
+  // can stand in for it: `kRmsNorm` reduces over the WHOLE row and has no
+  // group_size, `kRmsNormGated`/`kRmsNormGatedQuantFp8` fold a gate in, and
+  // `kRmsNormGatedGroup` groups correctly but always multiplies by
+  // `silu(gate)` first, so there is no way to ask any of them for a plain
+  // grouped norm. The only grouped reduction this tree had was FUSED inside
+  // `kQwen4ExpGatedResidual` and could not be called on its own, which is the
+  // gap `include/vt/ops.h` states in its own words at the kQwen4ExpGatedResidual
+  // comment above ("There is no ungated per-group RMS norm").
+  //
+  // Adding `group_size` to `RmsNormArgs` instead was REJECTED, and the reason is
+  // the silent-wrong-answer shape this row keeps meeting. `kRmsNorm` is
+  // registered on five backends; a new field on its args struct is ignored by
+  // every kernel that is not taught to read it, so a CUDA or Metal caller would
+  // get a whole-row norm back from a grouped request, with no crash and no
+  // refusal. A separate OpId cannot do that: an unregistered device refuses BY
+  // NAME. `kRmsNormGatedGroup` is the in-tree precedent for exactly this split
+  // ("SIBLING of RmsNormGatedArgs, not a mode of it").
+  //
+  // Registered on kCPU only (src/vt/cpu/cpu_ops.cpp). The CUDA arm is OWED, not
+  // written: it cannot be gated on a CPU-only host, and an ungated kernel is
+  // worse than an absent one — the same call W5b-3 and W5b-4 made.
+  // Appended before kCount so no existing op's id shifts.
+  kRmsNormGroup,
   kCount
 };
 
@@ -573,6 +695,43 @@ struct DropinProbeArgs {
 struct RmsNormArgs {
   float eps = 1e-6f;
   bool gemma = false;  // weight applied as (1 + w), GemmaRMSNorm style
+};
+
+// Ungated GROUP RMS norm args (vt::RmsNormGroup). A SIBLING of RmsNormArgs, not
+// a mode of it: see the kRmsNormGroup comment for why the group extent is not a
+// field on that struct. `eps` and `gemma` keep RmsNormArgs's names and meanings
+// exactly, so a caller migrating a whole-row norm to a grouped one changes the
+// extent and nothing else.
+//
+// Algorithm oracle: transformers v5.16.0
+// `models/qwen4_exp/modeling_qwen4_exp.py::Qwen4ExpTextRMSNorm` (:158-181),
+// whose `group_size` argument this mirrors by NAME. `RmsNormGatedGroupArgs`
+// spells the same axis as `n_groups` because ITS upstream
+// (`Mixer2RMSNormGated`, mamba_mixer2.py:80) does; the two upstreams disagree
+// on which half of the quotient is the parameter, and each op takes the one its
+// own upstream takes rather than a normalized third form.
+struct RmsNormGroupArgs {
+  float eps = 1e-6f;
+  // `weight` applied as `(1 + w)` rather than `w`. TRUE is the polarity every
+  // `qwen4_exp` gamma needs: `Qwen4ExpTextRMSNorm.forward` is
+  // `output * (1.0 + self.weight.float())` over a ZERO-initialised parameter
+  // (:162, :177), the loader stores every gamma RAW, and every consumer adds
+  // the 1 itself (#2218). It is a flag and not a constant because this op is a
+  // general `vt::` primitive and `RmsNormArgs` already spells the same choice
+  // the same way.
+  bool gemma = false;
+  // Elements per group. The reduction runs over `group_size` CONSECUTIVE
+  // elements of the last dimension, so the norm of one group cannot see another
+  // (`x.reshape(*x.shape[:-1], -1, group_size)` then `mean(-1)`, :168-171).
+  //
+  // ZERO IS REFUSED rather than meaning "the whole row", and that default is
+  // deliberate. Whole-row is what `vt::RmsNorm` already does; letting a
+  // forgotten field silently produce it would make the single most likely
+  // caller mistake indistinguishable from success, and a full-row reduction
+  // over a grouped stream is a plausible tensor rather than a crash. Upstream
+  // refuses the analogous case at :164-165 (`hidden_size must be divisible by
+  // group_size`) and so does the dispatcher.
+  int64_t group_size = 0;
 };
 
 // ─── EXL3 device-kernel argument records — MODEL-DSV4-EXL3 W2 ────────────────
@@ -769,6 +928,21 @@ struct CausalConv1dArgs {
   const Tensor* token_chunk_offset_ptr = nullptr;
 };
 
+// Qwen4-Exp PLE short-conv args. SIBLING of CausalConv1dArgs, deliberately not
+// a mode of it — see the kQwen4ExpPleConv comment for the five-backend reason.
+// Algorithm oracle: transformers v5.16.0
+// `models/qwen4_exp/modeling_qwen4_exp.py::Qwen4ExpTextPLELayer._short_conv`
+// (:1150-1167), with `conv_dilation = config.ngram_size` (:1134) and
+// `short_conv_state_len = (conv_kernel_size - 1) * conv_dilation` (:1135).
+struct Qwen4ExpPleConvArgs {
+  // `config.ngram_size`; 3 in the released `Qwen/Qwen3.8-Flash-Next` config.
+  // Cross-checked against the state width rather than derived from it: a
+  // `conv_state` whose last dim is not `(K - 1) * dilation` is a caller that
+  // believes a different geometry, and deriving would make that agreement
+  // unfalsifiable.
+  int64_t dilation = 1;
+};
+
 struct L2NormArgs {
   float eps = 1e-6f;  // upstream default (gdn-semantics.md §4)
 };
@@ -811,6 +985,83 @@ struct Qwen4ExpGatedResidualArgs {
   int64_t hidden_size = 0;  // `config.hidden_size`; ALSO the norm's group_size
   int64_t lowrank = 0;      // `config.hc_lowrank`, the mix down/up rank
   float eps = 1e-6f;        // `config.rms_norm_eps`, INSIDE the rsqrt
+};
+
+// Qwen Sparse Attention COMPRESSOR geometry (vt::Qwen4ExpQsaCompress).
+// Algorithm oracle: transformers v5.16.0
+// `models/qwen4_exp/modeling_qwen4_exp.py::Qwen4ExpTextQSAIndexer` (:677-688),
+// with the scaffolding — boundary predicate, block-start RoPE, paged store —
+// from the TRITON head_dim=128 variant of DeepSeek-V4's
+// `_fused_kv_compress_norm_rope_insert_indexer_attn`
+// (models/deepseek_v4/common/ops/fused_compress_quant_cache.py :677-830 @ vLLM
+// origin/main 6a5e8f5979). Only the scaffolding: DSv4's pool is a LEARNED
+// softmax over an OVERLAPPING window driven by a score channel this checkpoint
+// does not have, and QSA's is an unweighted mean over a NON-overlapping one.
+struct Qwen4ExpQsaCompressArgs {
+  // `config.indexer_compress_ratio`; 4 in the released `Qwen/Qwen3.8-Flash-Next`
+  // config, and the number of consecutive RAW keys that pool into one state.
+  int64_t compress_ratio = 0;
+  // `int(head_dim * partial_rotary_factor)` = 64 at the released config, which
+  // upstream then requires to FIT `indexer_head_dim`
+  // (configuration_qwen4_exp.py:225-231). The LEADING `rotary_dim` dims rotate
+  // NeoX-style and the NoPE dims trail untouched — the halves are swapped end
+  // for end against DeepSeek-V4's indexer, which ropes a TRAILING span.
+  int64_t rotary_dim = 0;
+  float eps = 1e-6f;  // `config.rms_norm_eps`, INSIDE the rsqrt
+  // Mirrors the model dtype's intermediate rounding: upstream's pooled key goes
+  // through `.to(raw_keys.dtype)` before `k_layernorm`, `Qwen4ExpTextRMSNorm`
+  // closes on `.type_as(x)`, and a bf16 elementwise RoPE rounds per operation.
+  // TRUE reproduces that op by op, which is what a bf16 model path does and what
+  // the lane-pinned goldens were dumped under; FALSE is the f32 arm. The host
+  // reference `vllm::qwen4_exp::QsaCompressNormRope` carries the same flag with
+  // the same meaning, so the two arms answer to one oracle rather than to each
+  // other. This is deliberately NOT the house "round once on the store"
+  // contract: here the rounding is load-bearing (mutation M9 measures it), and
+  // an op that could not express it could not be gated against the oracle at
+  // all.
+  bool round_intermediates_to_bf16 = false;
+};
+
+// Qwen Sparse Attention GATHER-CONSUMER arguments
+// (vt::Qwen4ExpQsaGatherAttention).
+struct Qwen4ExpQsaAttnArgs {
+  // Softmax scale, `head_dim ** -0.5` on the MODEL's attention head (256 in the
+  // released config), NOT the indexer's. Must be set explicitly (> 0), the
+  // `AttentionArgs::scale` convention.
+  float scale = 0.0f;
+  // `config.indexer_compress_ratio`. Selected block `b` IS tokens
+  // [CR*b, CR*b + CR); this op expands that as ADDRESSES and never materialises
+  // the token index buffer, which is the difference between a gather and a mask.
+  int64_t compress_ratio = 0;
+  // OPTIONAL host-side instrument: the number of key ROWS the kernel actually
+  // read, ACCUMULATED over every query token of the call and INCREMENTED AT THE
+  // READ. It is never assigned from the selection, and that distinction is the
+  // whole point of it. W4's first fresh review found a counter set to
+  // `sel.size()` and compared against `SelectedCount(sel)` — the same quantity
+  // by the same rule — under which a body that dot-products every one of the
+  // `kv_len` cached rows still reported the sparse figure and passed 12 cases /
+  // 7251 assertions, including the case named "the GATHER touches only the
+  // selected rows". Counted at the read, an honest gather comes out at
+  // `sum_t selected(t) * num_q_heads * 2` (two softmax passes) and a dense walk
+  // at `sum_t kv_len(t) * num_q_heads * 2`, so the ratio between a gather and a
+  // mask is MEASURED rather than asserted.
+  //
+  // WHAT IT CANNOT SEE, stated because it was MEASURED rather than feared. It
+  // counts reads at THIS body's read site, so it says what an honest body cost;
+  // it cannot convict a dishonest one. W5b-4 mutation M11 is a dense masked walk
+  // that also reports `sel.size() * 2` per head, and it passed 10 cases and 4167
+  // assertions — a mask-shaped port changes the loop and the counter together,
+  // which is what a mask-shaped port IS, and no value comparison separates them
+  // either because `exp(-inf - m)` is exactly +0. The gate that DOES separate
+  // them is an observable of the walk: `test_qwen4_exp_qsa_device.cpp` runs this
+  // op over a cache whose UNSELECTED rows are NaN, which a gather never
+  // addresses and a mask multiplies by a zero weight into `0.0f * NaN`. It also
+  // cannot see a body that iterates 0..kv_len and `continue`s past unselected
+  // rows without touching them — correctly, because the loop counter is not the
+  // cost llama.cpp #27739 measures, the key-row traffic is.
+  // A host pointer, on the `GdnArgs::query_start_loc_host` precedent; a CUDA arm
+  // owes a device-side counter and its copy-back.
+  int64_t* keys_visited = nullptr;
 };
 
 // Mamba2 SSD args, shared by the chunked prefill scan and the decode state
@@ -1720,6 +1971,7 @@ using CastBf16Fn = void (*)(Queue&, Tensor&, const Tensor&);
 using PermuteVHeadsFn = void (*)(Queue&, Tensor&, const Tensor&, int64_t, int64_t,
                                   int64_t, int64_t);
 using CastF32Fn = void (*)(Queue&, Tensor&, const Tensor&);
+using CastF16Fn = void (*)(Queue&, Tensor&, const Tensor&);
 using MulColVecF32Fn = void (*)(Queue&, Tensor&, const Tensor&);
 using AttnGateSplitFn = void (*)(Queue&, Tensor&, Tensor&, const Tensor&);
 using SigmoidGateBf16Fn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&);
@@ -1759,6 +2011,11 @@ using Exl3MoeMlpFn = void (*)(Queue&, Tensor&, const Tensor&, const Exl3MoeExper
                               const Exl3MoeRouting&, const Exl3MoeTemps&, const Exl3MoeArgs&);
 using RmsNormFn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const RmsNormArgs&, Tensor*);
+// Ungated group RMS norm (vt::RmsNormGroup). Same operand order as RmsNormFn
+// minus the residual, which this op does not carry because its upstream has no
+// residual arm and a knob nobody can set is a divergence with extra steps.
+using RmsNormGroupFn = void (*)(Queue&, Tensor& /*out*/, const Tensor& /*x*/,
+                                const Tensor& /*weight*/, const RmsNormGroupArgs&);
 using SiluAndMulFn = void (*)(Queue&, Tensor&, const Tensor&);
 using GeluAndMulFn = void (*)(Queue&, Tensor&, const Tensor&);
 using MulScalarFn = void (*)(Queue&, Tensor&, const Tensor&, double);
@@ -1782,6 +2039,15 @@ using CausalConv1dFwdFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&
 using CausalConv1dUpdateFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&,
                                       const Tensor*, Tensor&, const Tensor*,
                                       const CausalConv1dArgs&);
+// Qwen4-Exp PLE dilated depthwise causal conv (vt::Qwen4ExpPleConv). The
+// `conv_state_indices` pointer is the PER-SEQUENCE cache row, nullable, named
+// for `CausalConv1dUpdate`'s parameter of the same axis; see the declaration
+// for why upstream's own `state_idx` is a different axis entirely.
+using Qwen4ExpPleConvFn = void (*)(Queue&, Tensor& /*out*/, const Tensor& /*x*/,
+                                   const Tensor& /*weight*/, Tensor& /*conv_state*/,
+                                   const Tensor& /*query_start_loc*/,
+                                   const Tensor* /*conv_state_indices*/,
+                                   const Qwen4ExpPleConvArgs&);
 using L2NormFn = void (*)(Queue&, Tensor&, const Tensor&, const L2NormArgs&);
 using RmsNormGatedFn = void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor&,
                                 const RmsNormGatedArgs&);
@@ -1856,6 +2122,21 @@ using Qwen4ExpGatedResidualFn = void (*)(Queue&, Tensor& /*mixed*/,
 using Qwen4ExpGatedResidualWriteBackFn =
     void (*)(Queue&, Tensor& /*hyper*/, const Tensor& /*block_out*/,
              const Tensor& /*injection*/, const Qwen4ExpGatedResidualArgs&);
+// Qwen4-Exp QSA pooled-key compressor (vt::Qwen4ExpQsaCompress): the side
+// cache's contents, one state per `compress_ratio` complete RAW keys.
+using Qwen4ExpQsaCompressFn = void (*)(Queue&, Tensor& /*block_keys*/,
+                                       const Tensor& /*raw_keys*/,
+                                       const Tensor& /*k_norm_weight*/,
+                                       const Tensor& /*cos*/, const Tensor& /*sin*/,
+                                       const Qwen4ExpQsaCompressArgs&);
+// Qwen4-Exp QSA gather consumer (vt::Qwen4ExpQsaGatherAttention).
+using Qwen4ExpQsaGatherAttentionFn = void (*)(Queue&, Tensor& /*out*/,
+                                              const Tensor& /*query*/,
+                                              const Tensor& /*key*/,
+                                              const Tensor& /*value*/,
+                                              const Tensor& /*block_ids*/,
+                                              const Tensor& /*kv_lens*/,
+                                              const Qwen4ExpQsaAttnArgs&);
 using GdnStateGatherFn =
     void (*)(Queue&, Tensor&, const Tensor&, const Tensor&, const Tensor*);
 using GdnStateScatterFn =
@@ -2677,6 +2958,57 @@ void MoeRelu2(Queue& q, Tensor& out, const Tensor& x);
 void RmsNorm(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight,
              const RmsNormArgs& args, Tensor* residual = nullptr);
 
+// UNGATED PER-GROUP RMS NORM — `Qwen4ExpTextRMSNorm` (transformers v5.16.0
+// `models/qwen4_exp/modeling_qwen4_exp.py:158-181`), the `group_size is not
+// None` arm, executed per row:
+//
+//   g       = i / group_size                       (:168-169, the reshape)
+//   ms[g]   = mean_{i in g}( x[i]^2 )              (:170, `pow(2).mean(-1)`)
+//   out[i]  = x[i] * rsqrt(ms[g] + eps) * (1 + w[i])   when gemma
+//   out[i]  = x[i] * rsqrt(ms[g] + eps) * w[i]         otherwise
+//
+// A SIBLING of vt::RmsNorm, which is the same expression with one group per
+// row, and of vt::RmsNormGatedGroup, which groups the same way but multiplies
+// `silu(gate)` in before the reduction. Neither can express this one; see the
+// kRmsNormGroup comment for why the extent is not a mode of RmsNormArgs.
+//
+// THREE PLACES EPS IS NOT. It is INSIDE the rsqrt, added to the MEAN SQUARE,
+// and added ONCE PER GROUP. The plausible slips are adding it to the norm
+// rather than to the mean square, and computing it against the whole row's mean
+// square. `scripts/gen-qwen4-exp-hc-goldens.py` case D exists for the first
+// (at `hyper_scale = 1.7` an eps of 1e-6 moves the answer ~5e-7 relative, which
+// is BELOW the gate tolerance and therefore invisible; at `hyper_scale = 0.01`
+// it is 1% of the mean square), and the grouped/full-row separation on those
+// same goldens is 4.0e-1 to 1.2e+0 against a 1e-5 tolerance.
+//
+// POLARITY. `gemma = true` applies `(1 + w)`, and that is what every
+// `qwen4_exp` gamma needs: the loader stores each one RAW as HuggingFace ships
+// it, centred on 0, and EVERY consumer adds the 1 itself — `vt::RmsNorm` under
+// `gemma = true`, `vt::Qwen4ExpQsaCompress`, `vt::Qwen4ExpGatedResidual` since
+// #2218, and this op. `ssm_norm` is the single exception in the architecture.
+// The failure this rule prevents is silent: a gamma centred on 0 multiplied
+// without the `+1` scales the stream by ~0 and reads as a corrupt checkpoint
+// rather than as a wiring bug.
+//
+// SHAPES. x [T, H] and out [T, H] rank-2 contiguous; weight [H] rank-1, applied
+// per COLUMN of the flat row (upstream's `self.weight` is `[dim]` over the
+// unflattened width, and :177 multiplies AFTER `out.flatten(-2)`, so the weight
+// index is the flat one and not the in-group one). `args.group_size` must be
+// >= 1 and divide H; upstream raises `ValueError` on the same condition
+// (:164-165) and this op refuses by name.
+//
+// PRECISION, AND IT IS A MIRROR RATHER THAN A CHOICE. The reduction, the
+// reciprocal square root and the weight multiply all run in f32 and the result
+// is rounded ONCE on the store, which is `output = self._norm(x.float())`,
+// `output * (1.0 + self.weight.float())`, `output.type_as(x)` (:174-178) in
+// order. Upstream says so in a comment at :175-176 — "Llama does x.to(float16)
+// * w whilst Qwen4ExpText is (x * w).to(float16)" — so rounding the normalized
+// value BEFORE the weight multiply is a different model, not a tolerance. This
+// is the same order `vt::RmsNorm` already keeps; `vt::RmsNormGatedGroup` keeps
+// the OTHER one, because its own upstream (mamba_mixer2.py:149) does.
+void RmsNormGroup(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight,
+                  const RmsNormGroupArgs& args);
+
 // --- Fused declarative recipe (TDR; see include/vt/recipes.h and
 // .agents/specs/portable-fusion-framework.md). A recipe (a backend-agnostic
 // constexpr FusedRecipe) is realized in tiers selected by VT_FUSED_TIER:
@@ -2979,6 +3311,65 @@ void CausalConv1dUpdate(Queue& q, Tensor& out, const Tensor& x, const Tensor& we
                         const Tensor* bias, Tensor& conv_state, const CausalConv1dArgs& args,
                         const Tensor* conv_state_indices = nullptr);
 
+// QWEN4-EXP PLE DILATED DEPTHWISE CAUSAL CONV, batched over sequences.
+// `Qwen4ExpTextPLELayer._short_conv` (transformers v5.16.0
+// modeling_qwen4_exp.py:1150-1167) end to end, including the state read and the
+// state write-back that `cache_utils.py::LinearAttentionLayer.update_conv_state`
+// (:1036-1075) performs around it. Per channel c and output position t:
+//
+//   out[t, c] = silu( sum_{k=0..K-1} weight[c, k] * hist[t - (K-1-k)*dilation] )
+//
+// with `hist` the concatenation of `conv_state` and this call's `x`, so
+// `weight[c, K-1]` multiplies the CURRENT token and the op is causal by that
+// tap. At the released config (K = 4, dilation = `ngram_size` = 3) the taps are
+// lags {9, 6, 3, 0}: a span of ten tokens for four multiply-accumulates, and a
+// genuine 9-deep history read at stride 3 that CANNOT be compressed to three
+// columns even though any one step touches only three of them.
+//
+// SILU IS UNCONDITIONAL and there is no activation switch, because upstream has
+// none: the line is `F.silu(self.conv1d(hidden_states))`, full stop. Mirroring
+// that is the point; a knob nobody can set is a divergence with extra steps.
+//
+// THERE IS NO `has_initial_state`, AND THAT IS AN ARGUMENT RATHER THAN AN
+// OMISSION. `CausalConv1dFwd` needs one because its state is undefined before
+// the first chunk. Here upstream's first call takes the `has_previous_state`
+// false branch and LEFT-ZERO-PADS (cache_utils.py:1053-1060), which is
+// arithmetically identical to running the steady path against a zeroed state.
+// A zero-initialised `conv_state` is therefore bit-identical to a first call,
+// and a flag would only add a way to disagree with upstream.
+//
+// SHAPES. x [T, C] (the NORMED conv input — never the raw hidden state, see the
+// fork at modeling_qwen4_exp.py:1184-1188); out [T, C]; weight [C, K] depthwise,
+// K >= 2; conv_state [N, C, L] f32 READ-WRITE with L == (K - 1) * dilation;
+// query_start_loc [B + 1] i32 cumulative token offsets, sequence s spanning
+// [qsl[s], qsl[s+1]); conv_state_indices [B] i32 or nullptr.
+//
+// `conv_state_indices` IS THE PER-SEQUENCE CACHE ROW, and the name is
+// deliberate: this op does NOT call it `state_idx`, because upstream already
+// uses that name for a different axis and the collision would read as agreement.
+// Upstream writes `update_conv_state(..., state_idx=1, ...)`, where
+// 1 selects the PLE conv out of the three states a PLE layer owns — the GDN
+// conv, this conv, and the n-gram token history. Those three cannot be planes of
+// one tensor: `cache_utils.py` keeps `conv_states` as a LIST with a per-entry
+// `conv_kernel_size[state_idx]`, and the three widths here are 4, 9 and 2, over
+// different channel counts and, for the third, over integers rather than floats.
+// Upstream's selector is therefore resolved by the CALLER passing this op the
+// right tensor, which is what taking the state as an explicit operand buys.
+// What is left is the axis a batched engine actually needs and upstream does not
+// have: which ROW of a shared cache each sequence owns. That is exactly what
+// `CausalConv1dUpdate`'s `conv_state_indices` names, so this op spells it the
+// same way rather than reusing upstream's word for somebody else's axis. Null
+// means row s for sequence s, again as that sibling does.
+//
+// PRECISION. f32 interior, taps accumulated in DOUBLE — the same house
+// convention the W2 host reference (`qwen4_exp_ple.cpp`) uses, kept so the two
+// arms answer to one oracle. Four terms is a short reduction, so this is cheap
+// insurance rather than a load-bearing width; a CUDA arm may accumulate in f32
+// and must be gated against the oracle to say so.
+void Qwen4ExpPleConv(Queue& q, Tensor& out, const Tensor& x, const Tensor& weight,
+                     Tensor& conv_state, const Tensor& query_start_loc,
+                     const Tensor* conv_state_indices, const Qwen4ExpPleConvArgs& args);
+
 // SPECULATIVE multi-token conv step (SPEC-MTP I4). Ported from
 // vllm/model_executor/layers/mamba/ops/causal_conv1d.py @ e24d1b24
 // (_causal_conv1d_update_kernel IS_SPEC_DECODING + IS_VARLEN branches
@@ -3208,7 +3599,7 @@ void RmsNormGatedGroup(Queue& q, Tensor& out, const Tensor& x, const Tensor& gat
 // front. Per token:
 //
 //   normed[j*H+h] = hyper[j*H+h] * rsqrt(mean_h(hyper[j*H+.]^2) + eps)
-//                                * hc_norm_w[j*H+h]          (group_size == H)
+//                                * (1 + hc_norm_w[j*H+h])    (group_size == H)
 //   low[r]        = silu( (mix_down[r] . normed) / hc )       -- DIVIDE INSIDE
 //   gate[p]       = sigmoid( mix_up[p] . low )                -- NO divide here
 //   mixed[h]      = mean_j( gate[j*H+h] * normed[j*H+h] )     -- MEAN, not sum
@@ -3220,10 +3611,26 @@ void RmsNormGatedGroup(Queue& q, Tensor& out, const Tensor& x, const Tensor& gat
 // on the up projection, and the collapse is a MEAN over the branches while the
 // product it collapses is against the NORMED stream and not the raw one.
 //
-// `hc_norm_w` is vLLM's parameterization, i.e. ALREADY `1 + w_hf`. Upstream
-// applies `output * (1.0 + weight)` on a zero-init gamma; folding it once at
-// load is `vllm::qwen4_exp::HcNormWeightFromHf`, and a `qwen4exp` GGUF written by
-// ggml-org/llama.cpp#27742 carries the fold already. This op never adds 1.
+// `hc_norm_w` IS THE RAW HUGGINGFACE GAMMA, `w_hf`, and THIS OP ADDS THE 1.
+// That is upstream's parameterization verbatim — `Qwen4ExpTextRMSNorm.forward`
+// is `output * (1.0 + self.weight.float())` over a ZERO-initialised weight
+// (:173-178) — and it is the SAME polarity `vt::RmsNorm(gemma=true)` and
+// `vt::Qwen4ExpQsaCompress` apply to this architecture's other gammas, which is
+// the point: `Qwen4ExpWeights` holds every gamma raw (the `qwen4exp` loader
+// inverts the `+1` ggml-org/llama.cpp#27742 bakes in at convert time, with
+// `linear_attn.norm.weight` the one tensor the converter never folds), so ONE
+// rule covers the whole model and no call site has to remember which of two
+// forms this particular op wanted.
+//
+// IT READ THE OTHER WAY UNTIL #2218, and the correction is recorded here rather
+// than only in the spec because the failure is silent. Under the old contract a
+// forward that handed this op the loaded `hc_norm` multiplied every
+// hyper-connection norm by a gamma centred on ZERO — a plausible tensor, never
+// a crash, and unreachable by any single-sided gate, because the loader was
+// right about its own output and the op was right about its own input.
+// `vllm::qwen4_exp::HcNormWeightFromHf` remains the `w_hf -> 1 + w_hf` bridge
+// the W3 HOST reference needs (`qwen4_exp_hc.h` `GroupedRmsNorm` is vLLM's
+// `out * w` form and keeps it); it is NOT a step any caller of this op takes.
 //
 // SHAPES. hyper [T, hc*H]; hc_norm_w [hc*H]; mix_down [R, hc*H]; mix_up [hc*H, R]
 // (both in PyTorch `nn.Linear(bias=False)` `(out_features, in_features)` order);
@@ -3263,6 +3670,113 @@ void Qwen4ExpGatedResidual(Queue& q, Tensor& mixed, Tensor* injection, const Ten
 void Qwen4ExpGatedResidualWriteBack(Queue& q, Tensor& hyper, const Tensor& block_out,
                                     const Tensor& injection,
                                     const Qwen4ExpGatedResidualArgs& args);
+
+// --- QWEN SPARSE ATTENTION (row MODEL-MM-QWEN4-EXP W5b-4, #2167) ------------
+//
+// THE INDEXER IS THREE STEPS AND ONLY THE FIRST IS A NEW OP. The other two are
+// `vt::DsaIndexerLogits` and `vt::DsaTopkSelect`, called over the BLOCK axis:
+//
+//   Qwen4ExpQsaCompress(block_keys, raw_keys, k_norm_w, cos, sin, {CR, rot, eps})
+//   DsaIndexerLogits(scores, q_index, block_keys, ones, win_start, win_end,
+//                    {softmax_scale = index_head_dim ** -0.5, n_head_scale = 1})
+//   DsaTopkSelect(block_ids, counts, scores, win_start, win_end)
+//   Qwen4ExpQsaGatherAttention(out, q, k, v, block_ids, kv_lens, {scale, CR})
+//
+// with `win_start[t] = 0` and `win_end[t] = kv_len[t] / compress_ratio` — the
+// COMPLETE blocks visible to query token t — and `block_ids` sized
+// `token_budget / compress_ratio`. `DsaIndexerLogits`'s fold
+// `weights[t,h] * q_scale[t,h] * softmax_scale * n_head_scale` collapses to the
+// single constant `index_head_dim ** -0.5` when `weights` is ones and `q_scale`
+// is null, and that IS QSA's scale: QSA has neither DeepSeek-V4's learned
+// `weights_proj` nor its `n_head ** -0.5`. One reassociation survives and is
+// named rather than hidden — upstream divides AFTER the head sum
+// (`scores.sum(0) / sqrt(D)`, modeling_qwen4_exp.py:690-693) and the fold
+// multiplies BEFORE it, which is `sum_h c*r_h` against `c*sum_h r_h`: equal in
+// exact arithmetic, up to an ulp apart in f32, and top-k is invariant under a
+// positive scalar, so no selection can move except through a tie created at that
+// ulp. `test_qwen4_exp_qsa_device.cpp` measures the composed selection against
+// the lane-pinned oracle's own selected sets rather than trusting that argument.
+//
+// THE POOLED-KEY COMPRESSOR. Per COMPLETE block b of `compress_ratio` raw index
+// keys, `Qwen4ExpTextQSAIndexer` (transformers v5.16.0
+// modeling_qwen4_exp.py:677-688):
+//
+//   pooled[b] = mean(raw_keys[CR*b : CR*b + CR])   rounded back to the cache dtype
+//   block_keys[b] = rope( k_layernorm(pooled[b]), position = CR*b )
+//
+// THE MEAN IS UNWEIGHTED AND THE WINDOW DOES NOT OVERLAP, which is the one place
+// DeepSeek-V4's compressor must NOT be copied: its pool is
+// `score = tl.softmax(score, dim=0); sum(kv * score)` over a window of
+// `(1 + OVERLAP) * COMPRESS_RATIO`, driven by a score channel this checkpoint
+// has no tensor for, and the CuteDSL C4 variant refuses `overlap=False` at
+// compile time. THE ROPE POSITION IS THE BLOCK'S FIRST TOKEN, not its last:
+// upstream reads it as `group_starts = block_token_indices[:, 0]` and the Triton
+// kernel computes the same value as `compressed_pos = (position // CR) * CR`.
+// Taking the last position instead is a silent one-block phase error that no
+// shape check can see.
+//
+// ONLY COMPLETE BLOCKS PRODUCE A STATE. The compressor early-exits unless
+// `(position + 1) % compress_ratio == 0`, so `num_keys` must be a multiple of
+// `compress_ratio` and the ragged tail costs no state at all — it is attended
+// from the RAW KV cache instead, always, whatever the scores said. That floor is
+// why the side cache is 64 B/token/layer at the released shape and a per-token
+// index cache would be 256.
+//
+// SHAPES. raw_keys [num_keys, D] f32/bf16, UN-normed and UN-roped exactly as
+// `Cache.update_indexer` stores them, `num_keys % compress_ratio == 0`;
+// k_norm_weight [D] — the HuggingFace gamma, applied as `(1.0 + weight)`, which
+// is upstream's zero-initialised polarity and NOT vLLM's `out * weight`;
+// cos/sin [>= num_keys, rotary_dim] f32, the FULL-position tables, of which this
+// op reads row `compress_ratio * b`; block_keys [num_keys / compress_ratio, D]
+// f32/bf16 OUT. CPU only; the CUDA arm is owed.
+void Qwen4ExpQsaCompress(Queue& q, Tensor& block_keys, const Tensor& raw_keys,
+                         const Tensor& k_norm_weight, const Tensor& cos,
+                         const Tensor& sin, const Qwen4ExpQsaCompressArgs& args);
+
+// THE GATHER CONSUMER — the point of the wave, and the one piece with no
+// upstream counterpart at all. Dense GQA over ONLY the selected raw rows.
+//
+// For query token t with `kv_len[t]` cached tokens and
+// `complete[t] = kv_len[t] / compress_ratio` complete blocks, the attended set is
+//
+//   { CR*b + i : b in block_ids[t], 0 <= i < CR }  U  [CR*complete[t], kv_len[t])
+//
+// — the selected blocks expanded to their four real tokens, plus the ALWAYS
+// attended ragged tail. `block_ids` is ASCENDING and `-1`-terminated, which is
+// exactly what `vt::DsaTopkSelect` emits, so the expansion is ascending too and
+// the online softmax reduces over the same positions in the same order dense
+// attention would. That is what makes a sub-budget selection BIT-IDENTICAL to
+// dense attention rather than merely close: llama.cpp #27742 measures a max
+// logit delta of 0.0 over all 2051 such rows, and this op reproduces that
+// exactly, which is a free oracle needing no checkpoint.
+//
+// WHY THIS IS NOT A MASK, AND WHY THAT IS GATED RATHER THAN ASSERTED. A sparse
+// mask over a dense cache is CORRECT — it agrees with this op value for value,
+// because `exp(-inf - m)` is exactly +0 and adding an exact zero changes no
+// accumulator — and it is not faster. llama.cpp #27739 names the mechanism:
+// under CUDA flash attention `flash_attn_mask_to_KV_max` scans backwards and
+// stops at the first tile that is not all `-inf`, so a mask that keeps any late
+// key pays the whole dense prefix. A mask-shaped port therefore passes a token
+// gate and forfeits the long-context lever this row exists for. The
+// discriminator is `Qwen4ExpQsaAttnArgs::keys_visited`, counted at the key-row
+// read; see that field for what it can and cannot see.
+//
+// WHY IT TAKES BLOCK IDS RATHER THAN TOKEN IDS. Expanding to a materialised
+// `[T, token_budget + compress_ratio - 1]` token buffer is the mask-shaped
+// intermediate in miniature — at the released config that is 2051 int32 per
+// query token, 8 KiB a token, to say what four multiplications of a block id
+// say. The expansion is address arithmetic and belongs inside the consumer.
+//
+// SHAPES. query [T, num_q_heads, head_dim] f32/bf16; key and value
+// [max_kv, num_kv_heads, head_dim] f32/bf16, the raw KV cache;
+// block_ids [T, block_topk] i32, ascending, `-1` = no block;
+// kv_lens [T] i32, the causal visible length per query token;
+// out [T, num_q_heads, head_dim] f32/bf16. GQA: num_q_heads % num_kv_heads == 0.
+// CPU only; the CUDA arm is owed.
+void Qwen4ExpQsaGatherAttention(Queue& q, Tensor& out, const Tensor& query,
+                                const Tensor& key, const Tensor& value,
+                                const Tensor& block_ids, const Tensor& kv_lens,
+                                const Qwen4ExpQsaAttnArgs& args);
 
 // Single-token gated-delta-rule step, one token per sequence
 // (gdn-semantics.md §7 decode path). Same math as GdnPrefill with T == B and
@@ -4491,6 +5005,24 @@ void PermuteVHeads(Queue& q, Tensor& out, const Tensor& in,
 // value the bf16 output rounds to (mirror of the cutlass f32-output scratch cast).
 void CastF32(Queue& q, Tensor& out, const Tensor& in);
 
+// out[i] = F32ToF16(in[i]); out f16, in f32 or bf16, same element count. The
+// third sibling of the two casts above, and the NARROWING one.
+//
+// WHY IT EXISTS (QUANT-EXL3 W1a, #2181). `Exl3Gemm` reads its activation as f16
+// and nothing else — the CPU arm calls `HadRows(HadIo::kHalfHalf, ...)` on `a`
+// (`cpu_exl3_kernels.cpp:205`) and the device arm stages `a_had` in fp16 —
+// because exllamav3 runs the whole linear in fp16 (`exl3.py:183-214`). A model
+// whose residual stream is bf16 or f32 therefore needs one narrowing cast on
+// the way into an EXL3 linear. The direction is not EXL3-specific, so this is a
+// general op rather than a scheme-private helper.
+//
+// A bf16 source is read through its f32 value, which is exact (bf16 -> f32
+// widens), and then rounded once to f16 — NOT reinterpreted. An f16 SOURCE is
+// refused rather than copied, mirroring the two casts above, each of which
+// names exactly one source dtype: a cast that accepted anything would make a
+// wrong-dtype activation invisible at the call site.
+void CastF16(Queue& q, Tensor& out, const Tensor& in);
+
 // In-place per-output-column scale: x[m,n] *= col[n], with x an F32 or BF16
 // [M,N] (row-major, inner-contiguous rows; row stride may be padded) and col an
 // F32 [N] contiguous broadcast vector. The load-time-free realization of a merged
@@ -4619,18 +5151,39 @@ uint16_t Exl3TileCodeword(const uint16_t* tile, int bits, int t);
 // halves summed in fp16. Returns that fp16 value widened to f32.
 float Exl3DecodeMcg(uint16_t codeword);
 
+// The codebook decode, SELECTED rather than assumed (`codebook.cuh:56-90`).
+//
+//   cb 0  the original QTIP 3INST: `x *= 89226354; x += 64248484`
+//   cb 1  MCG:                     `x *= 0xCBAC1FED`
+//
+// then, for both, `x = (x & 0x8fff8fff) ^ 0x3b603b60` and the two fp16 halves
+// summed in fp16. Any other value REFUSES BY NAME.
+//
+// WHICH ONE A CHECKPOINT USES IS DECIDED BY TENSOR PRESENCE, AND THE POLARITY
+// IS THE OPPOSITE OF THE OBVIOUS GUESS. `LinearEXL3` sets `self.mcg =
+// (self.mcg_tensor is not None)` (`exl3.py:74-77`) and passes those BOOLEANS to
+// `ext.reconstruct` (`:197,223`), so a checkpoint that ships NO `mcg` tensor is
+// NOT MCG -- it is cb 0. The SparkInfer DeepSeek-V4 artifact ships an `mcg`
+// marker and is cb 1; every stock `turboderp/*-exl3` artifact ships neither and
+// is cb 0. Reading absence as MCG decodes with the wrong multiplier, which
+// yields a weight with the RIGHT DISTRIBUTION and no correlation to the true
+// one -- measured on `turboderp/Llama-3.2-1B-Instruct-exl3` as RMS 0.0385
+// against the reference's 0.0361 with a cosine of -0.0006, and as fluent
+// nonsense out of the model.
+float Exl3DecodeCodeword(uint16_t codeword, int codebook);
+
 // Row-major position (0..255) inside the 16x16 tile that codeword `t` decodes
 // into — upstream's `tensor_core_perm` (`exl3_lib/quantize.py:22-42`), which the
 // quantizer applies to a row-major tile before encoding.
 int Exl3TileRowMajorIndex(int t);
 
 // Decode one packed tile into 256 f32 values in ROW-MAJOR 16x16 order.
-void Exl3DecodeTile(const uint16_t* tile, int bits, float* out256);
+void Exl3DecodeTile(const uint16_t* tile, int bits, int codebook, float* out256);
 
 // `LinearEXL3.get_inner_weight_tensor` (`exl3.py:222-225`): the pre-Hadamard
 // reconstruct. `out` is f32 [k, n] row-major and holds exact fp16 codebook
 // values. `k` and `n` must be multiples of 16.
-void Exl3ReconstructInner(const uint16_t* trellis, int64_t k, int64_t n, int bits,
+void Exl3ReconstructInner(const uint16_t* trellis, int64_t k, int64_t n, int bits, int codebook,
                           float* out);
 
 // `LinearEXL3.get_weight_tensor` (`exl3.py:227-237`): the full dequantized
@@ -4646,7 +5199,7 @@ void Exl3ReconstructInner(const uint16_t* trellis, int64_t k, int64_t n, int bit
 // absorbs it for all but a fraction of entries, and MODEL-DSV4-EXL3 W2's device
 // parity gate is stated against THIS function, not against torch.
 void Exl3DequantLinear(const uint16_t* trellis, const uint16_t* suh,
-                       const uint16_t* svh, int64_t k, int64_t n, int bits,
+                       const uint16_t* svh, int64_t k, int64_t n, int bits, int codebook,
                        float* out);
 
 // ─── EXL3 device kernels — MODEL-DSV4-EXL3 W2a / W2b ─────────────────────────

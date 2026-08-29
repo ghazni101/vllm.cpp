@@ -777,6 +777,7 @@ add_library(vllm STATIC
   # Qwen4-Exp (Qwen3.8-Flash-Next) W4: Qwen Sparse Attention. Host reference
   # math for the indexer, its side cache and the GATHER consumer (#1991).
   src/vllm/model_executor/models/qwen4_exp_qsa.cpp
+  src/vllm/model_executor/models/qwen4_exp_qsa_block.cpp
   src/vllm/model_executor/models/qwen3_dense.cpp
   src/vllm/model_executor/models/qwen3_weights.cpp
   src/vllm/model_executor/models/qwen3.cpp
@@ -810,6 +811,10 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/qwen4_exp_weights.cpp
   src/vllm/model_executor/models/qwen4_exp_registry.cpp
   src/vllm/model_executor/models/glm5_next.cpp
+  src/vllm/model_executor/models/glm5_next_kda.cpp
+  src/vllm/model_executor/models/glm5_next_dsa.cpp
+  src/vllm/model_executor/models/glm5_next_mhc.cpp
+  src/vllm/model_executor/models/glm5_next_moe.cpp
   src/vllm/model_executor/models/glm5_next_registry.cpp
   src/vllm/model_executor/models/laguna_registry.cpp
   src/vllm/model_executor/models/laguna_weights.cpp
@@ -823,6 +828,7 @@ add_library(vllm STATIC
   src/vllm/model_executor/models/muse_glimmer_gguf_weights.cpp
   src/vllm/model_executor/models/qwen4_exp_gguf_weights.cpp
   src/vllm/model_executor/models/glm5_next_weights.cpp
+  src/vllm/model_executor/models/glm5_next_loader.cpp
   src/vllm/model_executor/models/muse_glimmer.cpp
   src/vllm/model_executor/models/muse_glimmer_vision.cpp
   src/vllm/model_executor/models/muse_glimmer_mm.cpp
@@ -1307,7 +1313,9 @@ add_library(vllm STATIC
   src/vt/cpu/cpu_minimax_h3.cpp
   src/vt/cpu/cpu_ltx2.cpp
   src/vt/cpu/cpu_ltx2_vae.cpp
+  src/vt/cpu/cpu_qwen4_exp_ple.cpp
   src/vt/cpu/cpu_qwen4_exp.cpp
+  src/vt/cpu/cpu_qwen4_exp_qsa.cpp
   src/vt/cpu/cpu_isa_arm.cpp
   src/vt/cpu/cpu_isa_x86.cpp
   src/vt/cpu/cpu_matmul_elem.cpp

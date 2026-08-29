@@ -27,6 +27,8 @@
 #include <string>
 #include <vector>
 
+#include "cpu_threadpool.h"
+
 #include "vt/dtype.h"
 #include "vt/op_provider.h"
 #include "vt/ops.h"
@@ -210,21 +212,37 @@ void Exl3GemmKernelCpu(Queue& q, Tensor& c, const Tensor& a, const Tensor& trell
   const int64_t tiles_n = n / 16;
   const int64_t tile_words = 16 * static_cast<int64_t>(args.bits);
   std::vector<float> raw(static_cast<size_t>(m) * static_cast<size_t>(n), 0.0f);
-  float tile[256];
-  for (int64_t ti = 0; ti < k / 16; ++ti) {
-    for (int64_t tj = 0; tj < tiles_n; ++tj) {
-      Exl3DecodeTile(tw + (ti * tiles_n + tj) * tile_words, args.bits, tile);
-      for (int64_t r = 0; r < m; ++r) {
-        float* orow = &raw[static_cast<size_t>(r * n + tj * 16)];
-        for (int rr = 0; rr < 16; ++rr) {
-          const float xv = F16ToF32(ah[r * k + ti * 16 + rr]);
-          if (xv == 0.0f) continue;
-          const float* wrow = tile + rr * 16;
-          for (int cc = 0; cc < 16; ++cc) orow[cc] += xv * wrow[cc];
+
+  // PARALLEL OVER OUTPUT TILES, and the loop order is inverted for it: `tj`
+  // outermost so each worker owns a disjoint 16-column stripe of `raw`, with
+  // the `ti` accumulation kept inside one worker. The original order had `ti`
+  // outermost, which accumulates ACROSS workers into the same columns and
+  // cannot be split without a reduction.
+  //
+  // This was the only CPU kernel in the tree running single-threaded, and it is
+  // the one that decodes: the trellis is decoded inside the GEMM, so a forward
+  // pass re-decodes every weight of the model. On the 1B stock EXL3 checkpoint
+  // that is 1,235,746,816 weights per token, which at ~50M weights/s on one
+  // core is the whole of the 0.040 tok/s W1b measured. The device arm is the
+  // real answer (QUANT-EXL3 W3); this is what the FALLBACK costs when the
+  // device declines, and every non-CUDA backend falls back here.
+  cpu::ParallelForRows(cpu::CurrentThreadpool(), tiles_n, [&](int64_t j0, int64_t j1) {
+    float tile[256];
+    for (int64_t tj = j0; tj < j1; ++tj) {
+      for (int64_t ti = 0; ti < k / 16; ++ti) {
+        Exl3DecodeTile(tw + (ti * tiles_n + tj) * tile_words, args.bits, args.codebook, tile);
+        for (int64_t r = 0; r < m; ++r) {
+          float* orow = &raw[static_cast<size_t>(r * n + tj * 16)];
+          for (int rr = 0; rr < 16; ++rr) {
+            const float xv = F16ToF32(ah[r * k + ti * 16 + rr]);
+            if (xv == 0.0f) continue;
+            const float* wrow = tile + rr * 16;
+            for (int cc = 0; cc < 16; ++cc) orow[cc] += xv * wrow[cc];
+          }
         }
       }
     }
-  }
+  });
 
   // 3. the output transform. The device holds this tile in f32 shared memory and
   // finishes with had_ff (f32 C) or had_fh (fp16 C) — the same two arms here.
@@ -256,7 +274,7 @@ void Exl3GemmKernelCpu(Queue& q, Tensor& c, const Tensor& a, const Tensor& trell
 // back. Same algebra, different rounding, and the spec's tier 4 is the bound on
 // the difference.
 void MoeGemm(const uint16_t* a_had, const uint16_t* trellis, float* raw, int64_t m, int64_t k,
-             int64_t n, int bits) {
+             int64_t n, int bits, int codebook) {
   // The same tile walk `Exl3GemmKernelCpu` step 2 performs, over an m-row batch.
   const int64_t tiles_n = n / 16;
   const int64_t tile_words = 16 * static_cast<int64_t>(bits);
@@ -264,7 +282,7 @@ void MoeGemm(const uint16_t* a_had, const uint16_t* trellis, float* raw, int64_t
   for (int64_t i = 0; i < m * n; ++i) raw[i] = 0.0f;
   for (int64_t ti = 0; ti < k / 16; ++ti) {
     for (int64_t tj = 0; tj < tiles_n; ++tj) {
-      Exl3DecodeTile(trellis + (ti * tiles_n + tj) * tile_words, bits, tile);
+      Exl3DecodeTile(trellis + (ti * tiles_n + tj) * tile_words, bits, codebook, tile);
       for (int64_t r = 0; r < m; ++r) {
         float* orow = &raw[r * n + tj * 16];
         for (int rr = 0; rr < 16; ++rr) {
@@ -405,8 +423,8 @@ void Exl3MoeMlpKernelCpu(Queue& q, Tensor& output_state, const Tensor& hidden_st
     // rounding is not optional: skipping it would make this arm strictly more
     // accurate than the kernel it is the reference for, and a device-vs-host
     // gate would then be measuring the difference between two intentions.
-    if (gated) MoeGemm(st_g, g_tr, raw_g.data(), tokens, hidden, interm, args.bits_gate);
-    MoeGemm(st_u, u_tr, raw_u.data(), tokens, hidden, interm, args.bits_up);
+    if (gated) MoeGemm(st_g, g_tr, raw_g.data(), tokens, hidden, interm, args.bits_gate, args.codebook);
+    MoeGemm(st_u, u_tr, raw_u.data(), tokens, hidden, interm, args.bits_up, args.codebook);
     for (int64_t i = 0; i < tokens * interm; ++i) {
       if (gated) in_g[i] = F32ToF16(raw_g[static_cast<size_t>(i)]);
       in_u[i] = F32ToF16(raw_u[static_cast<size_t>(i)]);
@@ -432,7 +450,7 @@ void Exl3MoeMlpKernelCpu(Queue& q, Tensor& output_state, const Tensor& hidden_st
     // stage 4: the down GEMM, again with no output Hadamard and again rounding
     // its f32 accumulator to fp16 at the store — into `state_g`, which is the
     // buffer upstream reuses for it (`exl3_moe_kernel.cuh:233`).
-    MoeGemm(in_g, d_tr, raw_d.data(), tokens, interm, hidden, args.bits_down);
+    MoeGemm(in_g, d_tr, raw_d.data(), tokens, interm, hidden, args.bits_down, args.codebook);
     for (int64_t i = 0; i < tokens * hidden; ++i) st_g[i] = F32ToF16(raw_d[static_cast<size_t>(i)]);
 
     // stage 5: `had_hf_r_128_d_inner`. The routing weight is folded into

@@ -40,6 +40,7 @@
 #include "vllm/v1/core/sched/output.h"
 #include "vllm/v1/kv_cache_dtype.h"
 #include "vllm/v1/attention/registry.h"
+#include "vllm/v1/core/kv_cache_utils.h"
 #include "vllm/v1/kv_cache_interface.h"
 #include "vt/backend.h"
 #include "vt/dtype.h"
@@ -764,6 +765,179 @@ TEST_CASE("runner: the Qwen3.5 allocation is BYTE-IDENTICAL after #810") {
     total_bytes += static_cast<int64_t>(gs.conv_state.Bytes()) +
                    static_cast<int64_t>(gs.ssm_state.Bytes());
   CHECK(total_bytes == 1 * 8 * kFaPageBytes + 3 * (6144 + 8192));
+}
+
+// ─── ENG-RECURRENT-MULTISTATE (#2131): N RECURRENT STATES, NOT TWO ───────────
+//
+// `initialize_kv_cache` refused any `MambaSpec` that did not carry EXACTLY two
+// shapes and two dtypes, and `GdnStateCache` carried exactly two named tensors.
+// Upstream has no such assumption anywhere: `MambaBase.kv_cache` is
+// `tuple[torch.Tensor, ...]` (`vllm/model_executor/layers/mamba/abstract.py:26`)
+// and `bind_kv_cache` (`:29-43`) unpacks ONE page into as many states as
+// `zip(get_state_shape(), get_state_dtype())` yields, each with its own shape
+// and its own dtype. Three values of N ship at the pin `5559679229`: 1
+// (`short_conv.py:87`), 2, and 5 (`mamba_mixer2.py:517-520`, whose appended ring
+// states are rank 3 / rank 2 / rank 3 with a `torch.float32` between two
+// activation dtypes, `mamba_utils.py:84-93` and `:202-221`).
+//
+// THE FIXTURE IS CHOSEN SO THE THIRD STATE CHANGES THE ANSWER. It is a
+// different RANK (1-D against 2-D and 3-D), a different ELEMENT COUNT, and a
+// different DTYPE (kI64 — a token-id history is integers, not activations) from
+// either of the first two. A third state that merely repeated the conv shape
+// would be counted correctly by an implementation that multiplied by 2, and its
+// dtype would be counted correctly by one that reused `dtypes[0]`.
+namespace {
+// The two-state gate geometry plus a third state, over the SAME group. Sizes:
+//   conv {64, 3}      f32  ->  768 B/slot
+//   ssm  {4, 8, 8}    f32  -> 1024 B/slot
+//   hist {7}          i64  ->   56 B/slot
+// Three distinct byte counts, so a wrong per-state size cannot cancel.
+constexpr int64_t kMsConvElems = 64 * 3;
+constexpr int64_t kMsSsmElems = 4 * 8 * 8;
+constexpr int64_t kMsHistElems = 7;
+
+KVCacheConfig MakeMultiStateKvConfig(
+    const HfConfig& c, std::vector<std::vector<int64_t>> shapes,
+    std::vector<DType> dtypes) {
+  KVCacheConfig kv;
+  kv.num_blocks = kNumBlocks;
+  kv.kv_cache_groups.emplace_back(
+      std::vector<std::string>{"fa3"},
+      std::make_shared<FullAttentionSpec>(
+          kBlockSize, static_cast<int>(c.num_key_value_heads),
+          static_cast<int>(c.head_dim), vllm::v1::ResolveKvCacheDType()));
+  kv.kv_cache_groups.emplace_back(
+      std::vector<std::string>{"gdn0", "gdn1", "gdn2"},
+      std::make_shared<MambaSpec>(kMaxModelLen, std::move(shapes),
+                                  std::move(dtypes)));
+  return kv;
+}
+
+KVCacheConfig MakeThreeStateKvConfig(const HfConfig& c) {
+  return MakeMultiStateKvConfig(
+      c, {{64, 3}, {4, 8, 8}, {kMsHistElems}},
+      {DType::kF32, DType::kF32, DType::kI64});
+}
+}  // namespace
+
+TEST_CASE("runner: a recurrent group carries N states, not two") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  const KVCacheConfig kv = MakeThreeStateKvConfig(c);
+  const auto* spec =
+      dynamic_cast<const MambaSpec*>(kv.kv_cache_groups[1].kv_cache_spec.get());
+  REQUIRE(spec != nullptr);
+  REQUIRE(spec->shapes.size() == 3);
+
+  GPUModelRunner runner(c, w, kv, Q(), /*max_num_reqs=*/8, kMaxModelLen,
+                        /*max_num_batched_tokens=*/64);
+  const int64_t slots = runner.gdn_state_slots();
+  REQUIRE(slots == 8);
+  REQUIRE(runner.gdn_state().size() == 3);  // three GDN layers
+
+  // 1. Every layer carries the group's OWN state count, in SPEC ORDER, and the
+  //    ordered list is the mirror of `MambaBase.kv_cache`.
+  for (const GdnStateCache& gs : runner.gdn_state()) {
+    REQUIRE(gs.states.size() == 3);
+    // The legacy names are the first two entries, unchanged, which is what
+    // every model consumer in this tree reads.
+    CHECK(gs.states[0].data == gs.conv_state.data);
+    CHECK(gs.states[1].data == gs.ssm_state.data);
+    // 2. Each state carries its OWN rank, shape and dtype off the spec, with
+    //    the slot dim prepended (`bind_kv_cache`'s `state.view(-1, *shape)`).
+    CHECK(gs.states[0].dtype == DType::kF32);
+    CHECK(gs.states[1].dtype == DType::kF32);
+    CHECK(gs.states[2].dtype == DType::kI64);
+    CHECK(gs.states[0].rank == 3);
+    CHECK(gs.states[1].rank == 4);
+    CHECK(gs.states[2].rank == 2);
+    CHECK(std::vector<int64_t>{gs.states[2].shape[0], gs.states[2].shape[1]} ==
+          std::vector<int64_t>{slots, kMsHistElems});
+    // 3. The third state is a DISTINCT allocation, not an alias of either
+    //    other one and not a re-view of the same bytes.
+    CHECK(gs.states[2].data != nullptr);
+    CHECK(gs.states[2].data != gs.states[0].data);
+    CHECK(gs.states[2].data != gs.states[1].data);
+    // 4. Its bytes are its OWN element count times its OWN element size — the
+    //    number a "multiply the conv row by 2" implementation cannot produce.
+    CHECK(static_cast<int64_t>(gs.states[2].Bytes()) ==
+          slots * kMsHistElems * 8);
+  }
+
+  // 5. The page-size identity holds over ALL THREE states, mirroring
+  //    `MambaSpec.page_size_bytes` (`kv_cache_interface.py:698-707`).
+  CHECK(spec->page_size_bytes() ==
+        kMsConvElems * 4 + kMsSsmElems * 4 + kMsHistElems * 8);
+
+  // 6. The runner's own byte report counts the third state. This is the
+  //    accounting surface a short allocation would hide in
+  //    (FIX-KV-GROUP-LAYER-COUNT, #1963).
+  int64_t recurrent_bytes = 0;
+  for (const GdnStateCache& gs : runner.gdn_state())
+    for (const vt::Tensor& s : gs.states)
+      recurrent_bytes += static_cast<int64_t>(s.Bytes());
+  CHECK(recurrent_bytes == 3 * slots * spec->page_size_bytes());
+  CHECK(runner.kv_cache_allocated_bytes() ==
+        runner.kv_cache_allocated_paged_bytes() + recurrent_bytes);
+
+  // 7. And the ENGINE-level budget the loader charges for this group agrees
+  //    with what the runner took, over three states rather than two.
+  CHECK(vllm::v1::recurrent_state_bytes(kv, /*max_num_seqs=*/8) ==
+        recurrent_bytes);
+}
+
+// Each subcase asserts the refusal MESSAGE, and that is the whole point of the
+// case. MEASURED: with a bare `CHECK_THROWS` this case is GREEN under the M1
+// mutation that restores the old `shapes.size() == 2` refusal — every one of
+// the three inputs still throws there, at the OLD message, for a reason that
+// has nothing to do with what the subcase is named after. A case that cannot
+// tell the widened refusal from the one it replaced gates nothing; the message
+// is the only thing that separates them. See the mutation record in
+// `.agents/specs/recurrent-multistate.md`.
+TEST_CASE("runner: a malformed recurrent MambaSpec is REFUSED by name") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  // Returns the refusal text, or the empty string when nothing was thrown, so
+  // a silent acceptance fails the substring check rather than escaping it.
+  const auto refusal = [&](KVCacheConfig kv) {
+    try {
+      GPUModelRunner runner(c, w, kv, Q(), /*max_num_reqs=*/8, kMaxModelLen,
+                            /*max_num_batched_tokens=*/64);
+    } catch (const std::exception& e) {
+      return std::string(e.what());
+    }
+    return std::string();
+  };
+
+  SUBCASE("shapes and dtypes of different length") {
+    // Refused at the base tree too, by the CONJUNCTIVE `== 2` that stood here
+    // and by `MambaSpec::page_size_bytes` — this row did not close an
+    // out-of-bounds read, and it does not claim to. What it must not do is
+    // stop refusing while it widens the count.
+    const std::string msg = refusal(MakeMultiStateKvConfig(
+        c, {{64, 3}, {4, 8, 8}, {kMsHistElems}},
+        {DType::kF32, DType::kF32}));
+    INFO("refusal: " << msg);
+    CHECK(msg.find("with one dtype per shape") != std::string::npos);
+  }
+  SUBCASE("a single state (upstream ShortConv) is refused, not truncated") {
+    const std::string msg =
+        refusal(MakeMultiStateKvConfig(c, {{64, 3}}, {DType::kF32}));
+    INFO("refusal: " << msg);
+    CHECK(msg.find("must carry at least a conv and a temporal state") !=
+          std::string::npos);
+  }
+  SUBCASE("a block-quantized state dtype is refused") {
+    // `vt::SizeOf` has no per-element answer for a block encoding, so a page
+    // sized from one would be arithmetic on a number that does not exist. This
+    // is a THREE-state spec, so under the old `== 2` refusal it threw for the
+    // count and never reached the dtype predicate at all.
+    const std::string msg = refusal(MakeMultiStateKvConfig(
+        c, {{64, 3}, {4, 8, 8}, {kMsHistElems}},
+        {DType::kF32, DType::kF32, DType::kQ8_0}));
+    INFO("refusal: " << msg);
+    CHECK(msg.find("has no per-element size") != std::string::npos);
+  }
 }
 
 // ─── #810: THE NEMOTRON-H ARM ────────────────────────────────────────────────
@@ -2005,6 +2179,195 @@ TEST_CASE("runner: a multi-cache topology keeps its recurrent group") {
   CHECK(runner.recurrent_group_ids() == std::vector<int>{7});
   CHECK(runner.layer_attn_kv_indices()[0].empty());
   CHECK(runner.layer_attn_kv_indices()[2].size() == 5);
+}
+
+// ─── A qwen4_exp-SHAPED topology: THREE groups, and FOUR recurrent states ────
+//
+// This closes two `## Owed` items in `.agents/specs/recurrent-multistate.md`
+// at once, and it is the first fixture in the tree to do either:
+//
+//   * "The multi-cache recurrent allocation site is UNEXERCISED." The
+//     `alloc_recurrent_layer_states` call inside `if (multi_cache_topology)`,
+//     in its `membership_by_name && has_mamba_group` recurrent loop, could be
+//     DELETED with all four recurrent suites green. The case above
+//     ("keeps its recurrent group") asserts CLASSIFICATION — `layer_kv_class_`,
+//     `gdn_group_id_`, the per-layer index lists — and every one of those is
+//     computed before the allocation, so it cannot see the allocation go away.
+//     This case asserts what was ALLOCATED.
+//   * "Nothing publishes N >= 3." Every recurrent registry in the tree
+//     published two states, so the N-general arm landed EXPRESSIBLE and
+//     UNREACHED. `MakeQwen4ExpKVCache` (W5c, #2031) publishes FOUR, and this
+//     is that shape at four layers instead of forty-eight.
+//
+// The miniature is `Qwen4ExpForConditionalGeneration`'s geometry: a 3:1
+// linear:sparse schedule, one paged K+V group over the sparse layers, ONE
+// uniform recurrent group over every linear layer carrying
+// [gdn_conv, temporal, ple_conv, ngram], and the QSA indexer side cache as an
+// `MLAAttentionSpec` at compress_ratio 4 — which is what makes the topology
+// multi-cache at all. A `FullAttentionSpec` there would be absorbed as the
+// single `fa_draft` draft-KV slot instead and get no buffer.
+//
+// The four state sizes are pairwise DISTINCT in element count, and the set
+// covers three ranks and two dtypes, so no implementation that reuses
+// `shapes[0]`, `shapes[1]`, `dtypes[0]` or a factor of 2 can produce them:
+//   gdn_conv  {64, 3}     bf16 ->  384 B/slot   rank 2
+//   temporal  {4, 8, 8}   f32  -> 1024 B/slot   rank 3
+//   ple_conv  {128, 9}    bf16 -> 2304 B/slot   rank 2
+//   ngram     {2}         i64  ->   16 B/slot   rank 1
+namespace {
+
+constexpr int64_t kQ4ConvElems = 64 * 3;
+constexpr int64_t kQ4SsmElems = 4 * 8 * 8;
+constexpr int64_t kQ4PleElems = 128 * 9;
+constexpr int64_t kQ4NGramElems = 2;
+constexpr int64_t kQ4MambaPage =
+    kQ4ConvElems * 2 + kQ4SsmElems * 4 + kQ4PleElems * 2 + kQ4NGramElems * 8;
+
+KVCacheConfig MakeQwen4ExpShapedKvConfig() {
+  KVCacheConfig kv;
+  kv.num_blocks = kNumBlocks;
+  // Group 0 — the sparse layer's paged K+V. Layer 3 is the `full_attention`
+  // entry in MakeConfig()'s [LA, LA, LA, FA] schedule, which upstream's
+  // `__post_init__` rewrites to `qwen_sparse_attention`.
+  kv.kv_cache_groups.emplace_back(
+      std::vector<std::string>{"model.layers.3.self_attn.attn"},
+      std::make_shared<FullAttentionSpec>(kBlockSize, /*num_kv_heads=*/2,
+                                          /*head_size=*/8,
+                                          vllm::v1::ResolveKvCacheDType()));
+  // Group 1 — ONE uniform recurrent group over EVERY linear layer, carrying the
+  // PLE states that only one of them uses. That is upstream's polarity, not a
+  // shortcut: `get_mamba_state_shape_from_config` is a classmethod with no
+  // `layer_idx` (`interfaces.py:809-812`) and `get_mamba_groups`
+  // (`mamba_utils.py:441`) asserts every `MambaSpec` in the model equal.
+  kv.kv_cache_groups.emplace_back(
+      std::vector<std::string>{"model.layers.0.linear_attn",
+                               "model.layers.1.linear_attn",
+                               "model.layers.2.linear_attn"},
+      std::make_shared<MambaSpec>(
+          kBlockSize,
+          std::vector<std::vector<int64_t>>{{64, 3},
+                                            {4, 8, 8},
+                                            {128, 9},
+                                            {kQ4NGramElems}},
+          std::vector<DType>{DType::kBF16, DType::kF32, DType::kBF16,
+                             DType::kI64}));
+  // Group 2 — the QSA indexer side cache. One key vector per FOUR tokens, no V.
+  kv.kv_cache_groups.emplace_back(
+      std::vector<std::string>{"model.layers.3.self_attn.indexer.k_cache"},
+      std::make_shared<vllm::v1::MLAAttentionSpec>(
+          kBlockSize, /*head_size=*/8, vllm::v1::ResolveKvCacheDType(),
+          /*num_kv_heads=*/1, vllm::v1::KVQuantMode::kNone,
+          /*page_size_padded=*/std::nullopt,
+          /*indexes_kv_by_block_stride=*/false,
+          /*cache_dtype_str=*/std::nullopt, /*alignment=*/std::nullopt,
+          /*compress_ratio=*/4, /*model_version=*/std::nullopt));
+  return kv;
+}
+
+}  // namespace
+
+TEST_CASE("runner: a multi-cache topology ALLOCATES its N-state recurrent group") {
+  const HfConfig c = MakeConfig();
+  const Qwen3_5MoeWeights w = MakeWeights(c);
+  const KVCacheConfig kv = MakeQwen4ExpShapedKvConfig();
+  REQUIRE(vllm::v1::ResolveKvCacheDType() == DType::kBF16);
+
+  const auto* mamba =
+      dynamic_cast<const MambaSpec*>(kv.kv_cache_groups[1].kv_cache_spec.get());
+  REQUIRE(mamba != nullptr);
+  REQUIRE(mamba->shapes.size() == 4);
+  REQUIRE(mamba->page_size_bytes() == kQ4MambaPage);
+  REQUIRE(kQ4MambaPage == 3728);
+
+  GPUModelRunner runner(c, w, kv, Q(), /*max_num_reqs=*/8, kMaxModelLen,
+                        /*max_num_batched_tokens=*/64);
+  const int64_t slots = runner.gdn_state_slots();
+  REQUIRE(slots == 8);
+
+  // 1. THE TOPOLOGY IS THE MULTI-CACHE ONE. Asserted rather than assumed,
+  //    because if it were not, the recurrent buffers below would come from the
+  //    LEGACY `is_gdn` call site and this case would gate the site that already
+  //    had four suites on it.
+  CHECK(runner.attn_group_ids() == std::vector<int>{0, 2});
+  CHECK(runner.recurrent_group_ids() == std::vector<int>{1});
+  CHECK(runner.gdn_group_id() == 1);
+  CHECK(runner.full_attn_group_id() == 0);
+  using LKC = GPUModelRunner::LayerKvClass;
+  CHECK(runner.layer_kv_class()[0] == LKC::kRecurrent);
+  CHECK(runner.layer_kv_class()[1] == LKC::kRecurrent);
+  CHECK(runner.layer_kv_class()[2] == LKC::kRecurrent);
+  CHECK(runner.layer_kv_class()[3] == LKC::kMultiCache);
+  // Layer 3 owns TWO caches: its paged K+V and its indexer side cache.
+  REQUIRE(runner.layer_attn_kv_indices().size() == 4);
+  CHECK(runner.layer_attn_kv_indices()[3] == std::vector<int32_t>{0, 1});
+  CHECK(runner.attn_kv_layer_names() ==
+        std::vector<std::string>{"model.layers.3.self_attn.attn",
+                                 "model.layers.3.self_attn.indexer.k_cache"});
+
+  // 2. THE RECURRENT ALLOCATION HAPPENED, on the multi-cache path. This is the
+  //    assertion the deletion mutation reds: with that call site removed,
+  //    `recurrent_state_buf_` stays empty, so `gdn_state_` is empty too.
+  REQUIRE(runner.gdn_state().size() == 3);
+
+  for (const GdnStateCache& gs : runner.gdn_state()) {
+    REQUIRE(gs.states.size() == 4);
+    // The two legacy NAMES are still slots 0 and 1, which is why the temporal
+    // state sits between the conv states rather than after them.
+    CHECK(gs.states[0].data == gs.conv_state.data);
+    CHECK(gs.states[1].data == gs.ssm_state.data);
+    // Each state carries its OWN rank, shape and dtype, slot dim prepended.
+    CHECK(gs.states[0].rank == 3);
+    CHECK(gs.states[1].rank == 4);
+    CHECK(gs.states[2].rank == 3);
+    CHECK(gs.states[3].rank == 2);
+    CHECK(gs.states[0].dtype == DType::kBF16);
+    CHECK(gs.states[1].dtype == DType::kF32);
+    CHECK(gs.states[2].dtype == DType::kBF16);
+    CHECK(gs.states[3].dtype == DType::kI64);
+    CHECK(std::vector<int64_t>{gs.states[2].shape[0], gs.states[2].shape[1],
+                               gs.states[2].shape[2]} ==
+          std::vector<int64_t>{slots, 128, 9});
+    CHECK(std::vector<int64_t>{gs.states[3].shape[0], gs.states[3].shape[1]} ==
+          std::vector<int64_t>{slots, kQ4NGramElems});
+    // Four DISTINCT allocations, none an alias or a re-view of another.
+    for (size_t i = 0; i < 4; ++i) {
+      CAPTURE(i);
+      CHECK(gs.states[i].data != nullptr);
+      for (size_t j = i + 1; j < 4; ++j) CHECK(gs.states[i].data != gs.states[j].data);
+    }
+    // 3. STATES 2 AND 3 ARE LOAD-BEARING. Their byte counts are their OWN
+    //    element count times their OWN element size, and both differ from
+    //    everything slots 0 and 1 could supply: reusing `shapes[1]` for the PLE
+    //    conv gives 8192 rather than 18432, and reusing `dtypes[0]` for the
+    //    n-gram history gives 32 rather than 128.
+    CHECK(static_cast<int64_t>(gs.states[2].Bytes()) == slots * kQ4PleElems * 2);
+    CHECK(static_cast<int64_t>(gs.states[2].Bytes()) == 18432);
+    CHECK(static_cast<int64_t>(gs.states[3].Bytes()) ==
+          slots * kQ4NGramElems * 8);
+    CHECK(static_cast<int64_t>(gs.states[3].Bytes()) == 128);
+  }
+
+  // 4. BYTE IDENTITY between what the runner took and what it reports, and
+  //    between that and what the ENGINE's own budget charges for this group.
+  //    A state the allocator skipped or the reporter missed shows up here
+  //    rather than as a short cache nothing mentions.
+  int64_t recurrent_bytes = 0;
+  for (const GdnStateCache& gs : runner.gdn_state())
+    for (const vt::Tensor& s : gs.states)
+      recurrent_bytes += static_cast<int64_t>(s.Bytes());
+  CHECK(recurrent_bytes == 3 * slots * kQ4MambaPage);
+  CHECK(recurrent_bytes == 89472);
+  CHECK(runner.kv_cache_allocated_bytes() -
+            runner.kv_cache_allocated_paged_bytes() == recurrent_bytes);
+  CHECK(vllm::v1::recurrent_state_bytes(kv, /*max_num_seqs=*/8) ==
+        recurrent_bytes);
+
+  // 5. And the paged half, from each group's OWN page: 16*2*(8+8)*2 = 1024 for
+  //    the K+V group, and (16/4)*1*8*2 = 64 for the compress-ratio-4 side
+  //    cache, over 8 blocks.
+  CHECK(runner.attn_kv().size() == 2);
+  CHECK(runner.kv_cache_allocated_paged_bytes() == kNumBlocks * (1024 + 64));
+  CHECK(runner.kv_cache_allocated_bytes() == 8704 + 89472);
 }
 
 // ─── The third forward channel ──────────────────────────────────────────────

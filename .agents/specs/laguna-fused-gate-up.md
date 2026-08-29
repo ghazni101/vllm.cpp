@@ -106,7 +106,7 @@ ours-versus-ours A/B, which needs no external denominator.
 |---|---|---|
 | W1 | ~~Read the REAL `UD-Q4_K_XL` tensor table~~ **DONE 2026-08-27, see `## W1` below: 47/47 layers pair, zero mismatch, lever available** | dtypes recorded from the file |
 | W2 | ~~Route the pair through the fused op~~ **DONE**: `VT_LAGUNA_FUSED_GATEUP=1`, default-OFF, with the same-dtype precondition falling back to the two-call arm | divergence bounded at 2 ULP and sign-preserving (`test_laguna_fused_gate_up`, 111,776 assertions); existing Laguna suites unchanged |
-| W3 | Same-binary A/B under one lease, decode only, and flip the default if it is both bit-exact and faster | measured ratio recorded |
+| W3 | ~~Same-binary A/B~~ **DONE, see `## W3`**: warm order-balanced A/B, both arms repeated. Tokens DIFFER deterministically, so the default is NOT flipped; +4.28% warm is recorded as a direction at n=2 | `DETERMINISM=PASS`, `W3B_RESULT=TOKENS_DIFFER_DETERMINISTICALLY` |
 
 W1 is first and is deliberately not code. The row's whole premise is that both
 towers share a dtype on a checkpoint whose quantization is dynamic by design, and
@@ -156,10 +156,155 @@ checkpoint only — a different UD quant may pair differently, which is why the
 runtime refusal and fallback stay in W2's scope rather than being dropped now
 that this one is clean.
 
+## W3 — MEASURED: the lever is worth ~4%, and it changes tokens, so it stays OFF
+
+Run on `dgx:gpu0` (GB10) under `rc` on 2026-08-27/28, against the real
+`unsloth/Laguna-S-2.1-GGUF` `UD-Q4_K_XL` @ `750f92f9` staged to the shared NAS.
+Same binary, same weights, same prompt, 32 tokens; the arms differ only in
+`VT_LAGUNA_FUSED_GATEUP`.
+
+### W3a ran once per arm and produced one real result and one artefact
+
+`TOKEN_GATE=FAIL` — the streams share two tokens and diverge at position 2
+(`350` against `290`), then cascade, which is what one changed token does
+autoregressively.
+
+It also printed off=3.7328 tok/s against on=8.0328, a 2.15x gap. **That number is
+an artefact and must not be quoted.** W11 priced this whole lever at 12.4% of
+decode GPU, of which this removes about half, so 2.15x is two orders of magnitude
+past the ceiling. The tell was the OFF arm sitting at half its own known speed:
+it ran FIRST, against a 68 GiB checkpoint freshly written to CIFS, and paid the
+page-cache faults the second arm never saw. A single run per arm cannot see that,
+and W3a's design could not have caught it.
+
+### W3b: warm, order-balanced, and each arm repeated
+
+`warmup (discarded) -> off1 -> on1 -> on2 -> off2`, so neither arm owns "first"
+and the page-cache cost is paid before anything is timed.
+
+| Arm | runs | mean tok/s | within-arm spread |
+|---|---|---:|---:|
+| OFF (two-call, default) | 7.7734, 7.9334 | **7.853** | 2.04% |
+| ON (fused) | 8.1763, 8.2032 | **8.190** | 0.33% |
+
+**`DETERMINISM=PASS`.** Both arms reproduce themselves across repeats, which is
+checked BEFORE any arm-versus-arm claim: had an arm differed from itself, the
+token divergence could not have been attributed to the epilogue at all, and that
+would have been the finding.
+
+**`W3B_RESULT=TOKENS_DIFFER_DETERMINISTICALLY`.** W3a's FAIL is real and
+reproducible.
+
+### Two hypotheses, both resolved
+
+**The cold/warm reading holds.** Warm OFF is 7.85 tok/s, matching W11's ~7.7.
+W3a's 2.15x was its cold first run, demonstrated rather than argued.
+
+**"The fused arm does less work" is REFUTED**, and it was the more serious
+possibility: a wrong scale fold or a mishandled dtype would produce the same
+token divergence while looking like a speedup. The measured **+4.28%** sits UNDER
+W11's <=6% ceiling for this lever. Skipped work would have shown a gain far above
+it. The implausible number was worth distrusting, and the real one being MODEST
+is what clears the arm of computing something different.
+
+### Verdict: the arm stays default-OFF
+
+The lever is real and worth about 4%. It also moves an output token, which is the
+measured 2-ULP epilogue landing on a near-tie argmax. `## Gates` committed to
+refusing that trade before any of these numbers existed:
+
+> either the fused arm is byte-identical, or the row records the divergence and
+> stops rather than trading correctness for 6%.
+
+That is a rule rather than a rationalisation, and it is applied here.
+
+### What this does NOT establish
+
+**n=2 per arm, ONE prompt, 32 tokens.** The +4.28% is a DIRECTION, not a ratified
+number: the gap is only 2.1x the OFF within-arm spread, which is thin. Nothing
+here is a speed claim, and no llama.cpp denominator is quoted — `27.8 tok/s` and
+every ratio from it remain superseded under #1003.
+
+**One prompt cannot show the divergence is always a near-tie.** It shows this
+prompt's token 2 was one. A prompt whose margins are wider might never diverge,
+and a longer generation might diverge more; neither was measured.
+
+## W4 — the wider sweep, COMPLETE: 6 of 6 prompts diverge, at widely varying depth
+
+Run on `dgx:gpu0` against `unsloth/Laguna-S-2.1-GGUF` `UD-Q4_K_XL` @ `750f92f9`.
+Six prompts, 256 tokens each, both arms, same binary and weights, differing only
+in `VT_LAGUNA_FUSED_GATEUP`. `SWEEP_DIVERGED=6 SWEEP_TOTAL=6 SWEEP_NTOK=256`.
+
+| # | Prompt | First divergence |
+|---|---|---:|
+| 0 | "The capital of France is" | **2** |
+| 1 | "List three prime numbers greater than one hundred:" | **73** |
+| 2 | "def quicksort(arr):" | **115** |
+| 3 | "If a train leaves at 3pm travelling 60km/h, and another" | **55** |
+| 4 | "Write a short paragraph about the sea in winter." | **13** |
+| 5 | "La capitale de l'Italie est" | **49** |
+
+Positions 2, 13, 49, 55, 73, 115 — median 52, min 2, max 115.
+
+### What this settles
+
+**The divergence is universal across these prompts, not a property of one.** W3's
+result came from prompt 0 alone, and the honest worry was that it might be that
+prompt's peculiarity. It is not: every prompt tried, across factual recall, a
+numbered list, code, arithmetic reasoning, free prose and a non-English factual,
+eventually hits a near-tie where the 2-ULP epilogue flips an argmax.
+
+**W3's position 2 was the WORST case, not the typical one.** Five of six ran
+between 13 and 115 tokens before splitting, and the code prompt reached 115. A
+reader who saw only W3 would have concluded the arm diverges immediately; it
+usually does not. That distinction is why this sweep reports the POSITION rather
+than a boolean, and it is the one thing the earlier single measurement got
+misleadingly right.
+
+**It does NOT establish a per-token probability, and the spread forbids
+estimating one from six samples.** A 2-to-115 range over n=6 supports "varies
+widely" and nothing sharper. No claim is made about prompts outside this set, and
+the prompts were chosen by hand rather than sampled.
+
+### What it means for the default
+
+The question W3 left open was whether the near-tie might be rare enough to
+reconsider shipping the arm ON. **It is not rare: 6 of 6.** The option is closed
+on the evidence rather than on preference, and `## Gates`'s advance commitment to
+refuse a near-tie stands unchanged. **The arm stays default-OFF.**
+
+### Cost, recorded because it was disproportionate
+
+Eight harness and environment faults were fixed to get this run, every one the
+author's: `xxd` absent; `--token-ids` read as an output flag when it is an input;
+`decode_hp` timings inside the token diff, which would have reported FAIL on every
+run; a 40-minute idle timeout against a measured 37.9-minute cadence, which killed
+a healthy job; an unverified `nvcc` install that produced a silently CPU-only
+build; a `lib64` glob that missed `targets/sbsa-linux/lib`; a `find | head -1`
+that selected a link-time STUB which cmake accepted with rc=0; and a cublasLt
+guard promoted to FATAL that then rejected dgx, the box that had always built.
+
+They share one root: **each fix encoded an assumption taken from the box last
+seen.** The general rule the last one states is that a guard must not be stricter
+than the thing it guards. The cheapest correction was also the latest: one
+12-minute diagnostic job established that the container had no CUDA and no NVIDIA
+apt repo, which seven earlier leases of inference had failed to determine.
+
+Also measured, and worth keeping: **Thor cannot run this sweep.** It loads this
+checkpoint in 2887 s against dgx's 14-24 min, so thirteen loads is 10.4 hours
+there against ~3.5 on dgx.
+
 ## Now
 
-`ACTIVE`. W2 landed default-OFF; W1 measured and recorded above: the lever is available on the gate
-model, on all 47 expert layers. Next action is W3, which needs a GPU: the token gate on the real checkpoint that
-decides whether the measured 2-ULP epilogue divergence moves an output token, and
-the same-binary decode A/B. The flag stays OFF and the two-call arm stays the
-reference until that passes.
+`ACTIVE`, and the row's question is answered. W1 measured the dtype pairing
+(47/47 layers), W2 built the arm and bounded its epilogue divergence at 2 ULP,
+W3 measured that the divergence moves a token and that the lever is worth ~4%
+warm. **The arm ships default-OFF and the two-call path remains the reference.**
+
+What is owed, and neither is a blocker on the above:
+
+- ~~The wider token sweep~~ **DONE (`## W4`): 6 of 6 prompts diverge.** The
+  question of whether the near-tie is rare enough to reconsider the default is
+  answered and closed.
+- A ratified speed number, if the arm is ever defaulted on: n=2 on one prompt is
+  a direction. That needs repeats on an idle box.
