@@ -642,13 +642,13 @@ void ForwardMlaAttentionBlock(Dev d, const MlaBlockDims& dims, const MlaBlockWei
             "residency");
       }
       Tensor kv_c_t = kv_c.t(), k_pe_t = k_pe.t();
-      vt::MatmulBT(d.q, kv_c_t, hidden, w_kva.Slice(0, 0, L));
+      vt::MatmulBT(d.q, kv_c_t, hidden, fused.Slice(0, ql, ql + L));
       // NoPE (W3, #2213): with no rope slice there are no rope ROWS in the
       // A-projection either — `fused_qkv_a_proj` is [q_lora + kv_lora, hidden]
       // — so the second GEMM is NOT LAUNCHED rather than issued at width 0,
       // which `Tensor::Slice` refuses as an empty range.
       if (R > 0) {
-        vt::MatmulBT(d.q, k_pe_t, hidden, w_kva.Slice(0, L, L + R));
+        vt::MatmulBT(d.q, k_pe_t, hidden, fused.Slice(0, ql + L, ql + L + R));
       }
     }
     // `q_c = self.q_a_layernorm(q_c)` (mla.py:143) — in-place, like upstream.
