@@ -1032,11 +1032,40 @@ namespace {
 // The FIRST argument of `PublishedShapeGguf` is the BLOCK count and is written
 // to `block_count`, so every per-block array this builder generates is block
 // length -- which is what llama.cpp writes and what the reader checks against.
+//
+// THE MLA AND KDA SPELLING KNOBS are #2268's. `key_length` and `value_length`
+// default to llama.cpp's own meaning of those names — `kv_lora_rank +
+// qk_rope_head_dim` and `kv_lora_rank`, `b10451:conversion/deepseek.py:345-346`
+// — which for this model is 512 and 512 and is what the published artifact
+// carries. `kda_heads` selects WHICH key states the linear-attention head
+// count, because the two producers spell it differently and the published file
+// spells it in no key at all; `ssm_a_entries` writes the `blk.<L>.ssm_a` tensor
+// whose length IS that count, which is the only place that file states it.
 struct Glm5NextGgufArrays {
   std::vector<int32_t> head_count_kv;
   std::vector<float> swiglu_clamp_exp;
   std::vector<float> swiglu_clamp_shexp;
   int64_t nextn_predict_layers = 0;
+
+  // Which key carries the KDA head count. `kOurs` is
+  // `attention.linear_head_count`, the key `scripts/convert-glm5-next-gguf.py`
+  // writes and llama.cpp spells nowhere; `kGroupCount` and `kInnerSize` are
+  // llama.cpp's `ssm.group_count` and `ssm.inner_size`; `kNone` writes none,
+  // which is the published artifact.
+  enum class KdaHeads { kOurs, kGroupCount, kInnerSize, kNone };
+  KdaHeads kda_heads = KdaHeads::kOurs;
+  int64_t kda_head_count = 64;
+  // A 1-D F32 `ssm_a` on the first `linear_attention` block, of this many
+  // entries. Zero writes no tensor.
+  int64_t ssm_a_entries = 0;
+
+  int64_t kv_lora_rank = 512;
+  int64_t key_length = 512;
+  int64_t value_length = 512;
+  int64_t key_length_mla = 256;
+  int64_t value_length_mla = 256;
+  int64_t rope_dimension_count = 0;
+  int64_t kda_head_dim = 128;
 };
 
 std::string PublishedShapeGguf(int64_t n_layers,
@@ -1071,10 +1100,16 @@ std::string PublishedShapeGguf(int64_t n_layers,
   }
   b.AddKv(gguf_test::F32Kv(k + "attention.layer_norm_rms_epsilon", 1e-5f));
   b.AddKv(gguf_test::U32Kv(k + "attention.q_lora_rank", 1536));
-  b.AddKv(gguf_test::U32Kv(k + "attention.kv_lora_rank", 512));
-  b.AddKv(gguf_test::U32Kv(k + "attention.key_length_mla", 256));
-  b.AddKv(gguf_test::U32Kv(k + "attention.value_length_mla", 256));
-  b.AddKv(gguf_test::U32Kv(k + "attention.key_length", 256));
+  b.AddKv(gguf_test::U32Kv(k + "attention.kv_lora_rank",
+                           static_cast<uint32_t>(arrays.kv_lora_rank)));
+  b.AddKv(gguf_test::U32Kv(k + "attention.key_length_mla",
+                           static_cast<uint32_t>(arrays.key_length_mla)));
+  b.AddKv(gguf_test::U32Kv(k + "attention.value_length_mla",
+                           static_cast<uint32_t>(arrays.value_length_mla)));
+  b.AddKv(gguf_test::U32Kv(k + "attention.key_length",
+                           static_cast<uint32_t>(arrays.key_length)));
+  b.AddKv(gguf_test::U32Kv(k + "attention.value_length",
+                           static_cast<uint32_t>(arrays.value_length)));
   if (arrays.swiglu_clamp_exp.empty()) {
     b.AddKv(gguf_test::F32Kv(k + "swiglu_clamp_exp", 10.0f));
   } else {
@@ -1090,7 +1125,9 @@ std::string PublishedShapeGguf(int64_t n_layers,
         k + "nextn_predict_layers",
         static_cast<uint32_t>(arrays.nextn_predict_layers)));
   }
-  b.AddKv(gguf_test::U32Kv(k + "rope.dimension_count", 0));
+  b.AddKv(gguf_test::U32Kv(
+      k + "rope.dimension_count",
+      static_cast<uint32_t>(arrays.rope_dimension_count)));
   b.AddKv(gguf_test::U32Kv(k + "attention.indexer.head_count", 32));
   b.AddKv(gguf_test::U32Kv(k + "attention.indexer.key_length", 128));
   b.AddKv(gguf_test::U32Kv(k + "attention.indexer.top_k", 2048));
