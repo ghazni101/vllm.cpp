@@ -82,3 +82,14 @@ greedy decode is unchanged).
   owe the teacher-forced ceremony and a ≥2% bar this lever does not meet.
 - Spec `## Now` line records: closed below the 2% bar, adopted as opt-in,
   +1.25% median (86.825 vs 85.753 at MT=16), byte-identical outputs.
+
+## Clean-window re-A/B (2026-08-29 late window, post-#9-fix tree, reference a0fa1c4a…)
+
+The original arms above were later found to have run against a co-tenant
+hung container. Re-measured on an idle window (loadavg 0.98 at start, no
+stray engine processes, 1 warm + 5 reps, shared base arm with the T35-r3
+evidence): base median **85.834** (85.713 85.838 85.899 83.200 85.834),
+VT_PREFILL_TILE=1 median **86.392** (86.511 86.669 86.375 86.311 86.392)
+= **+0.65%**, body byte-identical to the re-minted reference
+(a0fa1c4a…) in every arm. Confirms the direction and the below-bar
+opt-in disposition at the clean-window magnitude.
