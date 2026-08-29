@@ -676,9 +676,9 @@ __device__ inline void KQuantGemvMmvqRow(OutT* __restrict__ out,
         // Chunk c covers dequant elements [c*32, c*32+32). DotQ6K layout:
         // quarter q=c>>2 holds elements [q*128,+128); segment seg=c&3 picks
         // the ql low/high nibble half and the qh 2-bit field. Nibble values
-        // are biased by -32; the bias is removed EXACTLY in the integer
-        // domain with a constant-word dp4a (32*q8 per byte), so `acc`
-        // equals the baseline's exact isum whatever the grouping.
+        // are biased by -32; the bias is folded into the dot product per
+        // byte (see the TG150 note below), so `acc` equals the baseline's
+        // exact isum whatever the grouping.
         // seg 0/1: low nibble of ql bytes l / l+32; seg 2/3: high nibble.
         // qh contributes a 2-bit field per element (mask 0x03030303).
         const int q = c >> 2, seg = c & 3;
@@ -690,9 +690,17 @@ __device__ inline void KQuantGemvMmvqRow(OutT* __restrict__ out,
         const int8_t* q8 = yb.qs + c * 32;
         // TG150: fuse bias correction into the dot product. Instead of
         // sub = v·W8 and pre = 32·W8 then (sub - pre), compute
-        // (v - 0x20)·W8 directly. Unsigned byte subtraction wraps to the
-        // correct signed char value (v < 32 → 256+v-32 = signed v-32).
+        // (v - 0x20)·W8 directly on bytes. The bias MUST be applied per
+        // byte: v's bytes are 6-bit (0..63), so a plain `v - 0x20202020`
+        // underflows every byte < 32 and the borrow DECREMENTS the next
+        // byte by 1, corrupting the dp4a sum for ~87% of random words —
+        // that was the issue #9 gate red (Q6_K arm diverging from the
+        // baseline at every nsb). Guard each byte with 0x80: every byte
+        // computes (v_b + 128) - 32 in [96,159], underflow- and carry-
+        // free, and the closing XOR reinterprets the guard as the sign
+        // bit: byte result = (v_b - 32) mod 256, signed-char exact.
         static constexpr uint32_t kBias32Word = 0x20202020u;
+        static constexpr uint32_t kBiasGuard = 0x80808080u;
         int sub0 = 0, sub1 = 0;
 #pragma unroll
         for (int w = 0; w < 8; ++w) {
@@ -703,7 +711,7 @@ __device__ inline void KQuantGemvMmvqRow(OutT* __restrict__ out,
           uint32_t v =
               ((Wq >> shift) & 0x0F0F0F0Fu) |
               (((Wh >> hs) & 0x03030303u) << 4);
-          uint32_t vb = v - kBias32Word;  // signed-correct via wrap
+          uint32_t vb = ((v | kBiasGuard) - kBias32Word) ^ kBiasGuard;
           if (w < 4) {
             sub0 = amd_mixed_dot(*reinterpret_cast<char4*>(&vb), *reinterpret_cast<char4*>(&W8), sub0, false);
           } else {
