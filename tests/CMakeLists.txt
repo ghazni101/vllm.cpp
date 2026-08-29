@@ -4000,3 +4000,17 @@ target_include_directories(test_glm_moe_dsa_forward PRIVATE
 # lane's environment where a reader of the build looks for it.
 set_tests_properties(test_glm_moe_dsa_forward PROPERTIES
   ENVIRONMENT "VT_MOE_EXPERT_STREAM=1")
+
+# GFX1100-TG200 T37 microbench: decode-GEMV shapes through the real dispatch,
+# sweeping VT_GEMV_WARPS / VT_GEMV_SPLITK. Executable only — NOT add_test
+# (measurement tool, not a gate; the paged-attn-wmma precedent).
+add_executable(t37_gemv_bench vt/t37_gemv_bench.cpp)
+target_include_directories(t37_gemv_bench PRIVATE ${CMAKE_SOURCE_DIR}/src
+                                                  ${CMAKE_SOURCE_DIR}/third_party)
+if(TARGET vllm::sanitize_test_shared)
+  target_link_libraries(t37_gemv_bench PRIVATE vllm::sanitize_test_shared
+                                               vllm_test_main)
+else()
+  target_link_libraries(t37_gemv_bench PRIVATE vllm::vllm vllm_test_main)
+endif()
+vllm_cpp_set_warnings(t37_gemv_bench)
