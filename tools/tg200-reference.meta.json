@@ -1,0 +1,51 @@
+{
+  "schema": "tg200-neartie-reference/v1",
+  "role": "GFX1100-TG200 campaign reference continuation: the 256-token greedy body on the gate prompt, plus its token ids, that every reduction-order lever is adjudicated against (tools/tg200-neartie.sh adjudicate).",
+  "captured": {
+    "date": "2026-08-29",
+    "git_head": "54e40a850884a7c3c7a4e4bbb4f95fd6b61cb84b",
+    "tool": "examples/tg200_neartie (capture mode) via tools/tg200-neartie.sh",
+    "container": "rocm-dev:10.0.0 (HIP 7.15), gpu-ctl lock held",
+    "body_md5": "783cea1790ae7ebc4a0105fd309a6712",
+    "body_md5_convention": "md5 of the body bytes + one trailing newline (vllm-cli stdout, `md5sum body.txt`); matches the campaign reference recorded in docs/bench-evidence/gfx1100-tg200-t34-host-split-20260829.md and t36",
+    "n_tokens": 256,
+    "finish_reason": "length",
+    "ids_sha256": "2dcda0e4c0830054603699948e55991aeee77d218ad05cfa50916a720563f439"
+  },
+  "model": {
+    "path": "/home/ghazni/models/vllm.cpp/Qwen3.5-4B-Q4_K_M.gguf",
+    "sha256": "00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4"
+  },
+  "prompt": {
+    "path": "tools/tg200-prompt.txt",
+    "sha256": "e2b801cc6a5739cd317c2f77adfb67040667de524ab60ca64aac39f79c846bba",
+    "note": "109 prompt tokens; the CLI/command-substitution trailing-newline strip is replicated by the tool"
+  },
+  "sampling": "greedy (--temperature 0 --seed 0), batch 1, max_tokens 256",
+  "lever_env": {
+    "VT_GEMV_MMVQ": "1",
+    "VT_SKINNY_BF16": "1",
+    "VT_ATTN_DECODE_GQA4": "1",
+    "VT_GDN_SCAN_COOP": "1",
+    "VT_ATTN_PREAMBLE_COOP": "1",
+    "VT_NORM_QUANT_FUSED": "1",
+    "VT_RMSNORM_ROW_COOP": "1",
+    "VT_GDN_NORMGATED_COOP": "1",
+    "VT_GDN_POSTCONV_COOP": "1",
+    "VT_GDN_SCAN_SPLIT": "1",
+    "VT_ARGMAX_SPLIT": "1",
+    "VT_GDN_ROWPERM_KEEP_QUANT": "1",
+    "VT_RMSNORM_LDS_QUANT": "1",
+    "VT_GDN_COLPERM_KEEP_QUANT": "1",
+    "VT_QUANT_Q8K_WARP": "1",
+    "source": "the T33/T34 adopted-lever block (agent-artifacts tg200-t33-eval / tg200-t34-capture inner scripts); the body this block produced is the campaign reference 783cea17 reproduced byte-for-byte by T34, T36 and this capture"
+  },
+  "band": {
+    "mnats": 500,
+    "authority": ".agents/specs/rocm-m4-oracle.md (near-tie band <= 500 milli-nats, teacher-forced on the exact prefix)"
+  },
+  "self_test": {
+    "result": "PASS",
+    "detail": "teacher-forced walk of these ids at the capture commit: divergent=0 over_band=0 max_gap_mnats=0.000, forced body md5 == 783cea17... (raw: agent-artifacts/tg200-neartie/selftest-neartie.json)"
+  }
+}

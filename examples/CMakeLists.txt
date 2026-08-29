@@ -56,6 +56,15 @@ add_executable(vllm-cli cli/main.cpp)
 target_link_libraries(vllm-cli PRIVATE vllm::shared)
 vllm_cpp_set_warnings(vllm-cli)
 
+# tg200-neartie: the GFX1100-TG200 near-tie adjudicator — the teacher-forced
+# logprob-band ceremony (.agents/specs/rocm-m4-oracle.md) every reduction-order
+# lever owes before it can land. Thin C-ABI client in exactly the vllm-cli
+# shape: include/vllm.h only (the v8 logits_processor is the whole mechanism),
+# links the packaged shared library.
+add_executable(tg200-neartie tg200_neartie/main.cpp)
+target_link_libraries(tg200-neartie PRIVATE vllm::shared)
+vllm_cpp_set_warnings(tg200-neartie)
+
 # quant-gemm-bench (QUANT-GGUF-CIQ-GEMM G6 evidence tool, NOT a gate): op-level
 # GFLOP/s for kMatmulBTQuant, portable vs Arm i8mm mmla tier.
 add_executable(quant-gemm-bench quant_gemm_bench/main.cpp)
