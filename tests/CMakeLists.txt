@@ -2155,6 +2155,15 @@ target_include_directories(test_rocm_quant_dot PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # runtime-guarded on ROCM availability, never on CUDA.
 vllm_cpp_add_test(test_rocm_skinny_f32 vt/test_rocm_skinny_f32.cpp)
 vllm_cpp_add_test(test_rocm_fp8_kv_cache vt/test_rocm_fp8_kv_cache.cpp)
+# GFX1100-TG200 T36: the prefill M-tiled K-quant GEMM gate (VT_PREFILL_TILE).
+# The standing quant gate file stays UNCHANGED per the campaign constraint;
+# this file compares the tiled arm against the BASELINE kernel byte-for-byte
+# at m > 1 shapes (which the standing file's shared-lever arms cannot do) and
+# holds the tiled arm to the same 1e-6 NMSE band vs the CPU oracle. Same
+# conventions: plain C++ through the vt:: seam, runtime-guarded on ROCM
+# availability, never on CUDA.
+vllm_cpp_add_test(test_rocm_prefill_tile vt/test_rocm_prefill_tile.cpp)
+target_include_directories(test_rocm_prefill_tile PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # #785 P1 GPU product-seam witness. Executable only — NOT add_test.
 # Ordinary CTest must not see this target. Runner fail-closes on 77/nonzero.
 add_executable(test_ops_paged_attn_sharedk_wmma_p1_gpu
