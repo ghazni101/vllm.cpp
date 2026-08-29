@@ -3560,6 +3560,23 @@ void CastF32Kernel(Queue&, Tensor& out, const Tensor& in) {
   });
 }
 
+// T25: Permute V-heads from grouped (k*rpk+r) to tiled (r*num_k+k) order.
+void PermuteVHeadsKernel(Queue&, Tensor& out, const Tensor& in,
+                         int64_t T, int64_t num_k, int64_t rpk, int64_t dv) {
+  const int64_t value_dim = num_k * rpk * dv;
+  auto* out_p = out.Ptr<uint16_t>();
+  const auto* in_p = in.Ptr<uint16_t>();
+  for (int64_t row = 0; row < T; ++row) {
+    for (int64_t t = 0; t < num_k * rpk; ++t) {
+      const int64_t r = t / num_k;
+      const int64_t k = t % num_k;
+      const int64_t g = k * rpk + r;
+      for (int64_t h = 0; h < dv; ++h)
+        out_p[row * value_dim + t * dv + h] =
+            in_p[row * value_dim + g * dv + h];
+    }
+  }
+}
 // out[i] = F32ToF16(in[i]); out f16, in f32 or bf16, same element count.
 // QUANT-EXL3 W1a (#2181). LoadF32 reads either source width as f32 and StoreF32
 // rounds once to the f16 destination (cpu_ops.cpp:44-51), so the bf16 source
