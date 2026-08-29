@@ -21,13 +21,15 @@ tok/s (+70%), `Numel()` 27.09% → 1.76%, review PASS; lever 3 (batch
 per-layer staging) NOT taken, the residual attributed to per-upload
 tt-metal-internal work (`#2107`) — are all landed; see `## Evidence`.
 The #1486 teardown fix and the #2115 opt-out-arm golden pair (each arm
-gates its own captured pair; both legs doctest 146/146) landed after it.
-The `docs/USAGE.md` weights entry is complete (file, bytes, repo @
-revision, sha256, refused arms). Owed next: **W3 leftovers** (d2h
-counter completeness, `conv_transposed` fast-path check, tests for
-both), then the W4 record's named next lever: a per-slot persistent
-device buffer written through the mesh command queue, which needs the
-tt-metal-internal half of W4's lever 2.
+gates its own captured pair; both legs doctest 146/146) landed after it,
+as did the **W3 leftovers** (the two missing d2h `fetch_add`s and the
+scoped `conv_transposed` refusal; #2201 via #2217, `a456e6eaf`), with
+the suite at 44 cases / 4340 assertions. The `docs/USAGE.md` weights
+entry is complete (file, bytes, repo @ revision, sha256, refused arms).
+Owed next: **W5** — the W4 record's named next lever: a per-slot
+persistent device buffer written through the mesh command queue
+([#2244](https://github.com/mudler/vllm.cpp/issues/2244); the
+tt-metal-internal half of W4's lever 2).
 
 ## Scope
 
@@ -263,59 +265,6 @@ column above is the entry point, not the whole chain.
   (identical leg, lock discipline) plus a fresh benchmark-record entry; a
   wall that does not move is a reported result — the attribution shifts
   or the lever is named unreachable with the trace that proves it.
-- **W6 — batch per-layer staging: one mesh-CQ write per step (#2273).**
-  W5's trace re-attributed the unmoved wall to the per-CQ-operation
-  tt-metal stack — `Threadpool::PollForWork` 14.29%,
-  `MetalContext::instance` 11.14%, `memcpy` 6.23%, `Cluster::get_chip`
-  5.90%, `read_cq_host_ptr` 5.27%+ sub-slices — charged once per
-  staging write, so a step with fan-in N staged tensors pays it N
-  times regardless of bytes. Pack a step's staged host rows into one
-  contiguous host block and issue ONE mesh-CQ write per step (or per
-  layer group); the per-op tax divides by the fan-in. `StagingStats`
-  gains route counters for the new path (red-first). The capture-unsafe
-  host-write refusals keep their semantics; the f32-conversion arms
-  keep their declared dtypes. A batched/arena layout states its restage
-  semantics explicitly — same-geometry restage aliases the persistent
-  buffer (W5 review awareness), so no fresh-snapshot reasoning carries
-  over. The route must be production-reachable
-  (`ModelRegistry::Forward` → staging), never test-only.
-  Invariant: staging is bit-identical — the sacred golden pair stays
-  16/16 and the full TT suite stays green; this wave changes SPEED,
-  never tokens. Evidence owed: same-method before/after profile on the
-  P150 (identical leg, JIT-discard per arm, one lock hold) plus a fresh
-  benchmark-record entry; a wall that does not move is a reported
-  result — the attribution shifts or the lever is named unreachable
-  with the trace that proves it. The tt-metal-side residual (a
-  multi-destination write that reaches several offset views at once)
-  stays recorded as the upstream-shaped alternative.
-  **Outcome (2026-08-29): named unreachable** — see `## Evidence`, W6.
-  The successor lever is round-trip elimination, not write amortization.
-- **W7 — staging-write elimination: a residency state that stops
-  manufacturing restages (#2282).** The W6 probe counted 30 restages ≈
-  7-8 per step, and every one is our own doing: `MarkHostWritten`
-  (`tenstorrent_ops.cpp:5654`; callers `tenstorrent_backend.cpp:56,66,70`)
-  marks a slot device-stale — including scratch-block acquisition, where
-  the device bytes are garbage but the pending op may fully overwrite
-  them anyway — and `CommitHost` (`:1231`) drops the whole shadow on a
-  host in-place write, forcing a full-tensor restage (`:561`) on the
-  next device use. Make the residency state precise: a decode step
-  stages each slot's bytes once, or zero times when the consumer
-  overwrites the full buffer on device. The implementer derives the
-  mechanism (device-will-overwrite reservation, narrowed
-  `CommitHost`, upload-on-write for host-written device-resident
-  slots) and records it with explicit restage semantics. `StagingStats`
-  must observe the per-step write count; a needed new counter lands
-  red-first. Invariant: staging is bit-identical — the sacred golden
-  pair stays 16/16 and the full TT suite stays green; this wave changes
-  SPEED, never tokens; capture-unsafe refusals keep their semantics;
-  the f32 arms keep their declared dtypes; the #1486 never-destroy rule
-  holds; the route must move the production decode path's write count.
-  Evidence owed: same-method before/after on the P150 (identical leg,
-  JIT-discard per arm, one lock hold) reporting BOTH the per-step write
-  count and the wall time, plus a fresh benchmark-record entry; a count
-  that does not drop or a wall that does not move is a reported result
-  — the attribution shifts or the lever is named unreachable with the
-  trace that proves it.
 
 Each wave lands focused-green before the next; the full gate + fresh review close
 the row.
@@ -362,9 +311,9 @@ the row.
 ## Git integration
 
 One pull request for spec and implementation (row claim answer 2026-08-23, recorded
-in `.agents/developer-preferences.md`). Base `origin/main` @ `3fe34e2c6` (bumped
-2026-08-28; W4 #2118 and the #2115 opt-out-arm pair landed since the previous
-`8f5d4e4ed`). Branch `row/BACKEND-TENSTORRENT-QWEN35`, worktree
+in `.agents/developer-preferences.md`). Base `origin/main` @ `a456e6eaf` (bumped
+2026-08-29; W3 #2201 via #2217 landed since the previous `3fe34e2c6`). Branch
+`row/BACKEND-TENSTORRENT-QWEN35`, worktree
 `/home/lu_zero/Sources/vllmcpp-tt-qwen35`.
 
 ## Evidence
