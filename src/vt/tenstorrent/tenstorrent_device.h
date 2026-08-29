@@ -296,20 +296,6 @@ struct StagingStats {
   uint64_t uploads_persistent_bf16 = 0;
   uint64_t uploads_persistent_allocs = 0;
   uint64_t staged_persistent_bf16_bytes = 0;
-  // ---- BACKEND-TENSTORRENT-QWEN35 W7 (#2282): staging-write elimination ----
-  // The W6 probe read the per-step staging-write count off
-  // uploads_persistent_bf16 (~7-8/step) and traced every one to the residency
-  // state dropping a shadow a consumer could have served. These count the
-  // staging writes W7 eliminates, per class: reservation (a pool-acquired
-  // scratch block served from its resident allocation instead of restaging
-  // garbage), device_memset (an eager full-slot zero-fill that keeps the shadow
-  // alive), device_copy (a device-resident D2D copy that skips the
-  // download+restage pair). A post-W7 step's write count is
-  // uploads_persistent_bf16; the avoided counters attribute which precise-
-  // residency arm removed each write the pre-W7 baseline paid.
-  uint64_t stages_avoided_reservation = 0;
-  uint64_t stages_avoided_device_memset = 0;
-  uint64_t stages_avoided_device_copy = 0;
 };
 #ifdef VLLM_CPP_TENSTORRENT
 StagingStats GetStagingStats();

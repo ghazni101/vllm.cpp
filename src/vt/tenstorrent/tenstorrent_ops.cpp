@@ -509,23 +509,6 @@ std::atomic<uint64_t>& StagingPersistentBytes() {
   static std::atomic<uint64_t> v{0};
   return v;
 }
-// BACKEND-TENSTORRENT-QWEN35 W7 (#2282): staging writes the precise-residency
-// arms eliminate, one counter per class — reservation (EnsureDevice2D serving
-// a pool-acquired block from its resident allocation), device_memset
-// (MemsetDeviceFill keeping the shadow across an eager full-slot zero-fill),
-// device_copy (CopyDeviceDeviceIfResident skipping the download+restage pair).
-std::atomic<uint64_t>& StagingAvoidedReservation() {
-  static std::atomic<uint64_t> v{0};
-  return v;
-}
-std::atomic<uint64_t>& StagingAvoidedMemset() {
-  static std::atomic<uint64_t> v{0};
-  return v;
-}
-std::atomic<uint64_t>& StagingAvoidedDeviceCopy() {
-  static std::atomic<uint64_t> v{0};
-  return v;
-}
 
 // W4 lever 1 (#2107): bulk upload of a contiguous bf16 master. The host
 // bytes ARE the payload: one from_span over the tensor's own memory — no f32
@@ -6598,12 +6581,6 @@ StagingStats GetStagingStats() {
       StagingPersistentAllocs().load(std::memory_order_relaxed);
   s.staged_persistent_bf16_bytes =
       StagingPersistentBytes().load(std::memory_order_relaxed);
-  s.stages_avoided_reservation =
-      StagingAvoidedReservation().load(std::memory_order_relaxed);
-  s.stages_avoided_device_memset =
-      StagingAvoidedMemset().load(std::memory_order_relaxed);
-  s.stages_avoided_device_copy =
-      StagingAvoidedDeviceCopy().load(std::memory_order_relaxed);
   return s;
 }
 
@@ -6614,9 +6591,6 @@ void ResetStagingStats() {
   StagingPersistentWrites().store(0, std::memory_order_relaxed);
   StagingPersistentAllocs().store(0, std::memory_order_relaxed);
   StagingPersistentBytes().store(0, std::memory_order_relaxed);
-  StagingAvoidedReservation().store(0, std::memory_order_relaxed);
-  StagingAvoidedMemset().store(0, std::memory_order_relaxed);
-  StagingAvoidedDeviceCopy().store(0, std::memory_order_relaxed);
 }
 
 }  // namespace vt::tenstorrent
