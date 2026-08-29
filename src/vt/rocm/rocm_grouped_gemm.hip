@@ -659,16 +659,31 @@ __device__ inline void KQuantGemvMmvqRow(OutT* __restrict__ out,
                                          const uint8_t* __restrict__ w_row,
                                          const BlockQ8_K* __restrict__ act_row,
                                          int64_t j, int lane, int64_t nsb,
-                                         size_t w_block_bytes) {
+                                         size_t w_block_bytes,
+                                         int64_t sb0 = 0, int64_t sb1 = -1,
+                                         float* __restrict__ partial_dst = nullptr,
+                                         int split_id = 0,
+                                         int64_t partial_stride = 0) {
+  // T37 (GFX1100-TG200): [sb0, sb1) optionally restricts the super-block
+  // walk (split-K partials); the default full range with a null partial_dst
+  // reproduces the pre-T37 body exactly. Global sb lane ownership
+  // ((sbk & 31) == lane) and the ascending-sb per-lane accumulation order
+  // are preserved for ANY range, so a split's partial adds the same terms
+  // in the same per-lane order over a subset; only the final cross-lane
+  // tree and the cross-split combine (ascending split order in the reduce
+  // kernel) differ from the baseline's single-warp tree — a reduction-order
+  // change the near-tie harness adjudicates.
   float partial = 0.0f;
-  const int passes = static_cast<int>((nsb + 3) / 4);
+  const int64_t lo = sb0;
+  const int64_t hi = sb1 < 0 ? nsb : sb1;
+  const int passes = static_cast<int>((hi - lo + 3) / 4);
   for (int p = 0; p < passes; ++p) {
-    const int sb = p * 4 + (lane >> 3);
+    const int sb = static_cast<int>(lo) + p * 4 + (lane >> 3);
     const int c = lane & 7;
     int acc = 0;    // this chunk's weighted integer dot (exact)
     int sumi_c = 0; // Q4/Q5: mn * (bsums pair), exact
 
-    if (sb < nsb) {
+    if (sb < hi) {
       const uint8_t* blk =
           w_row + static_cast<size_t>(sb) * w_block_bytes;
       const BlockQ8_K& yb = act_row[sb];
@@ -768,10 +783,10 @@ __device__ inline void KQuantGemvMmvqRow(OutT* __restrict__ out,
     // whole-octet integer totals) and add it under the baseline's lane
     // ownership (lane l owns sbs l, l+32, ... — the stream here is strictly
     // sb-increasing, so per-lane accumulation order matches).
-    const int rem = static_cast<int>(nsb - p * 4);
+    const int rem = static_cast<int>(hi - (lo + p * 4));
     const int nact = rem < 4 ? rem : 4;
     for (int kk = 0; kk < nact; ++kk) {
-      const int sbk = p * 4 + kk;
+      const int sbk = static_cast<int>(lo) + p * 4 + kk;
       const int isum = __shfl_sync(0xffffffffULL, acc, 8 * kk);
       const int SUMI = __shfl_sync(0xffffffffULL, sumi_c, 8 * kk);
       float term = 0.0f;
@@ -794,11 +809,15 @@ __device__ inline void KQuantGemvMmvqRow(OutT* __restrict__ out,
       if ((sbk & 31) == lane) partial += P;
     }
   }
-#pragma unroll
   for (int off = 16; off > 0; off >>= 1) partial += __shfl_down_sync(0xffffffffULL, partial, off);
   if (lane == 0) {
-    if constexpr (sizeof(OutT) == 4) out[j] = partial;
-    else out[j] = DF32ToBF16(partial);
+    if (partial_dst != nullptr) {
+      partial_dst[j * partial_stride + split_id] = partial;
+    } else if constexpr (sizeof(OutT) == 4) {
+      out[j] = partial;
+    } else {
+      out[j] = DF32ToBF16(partial);
+    }
   }
 }
 
@@ -814,6 +833,61 @@ __global__ void KQuantGemvMmvqK(OutT* __restrict__ out,
       weight + static_cast<size_t>(j) * static_cast<size_t>(nsb) * w_block_bytes;
   KQuantGemvMmvqRow<OutT, Fmt>(out, w_row, act, j, static_cast<int>(threadIdx.x),
                                nsb, w_block_bytes);
+}
+// --- T37 (GFX1100-TG200): split-K decode GEMV ------------------------------
+//
+// The MMVQ arm hands one warp to a whole output row, so an n=2560 launch is
+// 320 blocks of 8 warps while the device holds several times that in
+// concurrent warps; the trace prices these shapes at 26-54% of achievable
+// weight bandwidth (attn_output-Q6K 26%, attn_gate 44%, ssm_out 54%;
+// gate_up, the one shape whose grid fills the device, runs 57%; lm_head
+// 99%). VT_GEMV_SPLITK=S partitions each row's super-blocks across S warps
+// (S contiguous ranges, the SAME per-super-block term construction and
+// per-lane ascending order), writes S float partials to the graph-safe
+// quant scratch, and a small reduce kernel folds them in ASCENDING split
+// order — deterministic across replays (no data atomics). The cross-lane
+// tree plus the cross-split combine differ from the baseline's single-warp
+// tree, so this is a REDUCTION-ORDER lever: near-tie adjudication
+// (tools/tg200-neartie.sh) before its engine A/B counts.
+template <typename OutT, int Fmt>
+__global__ void KQuantGemvMmvqSplitKK(float* __restrict__ partials,
+                                      const uint8_t* __restrict__ weight,
+                                      const BlockQ8_K* __restrict__ act,
+                                      int64_t n, int64_t nsb, int split,
+                                      size_t w_block_bytes) {
+  const int64_t w =
+      static_cast<int64_t>(blockIdx.x) * blockDim.y + threadIdx.y;
+  const int64_t total = n * split;
+  if (w >= total) return;
+  const int64_t j = w / split;
+  const int sid = static_cast<int>(w % split);
+  const int64_t per = (nsb + split - 1) / split;
+  const int64_t s0 = static_cast<int64_t>(sid) * per;
+  const int64_t s1 = (s0 + per) < nsb ? (s0 + per) : nsb;
+  if (s0 >= nsb) {
+    if (threadIdx.x == 0) partials[j * split + sid] = 0.0f;
+    return;
+  }
+  const uint8_t* w_row =
+      weight + static_cast<size_t>(j) * static_cast<size_t>(nsb) * w_block_bytes;
+  // Dummy OutT pointer: the partial path never touches `out`.
+  KQuantGemvMmvqRow<OutT, Fmt>(nullptr, w_row, act, j,
+                               static_cast<int>(threadIdx.x), nsb,
+                               w_block_bytes, s0, s1, partials, sid, split);
+}
+
+// Fold the S per-row partials in ascending split order (deterministic).
+template <typename OutT>
+__global__ void KQuantGemvSplitKReduceK(OutT* __restrict__ out,
+                                        const float* __restrict__ partials,
+                                        int64_t n, int split) {
+  const int64_t j =
+      static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (j >= n) return;
+  float acc = 0.0f;
+  for (int sid = 0; sid < split; ++sid) acc += partials[j * split + sid];
+  if constexpr (sizeof(OutT) == 4) out[j] = acc;
+  else out[j] = DF32ToBF16(acc);
 }
 
 // Fused-prologue variant (the operator-steered shape of the arm): the block
@@ -1143,9 +1217,60 @@ void MatmulBTQuantKernelRocm(Queue& q, Tensor& out, const Tensor& a, const Tenso
     auto launch_mvq = [&](auto ot, BlockQ8_K* qact) {
       using OutT = decltype(ot);
       auto* o = static_cast<OutT*>(out.data);
-      constexpr int kGemvWarps = 8;
-      const int64_t ggrid = (n + kGemvWarps - 1) / kGemvWarps;
-      dim3 gblock(32, kGemvWarps);
+      // T37 (GFX1100-TG200): decode-GEMV geometry knobs, read PER CALL
+      // (sibling convention) so in-process benches and graph capture pick
+      // them up at dispatch time. VT_GEMV_WARPS: warps per block (default
+      // 8, allowed 1..8) — pure launch geometry, per-row math unchanged,
+      // outputs bit-identical. VT_GEMV_SPLITK: split-K factor (2..32,
+      // default 1 = off) on the non-fused arm — reduction-order change,
+      // adjudicated by tools/tg200-neartie.sh before its A/B counts.
+      int gemv_warps = 8;
+      if (const char* we = std::getenv("VT_GEMV_WARPS")) {
+        const int v = std::atoi(we);
+        if (v >= 1 && v <= 8) gemv_warps = v;
+      }
+      int gemv_split = 1;
+      if (const char* se = std::getenv("VT_GEMV_SPLITK")) {
+        const int v = std::atoi(se);
+        const int cap = nsb < 32 ? static_cast<int>(nsb) : 32;
+        if (v >= 2 && cap >= 2) gemv_split = v > cap ? cap : v;
+      }
+      if (!gemv_fused && gemv_split > 1) {
+        // Split-K: S contiguous super-block ranges per row; S float
+        // partials into the graph-safe scratch; ascending-order reduce.
+        float* partials = static_cast<float*>(EnsureQuantScratch(
+            static_cast<size_t>(n) * static_cast<size_t>(gemv_split) *
+                sizeof(float),
+            s));
+        const int64_t sgrid = (n * gemv_split + 7) / 8;
+        dim3 sblock(32, 8);
+        if (fmt == 2)
+          KQuantGemvMmvqSplitKK<OutT, 2><<<static_cast<unsigned>(sgrid),
+                                           sblock, 0, s>>>(
+              partials, w, qact, n, nsb, gemv_split, w_block_bytes);
+        else if (fmt == 1)
+          KQuantGemvMmvqSplitKK<OutT, 1><<<static_cast<unsigned>(sgrid),
+                                           sblock, 0, s>>>(
+              partials, w, qact, n, nsb, gemv_split, w_block_bytes);
+        else
+          KQuantGemvMmvqSplitKK<OutT, 0><<<static_cast<unsigned>(sgrid),
+                                           sblock, 0, s>>>(
+              partials, w, qact, n, nsb, gemv_split, w_block_bytes);
+        Check(hipGetLastError(), "K-quant gemv splitk");
+        const unsigned rgrid = static_cast<unsigned>((n + 127) / 128);
+        if constexpr (sizeof(OutT) == 4)
+          KQuantGemvSplitKReduceK<float>
+              <<<rgrid, 128, 0, s>>>(static_cast<float*>(out.data), partials,
+                                     n, gemv_split);
+        else
+          KQuantGemvSplitKReduceK<uint16_t>
+              <<<rgrid, 128, 0, s>>>(static_cast<uint16_t*>(out.data),
+                                     partials, n, gemv_split);
+        Check(hipGetLastError(), "K-quant gemv splitk reduce");
+        return;
+      }
+      const int64_t ggrid = (n + gemv_warps - 1) / gemv_warps;
+      dim3 gblock(32, gemv_warps);
       if (gemv_fused) {
         const size_t lds_bytes = static_cast<size_t>(nsb) * sizeof(BlockQ8_K);
         if (fmt == 2)
