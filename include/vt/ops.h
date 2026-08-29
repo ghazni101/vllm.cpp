@@ -629,6 +629,31 @@ enum class OpId : uint8_t {
   // Appended before kCount so no existing op's id shifts.
   kQwen4ExpQsaCompress,
   kQwen4ExpQsaGatherAttention,
+  // MODEL-MM-QWEN4-EXP W5d-1 (#2249 item 1) — the UNGATED per-group RMS norm.
+  // A SIBLING of kRmsNorm and of kRmsNormGatedGroup, and neither of those two
+  // can stand in for it: `kRmsNorm` reduces over the WHOLE row and has no
+  // group_size, `kRmsNormGated`/`kRmsNormGatedQuantFp8` fold a gate in, and
+  // `kRmsNormGatedGroup` groups correctly but always multiplies by
+  // `silu(gate)` first, so there is no way to ask any of them for a plain
+  // grouped norm. The only grouped reduction this tree had was FUSED inside
+  // `kQwen4ExpGatedResidual` and could not be called on its own, which is the
+  // gap `include/vt/ops.h` states in its own words at the kQwen4ExpGatedResidual
+  // comment above ("There is no ungated per-group RMS norm").
+  //
+  // Adding `group_size` to `RmsNormArgs` instead was REJECTED, and the reason is
+  // the silent-wrong-answer shape this row keeps meeting. `kRmsNorm` is
+  // registered on five backends; a new field on its args struct is ignored by
+  // every kernel that is not taught to read it, so a CUDA or Metal caller would
+  // get a whole-row norm back from a grouped request, with no crash and no
+  // refusal. A separate OpId cannot do that: an unregistered device refuses BY
+  // NAME. `kRmsNormGatedGroup` is the in-tree precedent for exactly this split
+  // ("SIBLING of RmsNormGatedArgs, not a mode of it").
+  //
+  // Registered on kCPU only (src/vt/cpu/cpu_ops.cpp). The CUDA arm is OWED, not
+  // written: it cannot be gated on a CPU-only host, and an ungated kernel is
+  // worse than an absent one — the same call W5b-3 and W5b-4 made.
+  // Appended before kCount so no existing op's id shifts.
+  kRmsNormGroup,
   kCount
 };
 
