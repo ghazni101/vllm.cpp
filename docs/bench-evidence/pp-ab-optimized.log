@@ -1,0 +1,496 @@
+=== PP A/B: OPTIMIZED (8e1af38fc) ===
+Model: /home/ghazni/models/vllm.cpp/Qwen3.5-4B-Q4_K_M.gguf
+Date: 2026-08-30T10:18:26Z
+
+--- PP 28 ---
+  Run 1:
+vllm-bench: /home/ghazni/models/vllm.cpp/Qwen3.5-4B-Q4_K_M.gguf engine | num_prompts=5 input_len=28 output_len=1 concurrency=1 seed=42 temp=0.00 dataset=generated
+INFO auto-fit max_model_len: reduced from 262144 to 8192 to fit the KV cache (256 blocks x 32 tokens). Raise --num-blocks / --kv-cache-memory for a longer context.
+vllm.cpp: Asynchronous scheduling is disabled (max_concurrent_batches=1)
+
+============= vllm.cpp Benchmark Result =============
+Engine frontend:                           AsyncLLM    
+Async scheduling enabled:                  0           
+Pretokenized prompt admission:             1           
+Maximum concurrent batches:                1           
+Successful requests:                       5           
+Maximum request concurrency:               1           
+Benchmark duration (s):                    0.90        
+Total input tokens:                        143         
+Total generated tokens:                    5           
+Request throughput (req/s):                5.58        
+Output token throughput (tok/s):           5.58        
+Total token throughput (tok/s):            165.28      
+-------- Time to First Token --------
+Mean TTFT (ms):                            179.09      
+Median TTFT (ms):                          104.87      
+P99 TTFT (ms):                             463.79      
+-------- Time per Output Token (excl. 1st token) --------
+Mean TPOT (ms):                            0.00        
+Median TPOT (ms):                          0.00        
+P99 TPOT (ms):                             0.00        
+-------- Inter-token Latency --------
+Mean ITL (ms):                             0.00        
+Median ITL (ms):                           0.00        
+P99 ITL (ms):                              0.00        
+-------- End-to-end Latency --------
+Mean E2EL (ms):                            179.09      
+Median E2EL (ms):                          104.87      
+P99 E2EL (ms):                             463.79      
+-------- Prefill vs Decode split (gate #1) --------
+Input token throughput (tok/s, over whole run): 159.70      
+Prefill token throughput (tok/s, in/TTFT): 159.70      
+Output (decode) token throughput (tok/s):  5.58        
+Mean per-stream decode rate (tok/s):       0.00        
+====================================================
+  Run 2:
+vllm-bench: /home/ghazni/models/vllm.cpp/Qwen3.5-4B-Q4_K_M.gguf engine | num_prompts=5 input_len=28 output_len=1 concurrency=1 seed=42 temp=0.00 dataset=generated
+INFO auto-fit max_model_len: reduced from 262144 to 8192 to fit the KV cache (256 blocks x 32 tokens). Raise --num-blocks / --kv-cache-memory for a longer context.
+vllm.cpp: Asynchronous scheduling is disabled (max_concurrent_batches=1)
+
+============= vllm.cpp Benchmark Result =============
+Engine frontend:                           AsyncLLM    
+Async scheduling enabled:                  0           
+Pretokenized prompt admission:             1           
+Maximum concurrent batches:                1           
+Successful requests:                       5           
+Maximum request concurrency:               1           
+Benchmark duration (s):                    0.87        
+Total input tokens:                        143         
+Total generated tokens:                    5           
+Request throughput (req/s):                5.73        
+Output token throughput (tok/s):           5.73        
+Total token throughput (tok/s):            169.48      
+-------- Time to First Token --------
+Mean TTFT (ms):                            174.66      
+Median TTFT (ms):                          104.66      
+P99 TTFT (ms):                             443.97      
+-------- Time per Output Token (excl. 1st token) --------
+Mean TPOT (ms):                            0.00        
+Median TPOT (ms):                          0.00        
+P99 TPOT (ms):                             0.00        
+-------- Inter-token Latency --------
+Mean ITL (ms):                             0.00        
+Median ITL (ms):                           0.00        
+P99 ITL (ms):                              0.00        
+-------- End-to-end Latency --------
+Mean E2EL (ms):                            174.66      
+Median E2EL (ms):                          104.66      
+P99 E2EL (ms):                             443.97      
+-------- Prefill vs Decode split (gate #1) --------
+Input token throughput (tok/s, over whole run): 163.75      
+Prefill token throughput (tok/s, in/TTFT): 163.75      
+Output (decode) token throughput (tok/s):  5.73        
+Mean per-stream decode rate (tok/s):       0.00        
+====================================================
+
+--- PP 57 ---
+  Run 1:
+vllm-bench: /home/ghazni/models/vllm.cpp/Qwen3.5-4B-Q4_K_M.gguf engine | num_prompts=5 input_len=57 output_len=1 concurrency=1 seed=42 temp=0.00 dataset=generated
+INFO auto-fit max_model_len: reduced from 262144 to 8192 to fit the KV cache (256 blocks x 32 tokens). Raise --num-blocks / --kv-cache-memory for a longer context.
+vllm.cpp: Asynchronous scheduling is disabled (max_concurrent_batches=1)
+
+============= vllm.cpp Benchmark Result =============
+Engine frontend:                           AsyncLLM    
+Async scheduling enabled:                  0           
+Pretokenized prompt admission:             1           
+Maximum concurrent batches:                1           
+Successful requests:                       5           
+Maximum request concurrency:               1           
+Benchmark duration (s):                    1.29        
+Total input tokens:                        287         
+Total generated tokens:                    5           
+Request throughput (req/s):                3.87        
+Output token throughput (tok/s):           3.87        
+Total token throughput (tok/s):            226.19      
+-------- Time to First Token --------
+Mean TTFT (ms):                            258.18      
+Median TTFT (ms):                          191.82      
+P99 TTFT (ms):                             511.49      
+-------- Time per Output Token (excl. 1st token) --------
+Mean TPOT (ms):                            0.00        
+Median TPOT (ms):                          0.00        
+P99 TPOT (ms):                             0.00        
+-------- Inter-token Latency --------
+Mean ITL (ms):                             0.00        
+Median ITL (ms):                           0.00        
+P99 ITL (ms):                              0.00        
+-------- End-to-end Latency --------
+Mean E2EL (ms):                            258.18      
+Median E2EL (ms):                          191.82      
+P99 E2EL (ms):                             511.49      
+-------- Prefill vs Decode split (gate #1) --------
+Input token throughput (tok/s, over whole run): 222.32      
+Prefill token throughput (tok/s, in/TTFT): 222.32      
+Output (decode) token throughput (tok/s):  3.87        
+Mean per-stream decode rate (tok/s):       0.00        
+====================================================
+  Run 2:
+vllm-bench: /home/ghazni/models/vllm.cpp/Qwen3.5-4B-Q4_K_M.gguf engine | num_prompts=5 input_len=57 output_len=1 concurrency=1 seed=42 temp=0.00 dataset=generated
+INFO auto-fit max_model_len: reduced from 262144 to 8192 to fit the KV cache (256 blocks x 32 tokens). Raise --num-blocks / --kv-cache-memory for a longer context.
+vllm.cpp: Asynchronous scheduling is disabled (max_concurrent_batches=1)
+
+============= vllm.cpp Benchmark Result =============
+Engine frontend:                           AsyncLLM    
+Async scheduling enabled:                  0           
+Pretokenized prompt admission:             1           
+Maximum concurrent batches:                1           
+Successful requests:                       5           
+Maximum request concurrency:               1           
+Benchmark duration (s):                    1.29        
+Total input tokens:                        287         
+Total generated tokens:                    5           
+Request throughput (req/s):                3.87        
+Output token throughput (tok/s):           3.87        
+Total token throughput (tok/s):            226.09      
+-------- Time to First Token --------
+Mean TTFT (ms):                            258.30      
+Median TTFT (ms):                          191.50      
+P99 TTFT (ms):                             513.91      
+-------- Time per Output Token (excl. 1st token) --------
+Mean TPOT (ms):                            0.00        
+Median TPOT (ms):                          0.00        
+P99 TPOT (ms):                             0.00        
+-------- Inter-token Latency --------
+Mean ITL (ms):                             0.00        
+Median ITL (ms):                           0.00        
+P99 ITL (ms):                              0.00        
+-------- End-to-end Latency --------
+Mean E2EL (ms):                            258.30      
+Median E2EL (ms):                          191.50      
+P99 E2EL (ms):                             513.91      
+-------- Prefill vs Decode split (gate #1) --------
+Input token throughput (tok/s, over whole run): 222.22      
+Prefill token throughput (tok/s, in/TTFT): 222.22      
+Output (decode) token throughput (tok/s):  3.87        
+Mean per-stream decode rate (tok/s):       0.00        
+====================================================
+
+--- PP 114 ---
+  Run 1:
+vllm-bench: /home/ghazni/models/vllm.cpp/Qwen3.5-4B-Q4_K_M.gguf engine | num_prompts=5 input_len=114 output_len=1 concurrency=1 seed=42 temp=0.00 dataset=generated
+INFO auto-fit max_model_len: reduced from 262144 to 8192 to fit the KV cache (256 blocks x 32 tokens). Raise --num-blocks / --kv-cache-memory for a longer context.
+vllm.cpp: Asynchronous scheduling is disabled (max_concurrent_batches=1)
+
+============= vllm.cpp Benchmark Result =============
+Engine frontend:                           AsyncLLM    
+Async scheduling enabled:                  0           
+Pretokenized prompt admission:             1           
+Maximum concurrent batches:                1           
+Successful requests:                       5           
+Maximum request concurrency:               1           
+Benchmark duration (s):                    2.16        
+Total input tokens:                        570         
+Total generated tokens:                    5           
+Request throughput (req/s):                2.32        
+Output token throughput (tok/s):           2.32        
+Total token throughput (tok/s):            266.42      
+-------- Time to First Token --------
+Mean TTFT (ms):                            431.65      
+Median TTFT (ms):                          368.96      
+P99 TTFT (ms):                             670.72      
+-------- Time per Output Token (excl. 1st token) --------
+Mean TPOT (ms):                            0.00        
+Median TPOT (ms):                          0.00        
+P99 TPOT (ms):                             0.00        
+-------- Inter-token Latency --------
+Mean ITL (ms):                             0.00        
+Median ITL (ms):                           0.00        
+P99 ITL (ms):                              0.00        
+-------- End-to-end Latency --------
+Mean E2EL (ms):                            431.65      
+Median E2EL (ms):                          368.96      
+P99 E2EL (ms):                             670.72      
+-------- Prefill vs Decode split (gate #1) --------
+Input token throughput (tok/s, over whole run): 264.10      
+Prefill token throughput (tok/s, in/TTFT): 264.11      
+Output (decode) token throughput (tok/s):  2.32        
+Mean per-stream decode rate (tok/s):       0.00        
+====================================================
+  Run 2:
+vllm-bench: /home/ghazni/models/vllm.cpp/Qwen3.5-4B-Q4_K_M.gguf engine | num_prompts=5 input_len=114 output_len=1 concurrency=1 seed=42 temp=0.00 dataset=generated
+INFO auto-fit max_model_len: reduced from 262144 to 8192 to fit the KV cache (256 blocks x 32 tokens). Raise --num-blocks / --kv-cache-memory for a longer context.
+vllm.cpp: Asynchronous scheduling is disabled (max_concurrent_batches=1)
+
+============= vllm.cpp Benchmark Result =============
+Engine frontend:                           AsyncLLM    
+Async scheduling enabled:                  0           
+Pretokenized prompt admission:             1           
+Maximum concurrent batches:                1           
+Successful requests:                       5           
+Maximum request concurrency:               1           
+Benchmark duration (s):                    2.16        
+Total input tokens:                        570         
+Total generated tokens:                    5           
+Request throughput (req/s):                2.32        
+Output token throughput (tok/s):           2.32        
+Total token throughput (tok/s):            266.42      
+-------- Time to First Token --------
+Mean TTFT (ms):                            431.65      
+Median TTFT (ms):                          368.37      
+P99 TTFT (ms):                             674.83      
+-------- Time per Output Token (excl. 1st token) --------
+Mean TPOT (ms):                            0.00        
+Median TPOT (ms):                          0.00        
+P99 TPOT (ms):                             0.00        
+-------- Inter-token Latency --------
+Mean ITL (ms):                             0.00        
+Median ITL (ms):                           0.00        
+P99 ITL (ms):                              0.00        
+-------- End-to-end Latency --------
+Mean E2EL (ms):                            431.65      
+Median E2EL (ms):                          368.37      
+P99 E2EL (ms):                             674.83      
+-------- Prefill vs Decode split (gate #1) --------
+Input token throughput (tok/s, over whole run): 264.10      
+Prefill token throughput (tok/s, in/TTFT): 264.10      
+Output (decode) token throughput (tok/s):  2.32        
+Mean per-stream decode rate (tok/s):       0.00        
+====================================================
+
+--- PP 228 ---
+  Run 1:
+vllm-bench: /home/ghazni/models/vllm.cpp/Qwen3.5-4B-Q4_K_M.gguf engine | num_prompts=5 input_len=228 output_len=1 concurrency=1 seed=42 temp=0.00 dataset=generated
+INFO auto-fit max_model_len: reduced from 262144 to 8192 to fit the KV cache (256 blocks x 32 tokens). Raise --num-blocks / --kv-cache-memory for a longer context.
+vllm.cpp: Asynchronous scheduling is disabled (max_concurrent_batches=1)
+
+============= vllm.cpp Benchmark Result =============
+Engine frontend:                           AsyncLLM    
+Async scheduling enabled:                  0           
+Pretokenized prompt admission:             1           
+Maximum concurrent batches:                1           
+Successful requests:                       5           
+Maximum request concurrency:               1           
+Benchmark duration (s):                    3.86        
+Total input tokens:                        1144        
+Total generated tokens:                    5           
+Request throughput (req/s):                1.30        
+Output token throughput (tok/s):           1.30        
+Total token throughput (tok/s):            297.75      
+-------- Time to First Token --------
+Mean TTFT (ms):                            771.78      
+Median TTFT (ms):                          713.21      
+P99 TTFT (ms):                             998.69      
+-------- Time per Output Token (excl. 1st token) --------
+Mean TPOT (ms):                            0.00        
+Median TPOT (ms):                          0.00        
+P99 TPOT (ms):                             0.00        
+-------- Inter-token Latency --------
+Mean ITL (ms):                             0.00        
+Median ITL (ms):                           0.00        
+P99 ITL (ms):                              0.00        
+-------- End-to-end Latency --------
+Mean E2EL (ms):                            771.78      
+Median E2EL (ms):                          713.22      
+P99 E2EL (ms):                             998.69      
+-------- Prefill vs Decode split (gate #1) --------
+Input token throughput (tok/s, over whole run): 296.46      
+Prefill token throughput (tok/s, in/TTFT): 296.46      
+Output (decode) token throughput (tok/s):  1.30        
+Mean per-stream decode rate (tok/s):       0.00        
+====================================================
+  Run 2:
+vllm-bench: /home/ghazni/models/vllm.cpp/Qwen3.5-4B-Q4_K_M.gguf engine | num_prompts=5 input_len=228 output_len=1 concurrency=1 seed=42 temp=0.00 dataset=generated
+INFO auto-fit max_model_len: reduced from 262144 to 8192 to fit the KV cache (256 blocks x 32 tokens). Raise --num-blocks / --kv-cache-memory for a longer context.
+vllm.cpp: Asynchronous scheduling is disabled (max_concurrent_batches=1)
+
+============= vllm.cpp Benchmark Result =============
+Engine frontend:                           AsyncLLM    
+Async scheduling enabled:                  0           
+Pretokenized prompt admission:             1           
+Maximum concurrent batches:                1           
+Successful requests:                       5           
+Maximum request concurrency:               1           
+Benchmark duration (s):                    3.87        
+Total input tokens:                        1144        
+Total generated tokens:                    5           
+Request throughput (req/s):                1.29        
+Output token throughput (tok/s):           1.29        
+Total token throughput (tok/s):            297.25      
+-------- Time to First Token --------
+Mean TTFT (ms):                            773.09      
+Median TTFT (ms):                          715.28      
+P99 TTFT (ms):                             999.36      
+-------- Time per Output Token (excl. 1st token) --------
+Mean TPOT (ms):                            0.00        
+Median TPOT (ms):                          0.00        
+P99 TPOT (ms):                             0.00        
+-------- Inter-token Latency --------
+Mean ITL (ms):                             0.00        
+Median ITL (ms):                           0.00        
+P99 ITL (ms):                              0.00        
+-------- End-to-end Latency --------
+Mean E2EL (ms):                            773.09      
+Median E2EL (ms):                          715.28      
+P99 E2EL (ms):                             999.36      
+-------- Prefill vs Decode split (gate #1) --------
+Input token throughput (tok/s, over whole run): 295.95      
+Prefill token throughput (tok/s, in/TTFT): 295.95      
+Output (decode) token throughput (tok/s):  1.29        
+Mean per-stream decode rate (tok/s):       0.00        
+====================================================
+
+--- PP 911 ---
+  Run 1:
+vllm-bench: /home/ghazni/models/vllm.cpp/Qwen3.5-4B-Q4_K_M.gguf engine | num_prompts=5 input_len=911 output_len=1 concurrency=1 seed=42 temp=0.00 dataset=generated
+INFO auto-fit max_model_len: reduced from 262144 to 8192 to fit the KV cache (256 blocks x 32 tokens). Raise --num-blocks / --kv-cache-memory for a longer context.
+vllm.cpp: Asynchronous scheduling is disabled (max_concurrent_batches=1)
+
+============= vllm.cpp Benchmark Result =============
+Engine frontend:                           AsyncLLM    
+Async scheduling enabled:                  0           
+Pretokenized prompt admission:             1           
+Maximum concurrent batches:                1           
+Successful requests:                       5           
+Maximum request concurrency:               1           
+Benchmark duration (s):                    14.19       
+Total input tokens:                        4558        
+Total generated tokens:                    5           
+Request throughput (req/s):                0.35        
+Output token throughput (tok/s):           0.35        
+Total token throughput (tok/s):            321.50      
+-------- Time to First Token --------
+Mean TTFT (ms):                            2838.54     
+Median TTFT (ms):                          2787.05     
+P99 TTFT (ms):                             3044.05     
+-------- Time per Output Token (excl. 1st token) --------
+Mean TPOT (ms):                            0.00        
+Median TPOT (ms):                          0.00        
+P99 TPOT (ms):                             0.00        
+-------- Inter-token Latency --------
+Mean ITL (ms):                             0.00        
+Median ITL (ms):                           0.00        
+P99 ITL (ms):                              0.00        
+-------- End-to-end Latency --------
+Mean E2EL (ms):                            2838.54     
+Median E2EL (ms):                          2787.05     
+P99 E2EL (ms):                             3044.05     
+-------- Prefill vs Decode split (gate #1) --------
+Input token throughput (tok/s, over whole run): 321.15      
+Prefill token throughput (tok/s, in/TTFT): 321.15      
+Output (decode) token throughput (tok/s):  0.35        
+Mean per-stream decode rate (tok/s):       0.00        
+====================================================
+  Run 2:
+vllm-bench: /home/ghazni/models/vllm.cpp/Qwen3.5-4B-Q4_K_M.gguf engine | num_prompts=5 input_len=911 output_len=1 concurrency=1 seed=42 temp=0.00 dataset=generated
+INFO auto-fit max_model_len: reduced from 262144 to 8192 to fit the KV cache (256 blocks x 32 tokens). Raise --num-blocks / --kv-cache-memory for a longer context.
+vllm.cpp: Asynchronous scheduling is disabled (max_concurrent_batches=1)
+
+============= vllm.cpp Benchmark Result =============
+Engine frontend:                           AsyncLLM    
+Async scheduling enabled:                  0           
+Pretokenized prompt admission:             1           
+Maximum concurrent batches:                1           
+Successful requests:                       5           
+Maximum request concurrency:               1           
+Benchmark duration (s):                    14.25       
+Total input tokens:                        4558        
+Total generated tokens:                    5           
+Request throughput (req/s):                0.35        
+Output token throughput (tok/s):           0.35        
+Total token throughput (tok/s):            320.26      
+-------- Time to First Token --------
+Mean TTFT (ms):                            2849.56     
+Median TTFT (ms):                          2798.54     
+P99 TTFT (ms):                             3055.03     
+-------- Time per Output Token (excl. 1st token) --------
+Mean TPOT (ms):                            0.00        
+Median TPOT (ms):                          0.00        
+P99 TPOT (ms):                             0.00        
+-------- Inter-token Latency --------
+Mean ITL (ms):                             0.00        
+Median ITL (ms):                           0.00        
+P99 ITL (ms):                              0.00        
+-------- End-to-end Latency --------
+Mean E2EL (ms):                            2849.56     
+Median E2EL (ms):                          2798.54     
+P99 E2EL (ms):                             3055.03     
+-------- Prefill vs Decode split (gate #1) --------
+Input token throughput (tok/s, over whole run): 319.91      
+Prefill token throughput (tok/s, in/TTFT): 319.91      
+Output (decode) token throughput (tok/s):  0.35        
+Mean per-stream decode rate (tok/s):       0.00        
+====================================================
+
+--- PP 1821 ---
+  Run 1:
+vllm-bench: /home/ghazni/models/vllm.cpp/Qwen3.5-4B-Q4_K_M.gguf engine | num_prompts=5 input_len=1821 output_len=1 concurrency=1 seed=42 temp=0.00 dataset=generated
+INFO auto-fit max_model_len: reduced from 262144 to 8192 to fit the KV cache (256 blocks x 32 tokens). Raise --num-blocks / --kv-cache-memory for a longer context.
+vllm.cpp: Asynchronous scheduling is disabled (max_concurrent_batches=1)
+
+============= vllm.cpp Benchmark Result =============
+Engine frontend:                           AsyncLLM    
+Async scheduling enabled:                  0           
+Pretokenized prompt admission:             1           
+Maximum concurrent batches:                1           
+Successful requests:                       5           
+Maximum request concurrency:               1           
+Benchmark duration (s):                    28.77       
+Total input tokens:                        9109        
+Total generated tokens:                    5           
+Request throughput (req/s):                0.17        
+Output token throughput (tok/s):           0.17        
+Total token throughput (tok/s):            316.83      
+-------- Time to First Token --------
+Mean TTFT (ms):                            5753.20     
+Median TTFT (ms):                          5705.44     
+P99 TTFT (ms):                             5946.33     
+-------- Time per Output Token (excl. 1st token) --------
+Mean TPOT (ms):                            0.00        
+Median TPOT (ms):                          0.00        
+P99 TPOT (ms):                             0.00        
+-------- Inter-token Latency --------
+Mean ITL (ms):                             0.00        
+Median ITL (ms):                           0.00        
+P99 ITL (ms):                              0.00        
+-------- End-to-end Latency --------
+Mean E2EL (ms):                            5753.20     
+Median E2EL (ms):                          5705.44     
+P99 E2EL (ms):                             5946.33     
+-------- Prefill vs Decode split (gate #1) --------
+Input token throughput (tok/s, over whole run): 316.66      
+Prefill token throughput (tok/s, in/TTFT): 316.66      
+Output (decode) token throughput (tok/s):  0.17        
+Mean per-stream decode rate (tok/s):       0.00        
+====================================================
+  Run 2:
+vllm-bench: /home/ghazni/models/vllm.cpp/Qwen3.5-4B-Q4_K_M.gguf engine | num_prompts=5 input_len=1821 output_len=1 concurrency=1 seed=42 temp=0.00 dataset=generated
+INFO auto-fit max_model_len: reduced from 262144 to 8192 to fit the KV cache (256 blocks x 32 tokens). Raise --num-blocks / --kv-cache-memory for a longer context.
+vllm.cpp: Asynchronous scheduling is disabled (max_concurrent_batches=1)
+
+============= vllm.cpp Benchmark Result =============
+Engine frontend:                           AsyncLLM    
+Async scheduling enabled:                  0           
+Pretokenized prompt admission:             1           
+Maximum concurrent batches:                1           
+Successful requests:                       5           
+Maximum request concurrency:               1           
+Benchmark duration (s):                    28.78       
+Total input tokens:                        9109        
+Total generated tokens:                    5           
+Request throughput (req/s):                0.17        
+Output token throughput (tok/s):           0.17        
+Total token throughput (tok/s):            316.72      
+-------- Time to First Token --------
+Mean TTFT (ms):                            5755.29     
+Median TTFT (ms):                          5706.11     
+P99 TTFT (ms):                             5953.31     
+-------- Time per Output Token (excl. 1st token) --------
+Mean TPOT (ms):                            0.00        
+Median TPOT (ms):                          0.00        
+P99 TPOT (ms):                             0.00        
+-------- Inter-token Latency --------
+Mean ITL (ms):                             0.00        
+Median ITL (ms):                           0.00        
+P99 ITL (ms):                              0.00        
+-------- End-to-end Latency --------
+Mean E2EL (ms):                            5755.29     
+Median E2EL (ms):                          5706.11     
+P99 E2EL (ms):                             5953.31     
+-------- Prefill vs Decode split (gate #1) --------
+Input token throughput (tok/s, over whole run): 316.54      
+Prefill token throughput (tok/s, in/TTFT): 316.54      
+Output (decode) token throughput (tok/s):  0.17        
+Mean per-stream decode rate (tok/s):       0.00        
+====================================================
+
