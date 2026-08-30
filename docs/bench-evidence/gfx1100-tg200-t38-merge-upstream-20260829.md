@@ -54,6 +54,27 @@ Build: `cmake --build build-hip-docker -j 16 -- -k 0` in-container over
 passed. Both reds are the documented pre-existing set, now traced to their
 upstream origin rather than assumed.
 
+`ctest -R 'cross_device' --output-on-failure`: 2 tests, 1 passed, 1 failed:
+
+- `test_backend_cross_device_vt_attn_decode_d128`: PASSED.
+- `test_backend_cross_device`: 24/26 cases, 5/80253 assertions failed. Two
+  cases fail, both PRE-EXISTING campaign bugs (not merge regressions):
+  verified by building and running the pre-merge head `8e2f56cb1` in a
+  fresh worktree — identical result (24/26, 5 assertions). The campaign's
+  focused gate `ctest -R 'rocm|quant'` never included `cross_device`, so
+  these were never run before.
+  - `MoeSiluMul` bf16 exact-equality (`test_backend_cross_device.cpp:2067`):
+    GPU bf16 output != CPU oracle bf16. The campaign added the ROCm
+    `MoeSiluMulKernelRocm` in `rocm_moe_router.hip`; the rounding differs.
+  - `decode-skinny MatmulBT (wvSplitK path)` sentinel check
+    (`test_backend_cross_device.cpp:2231`): the wvSplitK kernel writes past
+    M*N elements for shape `{tok=2, k=256, feat=254}` (the "even below bound:
+    takes skinny" case). `got[i] == 0xBD44` instead of `0xDEAD` — the
+    campaign's YTILE=2 default overwrites the guard band. The float-tolerance
+    check at `:2227` also fails for the same shape.
+  These are owed a fix in a separate unit of work (issue needed per
+  AGENTS.md). The merge introduced zero new failures.
+
 ## Acceptance identity (the row's own token gate)
 
 Command: `build-hip-docker/examples/vllm-cli --model
@@ -73,14 +94,46 @@ tools/tg200-prompt.txt)" --max-tokens 256 --temperature 0 --seed 0
   OBSERVATION, not a claim — it owes a clean idle-window A/B before any
   attribution (candidate: upstream decode-path changes riding the merge).
 
+## Near-tie adjudication (teacher-forced logprob band)
+
+Command: `tools/tg200-neartie.sh adjudicate @levers -- --model
+/models/vllm.cpp/Qwen3.5-4B-Q4_K_M.gguf --prompt-file
+/repo/tg200/tools/tg200-prompt.txt --ref-ids
+/repo/tg200/tools/tg200-reference.ids.i32 --json
+/repo/tg200/t50-postmerge-neartie.json --expect-md5
+a0fa1c4aa8cc5de086006111dad7a7bf --note "post-merge identity"`,
+container `rocm-dev:10.0.0`, HIP 7.15, gpu-ctl lock held.
+
+Result: **PASS** — `verdict=PASS divergent=0 over_band=0
+max_gap_mnats=0.000 body_md5=a0fa1c4a…`. No divergent positions
+(argmax == reference at every step). The teacher-forced walk of the
+256 reference ids under the merged build reproduces the body md5
+bit-for-bit. This is the per-step bit-exactness ceremony the 9
+non-bit-identical levers owe (`rocm-m4-oracle.md` band <= 500 mnats):
+all 15 adopted levers ON together, the reduction-order composite
+produces zero divergence from the reference. JSON:
+`t50-postmerge-neartie.json`.
+
 ## Verdict
 
 Correctness PASS: focused gates at the documented baseline, campaign
-reference byte-identical, branch synced to upstream tip `3015aad08` at
-`69bd0f035`. Owed upstream: the `test_placed_moe_roundtrip` /
-`RunMoeBlockPlaced` removal belongs on mudler/vllm.cpp, not here. Owed
-here: the record-anchor ratchet reads stale=29 vs baseline 28 — the
-identical stale set exists at the pre-merge head `8e2f56cb1`, so the
-merge added zero rot; the +1 predates this work and its owner owes the
-citation repair. `check-env-doc` was repaired in-flow by allowlisting
-the three TG200 tuning knobs.
+reference byte-identical, near-tie adjudication PASS (0 divergent, 0
+over band, max gap 0.000 mnats), branch synced to upstream tip
+`3015aad08` at `69bd0f035`. The 9 non-bit-identical levers are covered
+by the all-levers-ON near-tie: the reduction-order composite produces
+zero per-step divergence from the reference under the merged build.
+
+Owed upstream: the `test_placed_moe_roundtrip` / `RunMoeBlockPlaced`
+removal belongs on mudler/vllm.cpp, not here.
+
+Owed here (pre-existing, NOT merge regressions):
+- `test_backend_cross_device` 2 failing cases (MoeSiluMul bf16 rounding,
+  wvSplitK YTILE=2 OOB) — verified identical at pre-merge `8e2f56cb1`;
+  the campaign's focused gate never included `cross_device`. Needs an
+  issue and a separate fix unit.
+- record-anchor ratchet stale=29 vs baseline 28 — identical set at
+  `8e2f56cb1`; the +1 predates this work.
+
+Repaired in-flow: `check-env-doc` by allowlisting the three TG200
+tuning knobs; commit-trailer contract by rebuilding the 5 sync commits
+with the bare `FOLLOWING_AGENTS_PROTOCOL` paragraph.
