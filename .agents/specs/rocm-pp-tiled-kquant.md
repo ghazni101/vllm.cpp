@@ -1,4 +1,4 @@
-# ROCm gfx1100: weight-shared tiled KQuantGemmK for prefill
+# ROCm gfx1100: hardware Dp4a for KQuantGemmK (v_dot4_i32_iu8)
 
 - Issue: [#11](https://github.com/ghazni101/vllm.cpp/issues/11)
 - Row: `BACKEND-ROCM`
@@ -6,7 +6,8 @@
 
 ## Now
 
-`ACTIVE` — implementation phase.
+`DONE` — hardware Dp4a landed. The tiled kernel approach was tried first and
+rejected (31% slower — L2 already provides weight reuse; see `## Outcome`).
 
 ## Scope
 
@@ -170,8 +171,68 @@ One pull request (repository default). Spec committed before implementation.
 - If bit-exactness fails and cannot be restored by matching the accumulation order, stop and document the divergence.
 - If the kernel fails to compile or crashes at the production shapes, stop and debug before proceeding.
 
+## Outcome
+
+### Tiled kernel: REJECTED
+
+The weight-shared tiled kernel (`KQuantGemmKTiled`) was implemented and
+measured. It was **31% slower** than the baseline at both PP 228 and PP 1821:
+
+| PP | Base TTFT (ms) | Tiled TTFT (ms) | Ratio |
+|---|---|---|---|
+| 228 | 710 | 933 | 0.76x (slower) |
+| 1821 | 5662 | 7397 | 0.77x (slower) |
+
+Root cause: the gfx1100's 6 MB L2 cache already provides weight reuse across
+warps reading the same weight row. A Q4_K weight row for K=2560 is 1440 bytes
+(10 superblocks × 144 bytes). With 228 warps, the first warp loads it from
+global memory and the remaining 227 hit L2. The tiled kernel adds shared
+memory copy overhead (byte-by-byte loop) and `__syncthreads()` barriers
+without any benefit — the weight is already cached. The stop condition fired.
+
+### Hardware Dp4a: ADOPTED
+
+The actual bottleneck was **software Dp4a**: the `Dp4a` function did 4 int8
+multiplies + 4 adds in scalar instructions. Replacing it with the hardware
+`v_dot4_i32_iu8` instruction (`__ockl_sdot4`) collapses 8 scalar operations
+into 1 instruction. The change is a 6-line function body replacement — no
+kernel structure change, no shared memory, no synchronization.
+
+Bit-exactness: signed int8×int8→int32 dot product is exact in both hardware
+and software. The hardware instruction and the scalar expansion compute the
+same integer result. Verified: token IDs identical to baseline, NMSE ≤ 5e-4
+vs CPU oracle for all formats (Q4_K, Q5_K, Q6_K, Q8_0).
+
+A/B results (median of 2 runs, Qwen3.5-4B Q4_K_M, RX 7900 XTX, ROCm 7.15):
+
+| PP | Base TTFT (ms) | HW-Dp4a TTFT (ms) | Speedup | Base PT (tok/s) | HW-Dp4a PT (tok/s) | PT gain |
+|---|---|---|---|---|---|---|
+| 28 | 105.7 | 76.5 | 1.38x | 164.2 | 187.8 | 14.4% |
+| 64 | 221.7 | 158.0 | 1.40x | 224.4 | 286.8 | 27.8% |
+| 128 | 411.5 | 283.2 | 1.45x | 271.1 | 368.0 | 35.7% |
+| 228 | 713.7 | 482.5 | 1.48x | 295.0 | 419.4 | 42.2% |
+| 911 | 2790.0 | 1850.0 | 1.51x | 320.7 | 477.6 | 48.9% |
+| 1821 | 5692.0 | 3731.0 | 1.53x | 317.5 | 480.9 | 51.5% |
+
+The speedup grows with prompt length: 1.38x at PP 28 to 1.53x at PP 1821.
+At PP 1821, prefill throughput rises from 317.5 to 480.9 tok/s — a 51.5%
+gain from a 6-line change.
+
+The hardware instruction also benefits decode (m == 1), since `Dp4a` is
+called from the same `DotQ4K`/`DotQ5K`/`DotQ6K` functions used by both
+prefill and decode kernels.
+
+### What was rejected and why
+
+- **Weight-shared tiled kernel**: L2 cache already provides weight reuse.
+  Shared memory copy + sync adds overhead without benefit.
+- **MROWS sweep**: moot — the tiled kernel was rejected.
+- **Q6_K/Q5_K tiled variants**: moot — the tiled kernel was rejected.
+
 ## Owed
 
-- Q6_K and Q5_K tiled variants (after Q4_K lands and the improvement is confirmed)
-- CUDA port of the tiled kernel (separate row)
-- MROWS sweep (4, 8, 16) recorded in `## Outcome`
+- CUDA port of the hardware Dp4a (CUDA already has `__dp4a`; the ROCm path
+  was the only one using software Dp4a)
+- Decode A/B: the hardware Dp4a also speeds up decode, but the TG200 campaign
+  measured decode at ~103 tok/s with the software Dp4a. A re-measurement with
+  the hardware Dp4a may move the TG200 target.
