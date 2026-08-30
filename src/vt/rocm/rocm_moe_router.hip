@@ -24,16 +24,31 @@ __device__ inline void St(__hip_bfloat16* p, int64_t i, float v) {
 __device__ inline float Silu(float x) { return x / (1.0f + expf(-x)); }
 
 // kMoeSiluMul: out = silu(gate) * up, elementwise (CPU oracle
-// cpu_ops.cpp:448). The MoE-path companion op the router unblocks. Fully
+// cpu_ops.cpp:531-548). The MoE-path companion op the router unblocks. Fully
 // generic over the three f32/bf16 dtype slots — the live caller mixes them
 // (the first same-dtype guard fired on a real mix), and the CPU oracle's
 // LoadF32/StoreF32 are exactly this generic.
+//
+// The CPU oracle narrows silu(gate) to the GATE tensor's dtype BEFORE
+// multiplying by up (cpu_ops.cpp:545 `RoundThrough(in_dt, ...)`), matching
+// upstream's `silu_and_mul` which narrows the activation to the input dtype
+// before the multiply. The GPU kernel must do the same, or the bf16 arm
+// diverges from the CPU oracle on exact-equality checks.
 template <typename Tout, typename Tg, typename Tu>
 __global__ void MoeSiluMulK(Tout* out, const Tg* gate, const Tu* up, int64_t n) {
   const int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
   for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
        i < n; i += step) {
-    St(out, i, Silu(Ld(gate, i)) * Ld(up, i));
+    const float g = Ld(gate, i);
+    float silu = Silu(g);
+    // RoundThrough: narrow to gate's dtype, then widen back to f32. This is
+    // the intermediate rounding the CPU oracle does (cpu_ops.cpp:545). For
+    // f32 gate this is a no-op (the round-trip is exact); for bf16 gate it
+    // narrows to bf16 precision before the multiply, matching upstream.
+    if constexpr (std::is_same_v<Tg, __hip_bfloat16>) {
+      silu = __bfloat162float(__float2bfloat16(silu));
+    }
+    St(out, i, silu * Ld(up, i));
   }
 }
 
