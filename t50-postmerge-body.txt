@@ -1,0 +1,16 @@
+
+
+<think>
+Here's a thinking process that leads to the detailed explanation of Transformer Neural Networks:
+
+1.  **Deconstruct the Request:**
+    *   **Topic:** Transformer Neural Network (specifically focusing on the architecture and training/inference mechanics).
+    *   **Key Components to Cover:** Attention, Embeddings, Feed-Forward Layers, Layer Normalization, Residual Connections, Positional Encodings, Next-Token Prediction, Tokenization, Softmax, Depth, KV Caching, Quantization, Batching, Speculative Decoding, MoE Routing, RoPE, Flash Attention Tiling, Gradient Checkpointing, LR Warmup, Weight Decay, Dropout, Temperature Sampling.
+    *   **Requirement:** Detailed explanation with concrete numeric examples where useful.
+
+2.  **Structure the Explanation:**
+    A logical flow is essential for such a dense topic. I'll organize it into sections:
+    *   **Introduction:** What is a Transformer? (The Big Picture).
+    *   **Input Processing:** Tokenization & Embeddings.
+    *   **Core Architecture:** Encoder/Decoder blocks (Self-Attention, FFN, Norm, Residuals, Positional Encodings).
+    *   **Training Dynamics:**
