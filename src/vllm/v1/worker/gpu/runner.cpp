@@ -55,9 +55,10 @@
 
 // Device-agnostic dispatch for the combine/scatter/ops kernels. The CUDA and
 // ROCm backends expose identical signatures in vt::cuda and vt::rocm; this
-// dispatch compiles the right one in at build time. On a CPU-only build both
-// backends are absent and these are no-ops. No runtime device-type check: the
-// build is single-backend, so the #if selects unconditionally.
+// dispatch compiles the right one in at build time. On a CPU-only or Vulkan
+// build both backends are absent, so the whole block is guarded out to avoid
+// unused-parameter/unused-function errors under -Werror.
+#if defined(VLLM_CPP_CUDA) || defined(VLLM_CPP_HIP)
 namespace {
 void DispatchCombineSampledAndDraftTokens(
     vt::Queue& q, int32_t* input_ids, const int32_t* idx_mapping,
@@ -96,6 +97,7 @@ void DispatchApplyLastSampledOps(vt::Queue& q, int32_t* last_sampled_tokens,
 #endif
 }
 }  // namespace
+#endif  // VLLM_CPP_CUDA || VLLM_CPP_HIP
 
 namespace vllm::v1 {
 
