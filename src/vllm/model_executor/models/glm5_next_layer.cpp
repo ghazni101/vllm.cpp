@@ -2,8 +2,6 @@
 // See `glm5_next_layer.h` for the oracle, the port anchors and the manifold.
 #include "vllm/model_executor/models/glm5_next_layer.h"
 
-#include "vllm/model_executor/models/glm5_next_diag.h"
-
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
@@ -37,10 +35,11 @@ void RmsNorm(const float* in, const float* gamma, int64_t n, double eps,
   for (int64_t i = 0; i < n; ++i) out[i] = gamma[i] * (in[i] * inv);
 }
 
-}  // namespace
-
-// See the header: public so the weight bridge and the forward resolve ONE
-// geometry rather than two.
+// `Glm5NextTextKdaDims` from the resolved config. Every field is read from
+// `p.kda` and none is defaulted here: `linear_head_dim`, `linear_num_heads` and
+// `linear_conv_kernel_dim` all arrive through the `linear_attn_config`
+// sub-object under different spellings, and `gate_lower_bound`'s PRESENCE
+// selects the forget-gate formula (`glm5_next.h`).
 glm5_next_kda::Glm5NextKdaDims KdaDimsFrom(const Glm5NextParams& p) {
   glm5_next_kda::Glm5NextKdaDims d;
   d.hidden_size = p.hidden_size;
@@ -51,6 +50,8 @@ glm5_next_kda::Glm5NextKdaDims KdaDimsFrom(const Glm5NextParams& p) {
   d.gate_lower_bound = p.kda.lower_bound;
   return d;
 }
+
+}  // namespace
 
 std::vector<float> ExpandToHiddenStreams(const std::vector<float>& inputs_embeds,
                                          int64_t batch, int64_t seq_len,
@@ -140,23 +141,12 @@ DecoderLayerResult DecoderLayerForward(
                 static_cast<size_t>(H), collapsed.data() + t * H);
   }
 
-  if (diag::Level() > 1) {
-    const std::string tag = "L" + std::to_string(layer_idx) + " ";
-    diag::Stats((tag + "in.streams").c_str(), hidden_streams);
-    diag::Stats((tag + "mhc_pre.collapsed").c_str(), collapsed);
-  }
-
   // `self.input_layernorm(hidden_states)` (`:1296`) — applied AFTER the collapse
   // and as a separate module, which is why `glm5_next::MhcPre` deliberately does
   // not fold it (`glm5_next_mhc.h`).
   for (int64_t t = 0; t < tokens; ++t) {
     RmsNorm(collapsed.data() + t * H, w.input_layernorm.data(), H,
             p.rms_norm_eps, normed.data() + t * H);
-  }
-
-  if (diag::Level() > 1) {
-    diag::Stats(("L" + std::to_string(layer_idx) + " attn_norm.out").c_str(),
-                normed);
   }
 
   // ── the attention arm (`:1297-1315`) ──────────────────────────────────────
@@ -217,12 +207,6 @@ DecoderLayerResult DecoderLayerForward(
     }
   }
   RequireSize("attention output", attn_out.size(), tokens * H);
-  if (diag::Level() > 1) {
-    diag::Stats(("L" + std::to_string(layer_idx) + " attn.out (" +
-                 std::string(Glm5NextLayerKindName(w.attn_kind)) + ")")
-                    .c_str(),
-                attn_out);
-  }
 
   // ── the attention site's mHC post (`:1316-1318`) ──────────────────────────
   // `post.unsqueeze(-1) * hidden.unsqueeze(-2) + matmul(comb.transpose(-1,-2),
@@ -238,11 +222,6 @@ DecoderLayerResult DecoderLayerForward(
     RequireSize("mHC attention fold", mixed.size(), hc * H);
     std::copy_n(mixed.data(), static_cast<size_t>(hc * H),
                 streams.data() + t * hc * H);
-  }
-
-  if (diag::Level() > 1) {
-    diag::Stats(("L" + std::to_string(layer_idx) + " streams@attn_fold").c_str(),
-                streams);
   }
 
   // ── the feed-forward site's mHC pre (`:1320-1323`) ────────────────────────
@@ -269,14 +248,6 @@ DecoderLayerResult DecoderLayerForward(
     mlp_out = MoeForward(MoeDimsFrom(p), w.moe, normed, tokens, queue);
   }
   RequireSize("feed-forward output", mlp_out.size(), tokens * H);
-  if (diag::Level() > 1) {
-    diag::Stats(("L" + std::to_string(layer_idx) + " ffn_norm.out").c_str(),
-                normed);
-    diag::Stats(("L" + std::to_string(layer_idx) + " mlp.out (" +
-                 std::string(Glm5NextMlpKindName(w.mlp_kind)) + ")")
-                    .c_str(),
-                mlp_out);
-  }
 
   // ── the feed-forward site's mHC post (`:1325-1327`) ───────────────────────
   for (int64_t t = 0; t < tokens; ++t) {
@@ -294,44 +265,13 @@ DecoderLayerResult DecoderLayerForward(
   return res;
 }
 
-namespace {
-
-// The resident tower as a `LayerWeightSource`. It holds nothing of its own and
-// hands back a reference into the caller's `TextModelWeights`, so the resident
-// overload below is a delegation and not a copy.
-class ResidentLayerSource final : public LayerWeightSource {
- public:
-  explicit ResidentLayerSource(const TextModelWeights& w) : w_(&w) {}
-  int64_t size() const override { return static_cast<int64_t>(w_->layers.size()); }
-  const DecoderLayerWeights& Layer(int64_t i) override {
-    return w_->layers[static_cast<size_t>(i)];
-  }
-
- private:
-  const TextModelWeights* w_;
-};
-
-}  // namespace
-
 std::vector<float> TextModelForward(const TextModelWeights& w,
                                     const std::vector<float>& inputs_embeds,
                                     const std::vector<uint8_t>& mask,
                                     int64_t batch, int64_t seq_len,
                                     std::vector<LayerCache>* caches,
                                     vt::Queue& queue) {
-  ResidentLayerSource src(w);
-  return TextModelForward(w.params, w.norm, src, inputs_embeds, mask, batch,
-                          seq_len, caches, queue);
-}
-
-std::vector<float> TextModelForward(const Glm5NextParams& p,
-                                    const std::vector<float>& norm,
-                                    LayerWeightSource& layers,
-                                    const std::vector<float>& inputs_embeds,
-                                    const std::vector<uint8_t>& mask,
-                                    int64_t batch, int64_t seq_len,
-                                    std::vector<LayerCache>* caches,
-                                    vt::Queue& queue) {
+  const Glm5NextParams& p = w.params;
   const int64_t hc = p.mhc.mult;
   const int64_t H = p.hidden_size;
   const int64_t tokens = batch * seq_len;
@@ -341,14 +281,14 @@ std::vector<float> TextModelForward(const Glm5NextParams& p,
     Fail("attention_mask must hold " + std::to_string(tokens) + " entries, got " +
          std::to_string(mask.size()));
   }
-  RequireSize("model.norm", norm.size(), H);
+  RequireSize("model.norm", w.norm.size(), H);
 
   // `self.layers[: self.config.num_hidden_layers]` (`:1480`), checked rather
   // than sliced. `blk.45` of the published artifact is the MTP block and is NOT
   // a decoder layer: building it as a 46th would be a fluent wrong model that no
   // gate on this fleet could detect (`glm5_next_layer.h`, `glm5_next_loader.h`).
-  if (layers.size() != p.num_hidden_layers) {
-    Fail("the weight tower holds " + std::to_string(layers.size()) +
+  if (static_cast<int64_t>(w.layers.size()) != p.num_hidden_layers) {
+    Fail("the weight tower holds " + std::to_string(w.layers.size()) +
          " decoder layers but `num_hidden_layers` is " +
          std::to_string(p.num_hidden_layers) +
          ". On the published checkpoint the 46th block (`blk.45`) is the "
@@ -372,24 +312,13 @@ std::vector<float> TextModelForward(const Glm5NextParams& p,
   std::vector<int32_t> topk;
   int64_t topk_width = 0;
   for (int64_t i = 0; i < p.num_hidden_layers; ++i) {
-    // `Layer(i)` is valid only until the next call, so the layer's weights are
-    // consumed HERE and never retained — which is what makes a streaming source
-    // hold one layer rather than every layer visited so far.
     DecoderLayerResult r = DecoderLayerForward(
-        p, i, layers.Layer(i), streams, mask,
+        p, i, w.layers[static_cast<size_t>(i)], streams, mask,
         topk.empty() ? nullptr : &topk, topk_width, batch, seq_len,
         caches != nullptr ? &(*caches)[static_cast<size_t>(i)] : nullptr, queue);
     streams = std::move(r.hidden_streams);
     topk = std::move(r.topk_indices);
     topk_width = topk.empty() ? 0 : r.topk_width;
-    // ONE LINE PER LAYER, which is what makes this a bisect rather than a
-    // verdict: the first layer whose streams stop being finite, or stop
-    // varying, is the layer that owns the defect. A single reading of the last
-    // layer says the model is broken and nothing about where.
-    if (diag::Level() > 0) {
-      diag::Stats(("layer[" + std::to_string(i) + "].streams out").c_str(),
-                  streams);
-    }
   }
 
   // `self.norm(self.hc_head(hidden_states))` (`:1493`). `HcHeadCollapseMean` is
@@ -402,10 +331,7 @@ std::vector<float> TextModelForward(const Glm5NextParams& p,
     const std::vector<float> slab(streams.begin() + t * hc * H,
                                   streams.begin() + (t + 1) * hc * H);
     const std::vector<float> collapsed = HcHeadCollapseMean(slab, hc, H);
-    if (diag::Level() > 0 && t == tokens - 1) {
-      diag::Stats("hc_head collapse (last token)", collapsed);
-    }
-    RmsNorm(collapsed.data(), norm.data(), H, p.rms_norm_eps,
+    RmsNorm(collapsed.data(), w.norm.data(), H, p.rms_norm_eps,
             out.data() + t * H);
   }
   return out;
