@@ -220,12 +220,12 @@ int64_t KdaHeadCount(const GgufFile& g, const std::string& p,
   if (const GgufValue* v = g.FindKv(p + "attention.linear_head_count")) {
     meta_key = p + "attention.linear_head_count";
     from_meta = KvInt(*v, meta_key);
-  } else if (const GgufValue* v = g.FindKv(p + "ssm.group_count")) {
+  } else if (const GgufValue* gv = g.FindKv(p + "ssm.group_count")) {
     meta_key = p + "ssm.group_count";
-    from_meta = KvInt(*v, meta_key);
-  } else if (const GgufValue* v = g.FindKv(p + "ssm.inner_size")) {
+    from_meta = KvInt(*gv, meta_key);
+  } else if (const GgufValue* gv = g.FindKv(p + "ssm.inner_size")) {
     const std::string inner_key = p + "ssm.inner_size";
-    const int64_t inner = KvInt(*v, inner_key);
+    const int64_t inner = KvInt(*gv, inner_key);
     VT_CHECK(inner > 0 && inner % kda_head_dim == 0,
              "glm5_next gguf: " + inner_key + " is " + std::to_string(inner) +
                  " and " + p + "kda.head_dim is " +
