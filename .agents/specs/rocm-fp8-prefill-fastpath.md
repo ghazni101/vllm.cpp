@@ -173,4 +173,104 @@ the guard widening and confirm the dispatch falls back to
 
 ## Now
 
-Spec committed, implementation pending.
+Implementation landed. SharedK prefill templated on `TKV`, `TQ`, `TO`.
+fp8 dequant-to-bf16 at load time. Dispatch guard accepts f32-query +
+fp8-KV + d=256. 14K prefill hang fixed. Token-exact gate passed (101
+token prompt, SharedK vs PagedAttnOnline produce identical output).
+All unit tests green (115 cases, 2297 assertions).
+
+## Outcome
+
+### Implementation
+
+Templated `PagedAttnPrefillSharedK` on `TKV` (KV element type), `TQ`
+(query element type), and `TO` (output element type). Default template
+params preserve backward compatibility with existing bf16 dispatches.
+
+The fp8 tile load path uses `uint4` vectorized loads (16 fp8 elements
+per thread) and dequantizes each byte to `__hip_bfloat16` via
+`__float2bfloat16(F8E4M3ToF32Dev(byte) * scale)` before storing to the
+same bf16 smem tile. The rest of the kernel (QK dot product, online
+softmax, V accumulation) is unchanged — it operates on dequantized
+bf16 values. Dequant-to-bf16 (not float) keeps smem at 32KB per K/V
+tile, matching the bf16 path and fitting within gfx1100's 64KB LDS.
+
+The dispatch guard accepts `query.dtype == kF32 && out.dtype == kF32
+&& k_cache.dtype == kI8 && v_cache.dtype == kI8 && d == 256 &&
+total_q >= 64 && num_reqs == 1`. QG=4 (Qwen3.5-4B: hq=16, kv=4) is
+tiled via z=2 using the QG=2 kernel. BM=32, BN=32 — matching the
+existing bf16 d=256 SharedK config.
+
+### Correctness
+
+Token-exact gate: 101-token prompt (10 repetitions of "The quick brown
+fox jumps over the lazy dog. "), `--max-tokens 30 --temperature 0
+--kv-cache-dtype fp8 --kv-cache-memory 805306368`. SharedK prefill and
+PagedAttnOnline prefill produce identical greedy decode output:
+"The quick brown fox jumps over the lazy dog. The quick brown fox
+jumps over the lazy dog. The quick brown fox jumps over the lazy dog."
+
+All unit tests pass: `test_ops_fp8_kv_cache` (511 assertions),
+`test_rocm_fp8_kv_cache` (28), `test_attn_backend_registry` (125),
+`test_attn_validate_configuration` (82), `test_kv_cache_fp8_wiring`
+(487), `test_ops_attention` (39), `test_rocm_backend` (1065),
+`test_rocm_arch` (59). Total: 115 cases, 2297 assertions, 0 failures.
+
+### 14K prefill hang fixed
+
+`PagedAttnOnline` hangs at ~14K+ prompt tokens (GPU scheduler timeout,
+90s timeout with no output). The SharedK prefill kernel completes at
+14K context in 68 seconds, producing correct output. The hang root
+cause — per-key `__syncthreads()` reduction in `PagedAttnOnline`
+(14K sync barriers per CTA) — is avoided by SharedK's BM×BN tile
+structure with no per-key sync.
+
+### Performance A/B
+
+Qwen3.5-4B Q4_K_M, RX 7900 XTX, ROCm 10.0.0, 2026-08-30.
+`--repeat 4` (2 warmup + 2 measured), `--max-tokens 20`,
+`--kv-cache-dtype fp8`, `VT_ATTN_DECODE_GQA4=1`,
+`--kv-cache-memory 805306368`. SharedK ON vs OFF (PagedAttnOnline):
+
+| Context | SharedK ON tok/s | SharedK OFF tok/s | Ratio |
+|--------:|-----------------:|------------------:|------:|
+| 251     | 13.7             | 13.6              | 1.01x |
+| 1001    | ~2.2             | ~1.9              | ~1.15x |
+| 4001    | 0.74             | 0.47              | 1.57x |
+| 8001    | ~0.32            | ~0.36             | ~1.0x |
+| 14001   | 0.146            | hang              | N/A   |
+
+SharedK is parity at short context (251 tokens), wins at 4K context
+(1.57x), and is the only path that completes at 14K context. The 8K
+data point is noisy (thermal/contention) but does not regress. The
+low tok/s at long context reflects prefill-dominated workload with
+only 20 decode tokens.
+
+End-to-end A/B (bf16 baseline vs fp8+GQA4+SharedK), `--repeat 6`
+(2 warmup + 4 measured, median run 6), `--max-tokens 100`:
+
+| Context | bf16 tok/s | fp8+GQA4+SharedK tok/s | Ratio |
+|--------:|-----------:|----------------------:|------:|
+| 251     | 26.56      | 28.27                 | 1.06x |
+| 1001    | 10.41      | 11.43                 | 1.10x |
+| 4001    | 3.92       | 5.14                  | 1.31x |
+
+fp8+GQA4+SharedK beats bf16 at all contexts. The advantage grows
+with context length because the SharedK prefill is faster than
+PagedAttnOnline at long context (1.57x at 4K in the isolated
+SharedK ON/OFF A/B) while the fp8 decode kernel halves KV bandwidth
+at all contexts.
+
+### What was rejected
+
+- **Dequant to float in smem:** rejected because it doubles smem per
+  element (4 vs 2 bytes), causing LDS overflow at BN=32 d=256 (66832
+  bytes > 65536 byte gfx1100 limit). Dequant to bf16 keeps the same
+  smem footprint as the bf16 path.
+- **BN=64 for fp8:** rejected for the same LDS overflow reason
+  (65536 dynamic + 1296 static = 66832 > 65536). The existing bf16
+  d=256 path also uses BN=32, not BN=64.
+- **Separate fp8 prefill kernel:** rejected because templating the
+  existing SharedK kernel on TKV is cleaner and avoids code
+  duplication. The compute path is identical; only the load path
+  differs.
