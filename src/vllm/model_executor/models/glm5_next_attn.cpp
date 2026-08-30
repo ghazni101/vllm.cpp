@@ -7,8 +7,6 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
-#include <utility>
-#include <vector>
 
 namespace vllm::glm5_next {
 namespace {
@@ -34,33 +32,6 @@ void RmsNorm(const float* in, const float* gamma, int64_t n, double eps,
   const float inv =
       static_cast<float>(1.0 / std::sqrt(acc / static_cast<double>(n) + eps));
   for (int64_t i = 0; i < n; ++i) out[i] = gamma[i] * (in[i] * inv);
-}
-
-// Append `[batch, seq_len, width]` new rows to a `[batch, cached_len, width]`
-// history, in place, producing `[batch, cached_len + seq_len, width]`.
-//
-// It is a per-batch-row SPLICE and not a `insert(end(), ...)`, because the batch
-// axis is the OUTER one: appending flatly would put request 0's new tokens in
-// front of request 1's history. Upstream never has to state this — its cache is
-// a torch `cat(dim=-2)` on a tensor whose batch axis is separate — and getting
-// it wrong at batch 1 is invisible, which is why the focused gate runs the cached
-// case at batch 2 with a left-padded row.
-void AppendRows(std::vector<float>* hist, const std::vector<float>& fresh,
-                int64_t batch, int64_t cached_len, int64_t seq_len,
-                int64_t width) {
-  const int64_t total = cached_len + seq_len;
-  std::vector<float> out(static_cast<size_t>(batch * total * width));
-  for (int64_t b = 0; b < batch; ++b) {
-    if (cached_len > 0) {
-      std::copy_n(hist->data() + b * cached_len * width,
-                  static_cast<size_t>(cached_len * width),
-                  out.data() + b * total * width);
-    }
-    std::copy_n(fresh.data() + b * seq_len * width,
-                static_cast<size_t>(seq_len * width),
-                out.data() + (b * total + cached_len) * width);
-  }
-  *hist = std::move(out);
 }
 
 // `nn.Linear(bias=False)` on a row-major `[out, in]` weight: one dot per output.
@@ -280,7 +251,7 @@ AttentionResult Attention(const MlaDims& d, const MlaWeights& w,
                           const std::vector<uint8_t>& mask,
                           const std::vector<int32_t>* prev_topk_indices,
                           int64_t prev_topk_width, int64_t batch,
-                          int64_t seq_len, DsaCache* cache) {
+                          int64_t seq_len) {
   d.Validate();
   if (batch <= 0 || seq_len <= 0) Fail("batch and seq_len must be > 0");
   const int64_t tokens = batch * seq_len;
@@ -329,25 +300,8 @@ AttentionResult Attention(const MlaDims& d, const MlaWeights& w,
       }
     }
   }
-  // ── the cache update (`:1177-1179`) ───────────────────────────────────────
-  // `k_pass` for THIS window, then the history it belongs to. Upstream appends
-  // the EXPANDED K/V here; this port appends the 512-wide latent and expands the
-  // history, which is value-for-value identical because `ExpandKv` is token-wise
-  // under NoPE. The header states the argument; `test_glm5_next_layer.cpp`
-  // asserts the split identity on real values.
-  const std::vector<float> k_pass_new = CompressKv(d, w, hidden, batch, seq_len);
-  const int64_t cached_len = cache != nullptr ? cache->cached_len : 0;
-  const int64_t kv_length = cached_len + seq_len;
-  if (cache != nullptr) {
-    if (cached_len < 0) Fail("`DsaCache::cached_len` must not be negative");
-    RequireSize("DsaCache::k_pass", cache->k_pass.size(),
-                batch * cached_len * d.kv_lora_rank);
-    AppendRows(&cache->k_pass, k_pass_new, batch, cached_len, seq_len,
-               d.kv_lora_rank);
-  }
-  const std::vector<float>& k_pass_all =
-      cache != nullptr ? cache->k_pass : k_pass_new;
-  const ExpandedKv kv = ExpandKv(d, w, k_pass_all, batch, kv_length);
+  const std::vector<float> k_pass = CompressKv(d, w, hidden, batch, seq_len);
+  const ExpandedKv kv = ExpandKv(d, w, k_pass, batch, seq_len);
 
   // ── the selection (`:1181-1191`) ──────────────────────────────────────────
   if (role.skip_topk) {
@@ -364,34 +318,19 @@ AttentionResult Attention(const MlaDims& d, const MlaWeights& w,
                 tokens * prev_topk_width);
     res.topk_indices = *prev_topk_indices;
     res.topk_width = prev_topk_width;
-  } else if (cache == nullptr) {
+  } else {
     const IndexerSelection sel =
         SelectIndexerTopk(id, *indexer, hidden, q_resid, mask, batch, seq_len);
-    res.topk_width = id.OutputWidth();
-    res.topk_indices = sel.topk_indices;
-  } else {
-    // `past_key_values.update_indexer(packed_states, self.layer_idx)` (`:810`):
-    // the packed rows of THIS window are appended, and the selection runs over
-    // the WHOLE history the call returns.
-    const int64_t row = 2 * id.head_dim + 1;
-    RequireSize("DsaCache::indexer_packed", cache->indexer_packed.size(),
-                batch * cached_len * row);
-    AppendRows(&cache->indexer_packed,
-               PackIndexerStates(id, *indexer, hidden, mask, batch, seq_len),
-               batch, cached_len, seq_len, row);
-    const IndexerSelection sel = SelectIndexerTopkFromPacked(
-        id, *indexer, hidden, q_resid, mask, cache->indexer_packed, batch,
-        seq_len, kv_length);
     res.topk_width = id.OutputWidth();
     res.topk_indices = sel.topk_indices;
   }
 
   // ── the mask (`:1193-1197`) ───────────────────────────────────────────────
-  // `kv_length` is `key_states.shape[2]`, which is the CACHE length. It equals
-  // `seq_len` on a fresh prefill (`cache == nullptr`) and exceeds it on every
-  // cached continuation, which is what W5b-2's binding made reachable.
+  // `kv_length` is `key_states.shape[2]`, which is the CACHE length upstream
+  // and equals `seq_len` on the fresh prefill this reference serves. W5b-2's
+  // cache binding is what makes the two differ.
   const std::vector<uint8_t> visible = BuildAttentionMaskFromTopk(
-      res.topk_indices, batch, seq_len, res.topk_width, kv_length);
+      res.topk_indices, batch, seq_len, res.topk_width, seq_len);
 
   // ── `eager_attention_forward` (`:1039-1061`) ──────────────────────────────
   // `repeat_kv` is the identity: `num_key_value_groups` is 1 for this model.
@@ -401,16 +340,16 @@ AttentionResult Attention(const MlaDims& d, const MlaWeights& w,
   const float min_bias = std::numeric_limits<float>::lowest();
 
   std::vector<float> ctx(static_cast<size_t>(tokens * heads * vhd));
-  std::vector<float> logits(static_cast<size_t>(kv_length));
+  std::vector<float> logits(static_cast<size_t>(seq_len));
   for (int64_t b = 0; b < batch; ++b) {
     for (int64_t h = 0; h < heads; ++h) {
       const float* qh = query.data() + (b * heads + h) * seq_len * qk;
-      const float* kh = kv.key_states.data() + (b * heads + h) * kv_length * qk;
-      const float* vh = kv.value_states.data() + (b * heads + h) * kv_length * vhd;
+      const float* kh = kv.key_states.data() + (b * heads + h) * seq_len * qk;
+      const float* vh = kv.value_states.data() + (b * heads + h) * seq_len * vhd;
       for (int64_t t = 0; t < seq_len; ++t) {
-        const uint8_t* vis = visible.data() + (b * seq_len + t) * kv_length;
+        const uint8_t* vis = visible.data() + (b * seq_len + t) * seq_len;
         float maxv = -std::numeric_limits<float>::infinity();
-        for (int64_t s = 0; s < kv_length; ++s) {
+        for (int64_t s = 0; s < seq_len; ++s) {
           double acc = 0.0;
           for (int64_t i = 0; i < qk; ++i) {
             acc += static_cast<double>(qh[t * qk + i]) * kh[s * qk + i];
@@ -421,7 +360,7 @@ AttentionResult Attention(const MlaDims& d, const MlaWeights& w,
           maxv = std::max(maxv, v);
         }
         double sum = 0.0;
-        for (int64_t s = 0; s < kv_length; ++s) {
+        for (int64_t s = 0; s < seq_len; ++s) {
           const float e = std::exp(logits[static_cast<size_t>(s)] - maxv);
           logits[static_cast<size_t>(s)] = e;
           sum += e;
@@ -432,7 +371,7 @@ AttentionResult Attention(const MlaDims& d, const MlaWeights& w,
         float* dst = ctx.data() + (b * seq_len + t) * heads * vhd + h * vhd;
         for (int64_t dv = 0; dv < vhd; ++dv) {
           double acc = 0.0;
-          for (int64_t s = 0; s < kv_length; ++s) {
+          for (int64_t s = 0; s < seq_len; ++s) {
             acc += static_cast<double>(logits[static_cast<size_t>(s)]) * inv *
                    vh[s * vhd + dv];
           }
@@ -449,7 +388,6 @@ AttentionResult Attention(const MlaDims& d, const MlaWeights& w,
                  d.hidden_size, res.attn_output.data() + t * d.hidden_size);
   }
 
-  if (cache != nullptr) cache->cached_len = kv_length;
   res.propagates_topk = role.next_skip_topk;
   return res;
 }
