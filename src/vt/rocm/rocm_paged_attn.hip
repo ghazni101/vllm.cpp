@@ -431,6 +431,36 @@ __device__ inline void LoadRowEplKv(const TKV* p, int64_t base, int lane,
   }
 }
 
+// fp8 LUT-based vectorized row load: 1KB lookup table in shared memory
+// eliminates all dequant compute from the hot decode loop.
+template <int EPL>
+__device__ inline void LoadRowEplFp8Lut(const uint8_t* p, int64_t base, int lane,
+                                        const float* __restrict__ lut,
+                                        float scale, float r[EPL]) {
+  static_assert(EPL == 4 || EPL == 8 || EPL == 16, "EPL");
+  if constexpr (EPL == 4) {
+    const uint32_t w = reinterpret_cast<const uint32_t*>(p + base)[lane];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) r[i] = lut[(w >> (i * 8)) & 0xFF] * scale;
+  } else if constexpr (EPL == 8) {
+    const uint2 w = reinterpret_cast<const uint2*>(p + base)[lane];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) r[i] = lut[(w.x >> (i * 8)) & 0xFF] * scale;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) r[i + 4] = lut[(w.y >> (i * 8)) & 0xFF] * scale;
+  } else {
+    const uint4 w = reinterpret_cast<const uint4*>(p + base)[lane];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) r[i] = lut[(w.x >> (i * 8)) & 0xFF] * scale;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) r[i + 4] = lut[(w.y >> (i * 8)) & 0xFF] * scale;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) r[i + 8] = lut[(w.z >> (i * 8)) & 0xFF] * scale;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) r[i + 12] = lut[(w.w >> (i * 8)) & 0xFF] * scale;
+  }
+}
+
 
 template <int EPL>
 __device__ inline void StoreRowEplBf16(__hip_bfloat16* p, int64_t base, int lane, const float r[EPL]) {
@@ -793,6 +823,14 @@ __global__ void PagedAttnDecodeGqaF32Q(float* out, const float* query_f32,
   // blockIdx.z splits a large GQA group into QG-sized tiles (e.g. global QG=8 → two×4).
   const int64_t h0 = g * qg_total + static_cast<int64_t>(blockIdx.z) * QG;
   if (h0 + QG > (g + 1) * qg_total) return;
+  // fp8 LUT: 256-entry shared-memory table eliminates dequant compute from
+  // the hot decode loop. Init cooperatively (256 threads = 8 warps × 32 lanes).
+  __shared__ float fp8_lut[256];
+  if constexpr (std::is_same_v<TKV, uint8_t>) {
+    if (static_cast<int>(threadIdx.x) < 256)
+      fp8_lut[threadIdx.x] = F8E4M3ToF32Dev(static_cast<uint8_t>(threadIdx.x));
+    __syncthreads();
+  }
   float q_reg[QG][kEpl];
 #pragma unroll
   for (int hh = 0; hh < QG; ++hh)
@@ -812,7 +850,10 @@ __global__ void PagedAttnDecodeGqaF32Q(float* out, const float* query_f32,
     const int64_t blk = block_table[r * bt_row + (j / block_size) * bt_col];
     const int64_t off = j % block_size;
     float k_reg[kEpl];
-    LoadRowEplKv<kEpl, TKV>(k_cache, blk * kc_blk + off * kc_pg + g * kc_hd, lane, k_scale, k_reg);
+    if constexpr (std::is_same_v<TKV, uint8_t>)
+      LoadRowEplFp8Lut<kEpl>(k_cache, blk * kc_blk + off * kc_pg + g * kc_hd, lane, fp8_lut, k_scale, k_reg);
+    else
+      LoadRowEplKv<kEpl, TKV>(k_cache, blk * kc_blk + off * kc_pg + g * kc_hd, lane, k_scale, k_reg);
 
     float s_h[QG];
 #pragma unroll
@@ -826,7 +867,10 @@ __global__ void PagedAttnDecodeGqaF32Q(float* out, const float* query_f32,
     }
 
     float v_reg[kEpl];
-    LoadRowEplKv<kEpl, TKV>(v_cache, blk * vc_blk + off * vc_pg + g * vc_hd, lane, v_scale, v_reg);
+    if constexpr (std::is_same_v<TKV, uint8_t>)
+      LoadRowEplFp8Lut<kEpl>(v_cache, blk * vc_blk + off * vc_pg + g * vc_hd, lane, fp8_lut, v_scale, v_reg);
+    else
+      LoadRowEplKv<kEpl, TKV>(v_cache, blk * vc_blk + off * vc_pg + g * vc_hd, lane, v_scale, v_reg);
 #pragma unroll
     for (int hh = 0; hh < QG; ++hh) {
       const float m_new = fmaxf(m[hh], s_h[hh]);
