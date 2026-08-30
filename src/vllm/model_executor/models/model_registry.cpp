@@ -618,28 +618,19 @@ ForwardLogits ModelRegistry::Forward(LoadedModel& model,
     // forward is owed by the model's row.
     const std::string arch(model.registration().architecture);
     VT_CHECK(false,
-             std::string("model forward: architecture '") + arch +
-                 "' reached this forward with " + std::to_string(mk.size()) +
-                 " KV cache(s) (" + std::to_string(mk.num_paged()) +
-                 " paged, " + std::to_string(mk.num_recurrent()) +
-                 " recurrent) from " + std::to_string(mk.num_groups()) +
-                 " published group(s), first '" +
-                 std::string(mk.first_name()) +
-                 "', with block tables gathered for " +
+             std::string("model forward: ") + std::to_string(mk.size()) +
+                 " KV cache(s) from " + std::to_string(mk.num_groups()) +
+                 " published group(s) reached this forward, first '" +
+                 std::string(mk.first_name()) + "', with block tables gathered "
+                 "for " +
                  std::to_string(mk.num_group_block_tables()) + " of " +
                  std::to_string(mk.num_published_groups()) +
-                 " published group(s), and the forward registered for '" +
-                 arch +
-                 "' does not consume a cache set keyed by layer name — its "
-                 "ModelFactory leaves `consumes_multi_kv` false. Refusing "
-                 "rather than discarding an allocated KV topology in silence. "
-                 "THIS GUARD IS THE ENGINE'S (KV-DSV4-MULTICACHE W3, #2068) and "
-                 "it fires for ANY architecture that publishes a multi-cache "
-                 "topology, BEFORE dispatch to that architecture's own forward "
-                 "hook, so the consuming forward is owed by the row that ports '" +
-                 arch +
-                 "' and not by the engine row that owns this guard. "
-                 "#1925, #2068, #2353");
+                 " published group(s), and no registered forward consumes a "
+                 "cache set keyed by "
+                 "layer name. Refusing rather than discarding an allocated KV "
+                 "topology in silence "
+                 "(row KV-DSV4-MULTICACHE W5 owns the consuming forward; "
+                 "#1925, #2068)");
   }
   return model.registration().factory->forward(model, input);
 }

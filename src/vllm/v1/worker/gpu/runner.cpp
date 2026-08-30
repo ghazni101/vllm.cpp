@@ -1691,31 +1691,13 @@ void GPUModelRunner::initialize_kv_cache(const KVCacheConfig& kv_cache_config) {
   // `size() == 0`) on every uniform topology, which is what keeps
   // `ModelForwardInput::multi_kv` null there.
   if (multi_cache_topology_) {
-    VT_CHECK(attn_kv_layer_names_.size() == attn_kv_.size(),
-             "runner: the paged name list is out of sync with attn_kv");
-    // ENG-MULTIKV-BYNAME: the five vectors are parallel to EACH OTHER and cover
-    // every published cache, so the size they are checked against is the index's
-    // own length, NOT `attn_kv_.size()`. That distinction is the row: checking
-    // against `attn_kv_` is exactly what made a recurrent entry inexpressible.
-    const size_t n = kv_index_layer_names_.size();
-    VT_CHECK(kv_index_group_ids_.size() == n &&
-                 kv_index_layer_indices_.size() == n &&
-                 kv_index_payload_kinds_.size() == n &&
-                 kv_index_payload_slots_.size() == n,
-             "runner: the by-name KV index vectors are not parallel");
-    // EVERY allocated cache is addressable, stated as an equality over the two
-    // payload containers. `gdn_state_` is built one-for-one from
-    // `recurrent_state_buf_` further down this function, so the recurrent count
-    // is read from the buffer list that already exists rather than from a
-    // vector that is still empty at this point.
-    VT_CHECK(n == attn_kv_.size() + recurrent_state_buf_.size(),
-             "runner: the by-name KV index does not cover exactly the caches "
-             "this runner allocated");
-    multi_kv_index_.layer_names = &kv_index_layer_names_;
-    multi_kv_index_.group_ids = &kv_index_group_ids_;
-    multi_kv_index_.layer_indices = &kv_index_layer_indices_;
-    multi_kv_index_.payload_kinds = &kv_index_payload_kinds_;
-    multi_kv_index_.payload_slots = &kv_index_payload_slots_;
+    VT_CHECK(attn_kv_layer_names_.size() == attn_kv_.size() &&
+                 attn_kv_group_ids_.size() == attn_kv_.size() &&
+                 attn_kv_layer_indices_.size() == attn_kv_.size(),
+             "runner: the multi-cache name index is out of sync with attn_kv");
+    multi_kv_index_.layer_names = &attn_kv_layer_names_;
+    multi_kv_index_.group_ids = &attn_kv_group_ids_;
+    multi_kv_index_.layer_indices = &attn_kv_layer_indices_;
     // W5c-2 (#2249 item 3): the FOURTH vector — one block table per PUBLISHED
     // group. Sized here (by GROUP, not by cache) and filled per step by
     // `gather_group_block_tables`; the pointers are published once because the

@@ -449,10 +449,7 @@ struct MultiKvCacheIndex {
   // exactly two group ids — the target attention group and the recurrent group
   // — so a third group's table never left the runner and its cache was
   // allocated and unread. `qwen4_exp` publishes exactly such a third group: the
-  // QSA indexer side cache, an `MLAAttentionSpec` at `compress_ratio` 1 —
-  // ONE ROW PER TOKEN. This line said 4 until W5h measured the group against
-  // upstream's `Cache.update_indexer`, which concatenates one raw key per
-  // token; the ratio is the SELECTION algorithm's, never the page geometry.
+  // QSA indexer side cache, an `MLAAttentionSpec` at `compress_ratio` 4.
   //
   // UPSTREAM DOES NOT HAVE A "TWO NAMED GROUPS" SHAPE AT ALL. Its per-group
   // metadata loop runs over `enumerate(kv_cache_groups)` and hands every group
@@ -472,8 +469,7 @@ struct MultiKvCacheIndex {
   const std::vector<std::vector<int32_t>>* group_block_tables = nullptr;
   const std::vector<int32_t>* group_block_table_cols = nullptr;
 
-  // How many caches arrived, paged and recurrent together. 0 when the channel is
-  // empty.
+  // How many caches arrived. 0 when the channel is empty.
   size_t size() const;
   // How many DISTINCT published groups they came from.
   int num_groups() const;
@@ -487,24 +483,6 @@ struct MultiKvCacheIndex {
   // name up once per layer per role, so an index structure would be premature.
   // Recorded as a decision rather than left as an oversight.
   int64_t Find(std::string_view layer_name) const;
-
-  // ENG-MULTIKV-BYNAME. How many of the published caches are paged, and how many
-  // are recurrent. `num_paged() + num_recurrent() == size()`.
-  int num_paged() const;
-  int num_recurrent() const;
-
-  // Where flat entry `index` lives. FALSE when `index` is out of range or the
-  // channel carries no locators. `*kind` and `*slot` are written in EVERY case —
-  // `kPaged` and -1 on the false answer — so a caller that forgets the bool
-  // indexes out of range rather than reading a stale slot, which is the failure
-  // mode `BlockTableForGroup` above already guards the same way.
-  bool PayloadAt(int64_t index, KvCachePayload* kind, int32_t* slot) const;
-
-  // `Find` and `PayloadAt` in one call, which is what a forward wants: it holds
-  // a layer name and needs the cache. FALSE when nothing was published under
-  // that name, with `*kind` / `*slot` written as above.
-  bool Resolve(std::string_view layer_name, KvCachePayload* kind,
-               int32_t* slot) const;
 
   // How many groups the model PUBLISHED, which is not `num_groups()`: that one
   // counts the distinct groups the caches in `attn_kv` came from, and a
