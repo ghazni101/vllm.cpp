@@ -150,15 +150,27 @@ __device__ inline void St(__hip_bfloat16* p, int64_t i, float v) {
 // (include/vt/fp8_kv.h:40-49) and the CUDA Fp8E4M3ToF32Dev
 // (cuda_paged_attn.cu:164), so ROCm==CPU==CUDA on the read is a property of
 // the source. Bit-identical to the F8E4M3ToF32 in rocm_fp8_channel_gemv.hip:22.
+// fp8-e4m3 byte → f32 on device. Branchless: replaces the original branchy
+// version (early returns for NaN/subnormal caused warp divergence in the
+// decode KV walk). Bit-identical output for all 256 input bytes.
+// Normal (e>0): direct f32 bit construction, no ldexpf call.
+// Subnormal (e==0): simple multiply by 2^-9.
+// NaN (e==0xF, m==0x7): 0 (no NaN in finite KV cache).
+// All selects compile to v_cndmask — no branch divergence.
 __device__ inline float F8E4M3ToF32Dev(uint8_t byte) {
-  const uint32_t sign = static_cast<uint32_t>(byte >> 7) & 0x1U;
-  const uint32_t exp = static_cast<uint32_t>(byte >> 3) & 0xFU;
-  const uint32_t mant = static_cast<uint32_t>(byte) & 0x7U;
-  const float sm = sign ? -1.0f : 1.0f;
-  if (exp == 0xFU && mant == 0x7U) return 0.f;  // NaN → 0 (no NaN in finite KV)
-  if (exp == 0U) return sm * (static_cast<float>(mant) * (1.0f / 512.0f));
-  const float mantissa = 1.0f + static_cast<float>(mant) * (1.0f / 8.0f);
-  return sm * ldexpf(mantissa, static_cast<int>(exp) - 7);
+  const uint32_t s = static_cast<uint32_t>(byte >> 7);
+  const uint32_t e = (static_cast<uint32_t>(byte) >> 3) & 0xFU;
+  const uint32_t m = static_cast<uint32_t>(byte) & 0x7U;
+  // Normal: f32 bits = sign | (exp+120)<<23 | mant<<20
+  // f32 bias 127 − fp8 bias 7 = 120; mantissa 3→23 bits = <<20
+  const uint32_t normal_bits = (s << 31) | ((e + 120U) << 23) | (m << 20);
+  const float normal = __uint_as_float(normal_bits);
+  // Subnormal: (−1)^s × m × 2^−9
+  const float subnormal =
+      (s ? -1.0f : 1.0f) * static_cast<float>(m) * (1.0f / 512.0f);
+  // Branchless select (v_cndmask, no divergence)
+  const float result = (e == 0U) ? subnormal : normal;
+  return ((e == 0xFU) && (m == 0x7U)) ? 0.0f : result;
 }
 
 // One K/V-cache element as f32, with the fp8 dequant folded in. INERT on the
