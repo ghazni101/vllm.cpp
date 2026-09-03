@@ -260,6 +260,140 @@ std::vector<float> FusedCall(vt::Queue& q, const MoeFixture& m, const std::vecto
   return out;
 }
 
+// ─── A DEVICE-RESIDENT fused call, which is what makes this arm gateable ─────
+//
+// `FusedCall` above labels HOST buffers with the queue's device and relies on
+// the pointers being dereferenceable from the kernel. That works on no CUDA
+// device: `CudaBackend` inherits `Backend::DeviceMemoryIsHostAddressable()`,
+// which is `false` by design and held there by a `static_assert` in
+// `cuda_backend.cu` (#1635, because `Alloc` is `cudaMalloc` and a `cudaMalloc`
+// pointer is not host-dereferenceable even where host and device share one
+// physical RAM). So the device case guarded on that predicate and SKIPPED
+// everywhere, which is exactly why `.agents/specs/model-dsv4-exl3.md` records
+// "W2d tier 4 on the fused MoE arm: STILL OWED, and it cannot be taken on this
+// code".
+//
+// This uploads instead. Every operand the kernel dereferences is real device
+// memory, and the nine per-expert pointer tables hold DEVICE addresses — which
+// is what `Exl3FusedMoePass` builds in production out of `ResidentWeight`
+// (`deepseek_v4.cpp`). The upload pattern is `tests/vt/test_exl3_rocm.cpp`'s.
+struct DeviceMoe {
+  vt::Backend* be = nullptr;
+  std::vector<void*> owned;
+  // Synchronized on purpose. `Copy` is a `cudaMemcpyAsync` on the queue's
+  // stream, and an async copy out of PAGEABLE host memory does not promise the
+  // source is consumed before the call returns — `Zeros` below hands it a
+  // buffer that dies at the closing brace. One sync per upload costs nothing at
+  // fixture size and removes a use-after-free that would read as a numeric
+  // disagreement rather than as a fault.
+  void* Up(vt::Queue& q, const void* src, size_t bytes) {
+    void* p = be->Alloc(bytes);
+    REQUIRE(p != nullptr);
+    owned.push_back(p);
+    be->Copy(q, p, src, bytes);
+    be->Synchronize(q);
+    return p;
+  }
+  void* Zeros(vt::Queue& q, size_t bytes) {
+    std::vector<char> z(bytes, 0);
+    return Up(q, z.data(), bytes);
+  }
+  ~DeviceMoe() {
+    for (void* p : owned) be->Free(p);
+  }
+};
+
+// Returns the f32 output, read back from the device.
+std::vector<float> FusedCallDevice(vt::Backend& cb, vt::Queue& dq, const MoeFixture& m,
+                                   const std::vector<float>& x, int64_t tokens,
+                                   const std::vector<int64_t>& ids,
+                                   const std::vector<float>& weights, int64_t topk, float limit,
+                                   vt::Exl3MoeAct act, int64_t max_rows) {
+  DeviceMoe d;
+  d.be = &cb;
+  const vt::Device dev = dq.device;
+  const int64_t E = m.experts, H = m.hidden, I = m.interm;
+
+  // The nine tables, filled with DEVICE addresses of DEVICE copies.
+  std::vector<int64_t> gt(E), gs(E), gv(E), ut(E), us(E), uv(E), dt(E), ds(E), dv(E);
+  auto up_lin = [&](const Exl3Fixture& f, int64_t& tr, int64_t& su, int64_t& sv) {
+    tr = reinterpret_cast<int64_t>(d.Up(dq, f.trellis.data(), f.trellis.size() * sizeof(uint16_t)));
+    su = reinterpret_cast<int64_t>(d.Up(dq, f.suh.data(), f.suh.size() * sizeof(uint16_t)));
+    sv = reinterpret_cast<int64_t>(d.Up(dq, f.svh.data(), f.svh.size() * sizeof(uint16_t)));
+  };
+  for (int64_t e = 0; e < E; ++e) {
+    const size_t i = static_cast<size_t>(e);
+    up_lin(m.gate[i], gt[i], gs[i], gv[i]);
+    up_lin(m.up[i], ut[i], us[i], uv[i]);
+    up_lin(m.down[i], dt[i], ds[i], dv[i]);
+  }
+
+  const int64_t assignments = tokens * topk;
+  std::vector<int64_t> cnt(static_cast<size_t>(E + 1), 0), tok(static_cast<size_t>(assignments), 0);
+  std::vector<uint16_t> wgt(static_cast<size_t>(assignments), 0);
+  const int num_active = vt::Exl3MoeSortTokensByExpert(ids.data(), weights.data(), tokens, topk, E,
+                                                       max_rows, cnt.data(), tok.data(),
+                                                       wgt.data());
+  std::vector<uint16_t> hid(static_cast<size_t>(tokens * H), 0);
+  for (size_t i = 0; i < hid.size(); ++i) hid[i] = vt::F32ToF16(x[i]);
+
+  auto tbl = [&](std::vector<int64_t>& v) {
+    return vt::Tensor::Contiguous(d.Up(dq, v.data(), v.size() * sizeof(int64_t)), vt::DType::kI64,
+                                  dev, {E});
+  };
+  vt::Tensor t_gt = tbl(gt), t_gs = tbl(gs), t_gv = tbl(gv);
+  vt::Tensor t_ut = tbl(ut), t_us = tbl(us), t_uv = tbl(uv);
+  vt::Tensor t_dt = tbl(dt), t_ds = tbl(ds), t_dv = tbl(dv);
+  vt::Exl3MoeExpertTables tables;
+  tables.gate_trellis = &t_gt; tables.gate_suh = &t_gs; tables.gate_svh = &t_gv;
+  tables.up_trellis = &t_ut;   tables.up_suh = &t_us;   tables.up_svh = &t_uv;
+  tables.down_trellis = &t_dt; tables.down_suh = &t_ds; tables.down_svh = &t_dv;
+
+  vt::Tensor t_cnt = vt::Tensor::Contiguous(
+      d.Up(dq, cnt.data(), cnt.size() * sizeof(int64_t)), vt::DType::kI64, dev, {E + 1});
+  vt::Tensor t_tok = vt::Tensor::Contiguous(
+      d.Up(dq, tok.data(), tok.size() * sizeof(int64_t)), vt::DType::kI64, dev, {assignments});
+  vt::Tensor t_wgt = vt::Tensor::Contiguous(
+      d.Up(dq, wgt.data(), wgt.size() * sizeof(uint16_t)), vt::DType::kF16, dev, {assignments});
+  vt::Exl3MoeRouting routing;
+  routing.expert_count = &t_cnt;
+  routing.token_sorted = &t_tok;
+  routing.weight_sorted = &t_wgt;
+
+  vt::Tensor sg = vt::Tensor::Contiguous(d.Zeros(dq, static_cast<size_t>(max_rows * H) * 2),
+                                         vt::DType::kF16, dev, {1, max_rows, H});
+  vt::Tensor su = vt::Tensor::Contiguous(d.Zeros(dq, static_cast<size_t>(max_rows * H) * 2),
+                                         vt::DType::kF16, dev, {1, max_rows, H});
+  vt::Tensor ig = vt::Tensor::Contiguous(d.Zeros(dq, static_cast<size_t>(max_rows * I) * 2),
+                                         vt::DType::kF16, dev, {1, max_rows, I});
+  vt::Tensor iu = vt::Tensor::Contiguous(d.Zeros(dq, static_cast<size_t>(max_rows * I) * 2),
+                                         vt::DType::kF16, dev, {1, max_rows, I});
+  vt::Exl3MoeTemps temps;
+  temps.state_g = &sg; temps.state_u = &su;
+  temps.intermediate_g = &ig; temps.intermediate_u = &iu;
+
+  const size_t out_bytes = static_cast<size_t>(tokens * H) * sizeof(float);
+  vt::Tensor t_out = vt::Tensor::Contiguous(d.Zeros(dq, out_bytes), vt::DType::kF32, dev,
+                                            {tokens, H});
+  vt::Tensor t_hid = vt::Tensor::Contiguous(
+      d.Up(dq, hid.data(), hid.size() * sizeof(uint16_t)), vt::DType::kF16, dev, {tokens, H});
+
+  vt::Exl3MoeArgs args;
+  args.bits_gate = args.bits_up = args.bits_down = m.bits;
+  args.codebook = 1;
+  args.act = act;
+  args.act_limit = limit;
+  args.num_active = num_active;
+  cb.Synchronize(dq);
+  vt::Exl3MoeMlp(dq, t_out, t_hid, tables, routing, temps, args);
+  cb.Synchronize(dq);
+
+  std::vector<float> out(static_cast<size_t>(tokens * H), 0.0f);
+  cb.Copy(dq, out.data(), t_out.data, out_bytes);
+  cb.Synchronize(dq);
+  return out;
+}
+
 double RelRms(const std::vector<float>& a, const std::vector<float>& b) {
   double sq = 0.0, rq = 0.0;
   for (size_t i = 0; i < a.size(); ++i) {
@@ -558,18 +692,14 @@ TEST_CASE("exl3 device: the fused MoE arm agrees with the CPU arm within tier 4"
     CHECK_FALSE(vt::OpRegistered(vt::OpId::kExl3MoeMlp, vt::DeviceType::kCUDA));
     return;
   }
-  // The fused kernel dereferences the per-expert pointer tables ON THE DEVICE,
-  // so this case needs a device-resident tower, which is the row's own owed
-  // "Real-checkpoint residency for the coalesced tower". Until it lands the
-  // device arm is reachable only where host pointers are dereferenceable.
+  // NO host-addressability guard. `CudaBackend` inherits
+  // `Backend::DeviceMemoryIsHostAddressable()`, which is `false` by design and
+  // held there by a `static_assert` in `cuda_backend.cu` (#1635), so the guard
+  // this case used to carry skipped on EVERY CUDA device and the case had never
+  // run anywhere. `FusedCallDevice` uploads instead, which is what production
+  // does, so the predicate is no longer the question.
   vt::Backend& cb = vt::GetBackend(vt::DeviceType::kCUDA);
-  if (!cb.DeviceMemoryIsHostAddressable()) {
-    MESSAGE(
-        "SKIPPED, CUDA present but host pointers are not dereferenceable: the coalesced EXL3 "
-        "tower is host-resident (MODEL-DSV4-EXL3 `## Owed`, device residency).");
-    CHECK_FALSE(cb.DeviceMemoryIsHostAddressable());
-    return;
-  }
+  CHECK_FALSE(cb.DeviceMemoryIsHostAddressable());  // the reason the upload exists
   vt::Queue dq = cb.CreateQueue();
   vt::Queue hq = CpuQueue();
   const int64_t H = 256, I = 128, E = 4, T = 3, topk = 2;
@@ -593,12 +723,11 @@ TEST_CASE("exl3 device: the fused MoE arm agrees with the CPU arm within tier 4"
     const MoeFixture m = MakeMoeFixture(H, I, E, 0xA11CEu, bits);
     REQUIRE(m.bits == bits);
     REQUIRE(m.gate[0].bits == bits);
-    MoeCall kh, kd;
+    MoeCall kh;
     const std::vector<float> host =
         FusedCall(hq, m, x, T, ids, w, topk, 10.0f, vt::Exl3MoeAct::kSiluAndMulClamp, 128, &kh);
-    const std::vector<float> dev =
-        FusedCall(dq, m, x, T, ids, w, topk, 10.0f, vt::Exl3MoeAct::kSiluAndMulClamp, 128, &kd);
-    cb.Synchronize(dq);
+    const std::vector<float> dev = FusedCallDevice(
+        cb, dq, m, x, T, ids, w, topk, 10.0f, vt::Exl3MoeAct::kSiluAndMulClamp, 128);
     // A tower that decoded to zeros would agree with itself perfectly. The
     // reference has to be non-trivial before its agreement means anything.
     double mx = 0.0;
@@ -630,11 +759,6 @@ TEST_CASE("exl3 device: an uninstantiated fused-MoE arm refuses BY NAME") {
     return;
   }
   vt::Backend& cb = vt::GetBackend(vt::DeviceType::kCUDA);
-  if (!cb.DeviceMemoryIsHostAddressable()) {
-    MESSAGE("SKIPPED, CUDA present but host pointers are not dereferenceable.");
-    CHECK_FALSE(cb.DeviceMemoryIsHostAddressable());
-    return;
-  }
   vt::Queue dq = cb.CreateQueue();
   const int64_t H = 256, I = 128, E = 4, T = 3, topk = 2;
   Rng rng;
@@ -648,12 +772,10 @@ TEST_CASE("exl3 device: an uninstantiated fused-MoE arm refuses BY NAME") {
   // width the GEMM cannot decode either.
   {
     const MoeFixture m7 = MakeMoeFixture(H, I, E, 0xA11CEu, 7);
-    MoeCall k;
     std::string msg;
     try {
-      (void)FusedCall(dq, m7, x, T, ids, w, topk, 10.0f, vt::Exl3MoeAct::kSiluAndMulClamp, 128,
-                      &k);
-      cb.Synchronize(dq);
+      (void)FusedCallDevice(cb, dq, m7, x, T, ids, w, topk, 10.0f,
+                            vt::Exl3MoeAct::kSiluAndMulClamp, 128);
     } catch (const std::exception& e) {
       msg = e.what();
     }
