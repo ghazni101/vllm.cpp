@@ -5,7 +5,8 @@ Issues: [#2495](https://github.com/mudler/vllm.cpp/issues/2495) (primary),
 [#2574](https://github.com/mudler/vllm.cpp/issues/2574) (slice F, the recount
 and the `(3, 2)` arm),
 [#2756](https://github.com/mudler/vllm.cpp/issues/2756) (slice G, the fused MoE
-widths)
+widths), [#2762](https://github.com/mudler/vllm.cpp/issues/2762) (the device
+case that could never run)
 Base SHA: `11fed3ba5`
 Parent row: [`QUANT-EXL3`](quant-exl3-shared.md)
 Matrix: [`.agents/quantization-matrix.md`](../quantization-matrix.md)
@@ -568,6 +569,23 @@ reference the device arm is gated against.
 - The case asserts the arm RAN. A device case that skips reports its skip
   through a `CHECK_FALSE` on the registration, exactly as the existing case
   does, so `assertions: 0` can never read as a pass.
+- **The fixture UPLOADS** (#2762). The case guarded on
+  `CudaBackend::DeviceMemoryIsHostAddressable()` and returned when it was false,
+  and that predicate is false on EVERY CUDA device permanently — `CudaBackend`
+  declares no override and `cuda_backend.cu` holds it at the inherited `false`
+  with a `static_assert` that fires on any override, because `Alloc` is
+  `cudaMalloc`. So the case had never executed anywhere and could not, which is
+  why `model-dsv4-exl3.md` records W2d tier 4 as "STILL OWED, and it cannot be
+  taken on this code". The guard was an honest reading of the fixture:
+  `FusedCall` labels HOST vectors with the queue's device, so the nine pointer
+  tables carry host addresses while the kernel dereferences them on the device.
+  `FusedCallDevice` allocates and copies every operand and fills the tables with
+  DEVICE addresses, which is what `Exl3FusedMoePass` builds in production out of
+  `ResidentWeight`, and the upload pattern is `tests/vt/test_exl3_rocm.cpp`'s.
+  Each upload synchronizes, because `Copy` is a `cudaMemcpyAsync` and an async
+  copy out of pageable memory does not promise its source is consumed before it
+  returns. **This is what makes the widened arm gateable at all**, and it closes
+  a debt older than this slice rather than one it opened.
 - A host case pins the refusal: bits 7 refuses BY NAME and the message names
   both the width and upstream's codebook bound.
 
