@@ -2340,10 +2340,11 @@ void Exl3GemmKernelCuda(Queue& q, Tensor& c, const Tensor& a, const Tensor& trel
 //
 // The CODEBOOK is one and not two because a cb-2 MoE kernel would be DEAD CODE.
 // `vt::Exl3MoeMlp` has two production callers, both in `Exl3FusedMoePass`
-// (`deepseek_v4.cpp`), and four sites pin the codebook to 1 before the kernel is
-// ever chosen: the loader refuses any marker but `mcg`, three `args.codebook = 1`
-// assignments, and `ops.cpp`'s own `VT_CHECK(args.codebook == 1, ...)` in the
-// SHARED seam. Widening here alone would instantiate a kernel nothing can reach.
+// (`deepseek_v4.cpp`), and FIVE sites pin the codebook to 1 before the kernel is
+// ever chosen: the loader refuses any marker but `mcg`, three separate
+// `args.codebook = 1` assignments, and `ops.cpp`'s own
+// `VT_CHECK(args.codebook == 1, ...)` in the SHARED seam -- which refuses for
+// every backend, the CPU reference included. Widening here alone would instantiate a kernel nothing can reach.
 // QUANT-EXL3-MUL1 slice G records it as owed, as a LOADER slice that ends in a
 // kernel (#2756).
 //
@@ -2351,8 +2352,11 @@ void Exl3GemmKernelCuda(Queue& q, Tensor& c, const Tensor& a, const Tensor& trel
 // reads the bit width per projection off the checkpoint (`e0.w1.bits` and its
 // siblings) and assigns it into `Exl3MoeArgs` unchanged; nothing between the
 // loader and this launcher clamps it. Before this arm set, an expert tower
-// quantized at 4, 5 or 6 bits reached here with that width and fell back to the
-// per-expert `vt::Exl3Gemm` loop, which serves those widths already.
+// quantized at 4, 5 or 6 bits reached here with that width and was REFUSED, with
+// no second path: `MoeBlock` calls `Exl3FusedMoePass` unguarded so the exception
+// leaves the forward, this arm is default-ON, and the `VT_DSV4_EXL3_FUSED_MOE=0`
+// rollback lands on `Exl3ArmInstantiated`, which has no `(4, 1)`, `(5, 1)` or
+// `(6, 1)` either. Such a tower could not run on a CUDA queue by ANY path.
 //
 // SHARED MEMORY ADMITS EVERY ONE OF THEM, and the guard is the one already in
 // `exl3_gemm_kernel_inner` rather than a new check. At the MoE shape
