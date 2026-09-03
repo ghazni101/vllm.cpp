@@ -22,7 +22,15 @@
 //   * The ACTIVATION CHOICE (W2d-2) is pinned by two directed cases, because it
 //     is the one place where mirroring the kernel oracle would mirror the wrong
 //     model behavior, and no shape gate can see it.
-//   * The device arm SKIPS loudly and still asserts.
+//   * The device arm RUNS. It used to skip on every machine -- the case guarded
+//     on `DeviceMemoryIsHostAddressable()`, which a `static_assert` in
+//     `cuda_backend.cu` pins false on every CUDA device (#2762) -- so
+//     `FusedCallDevice` uploads every operand and fills the nine per-expert
+//     pointer tables with DEVICE addresses, as production does. It covers all
+//     four instantiated widths at both N tiles (QUANT-EXL3-MUL1 slice G,
+//     #2756) and counts its own iterations, because an empty loop reports a
+//     pass. Where there is no CUDA device at all it still skips loudly and
+//     still asserts.
 #include <doctest/doctest.h>
 
 #include <algorithm>
@@ -702,45 +710,57 @@ TEST_CASE("exl3 device: the fused MoE arm agrees with the CPU arm within tier 4"
   CHECK_FALSE(cb.DeviceMemoryIsHostAddressable());  // the reason the upload exists
   vt::Queue dq = cb.CreateQueue();
   vt::Queue hq = CpuQueue();
-  const int64_t H = 256, I = 128, E = 4, T = 3, topk = 2;
+  const int64_t H = 256, E = 4, T = 3, topk = 2;
   Rng rng;
   std::vector<float> x(static_cast<size_t>(T * H));
   for (auto& v : x) v = vt::F16ToF32(vt::F32ToF16(rng.next(0.5f)));
   const std::vector<int64_t> ids = {2, 0, 3, 2, 1, 2};
   const std::vector<float> w = {0.5f, 0.25f, 0.75f, 0.125f, 0.4f, 0.6f};
 
-  // EVERY instantiated width, against the CPU arm, at the SAME tier-4 bound the
-  // single (3, 1) arm already carried. The bound is not widened for a new width;
-  // a width that needs a looser one has a port defect, not a tolerance problem
-  // (QUANT-EXL3-MUL1 slice G, #2756).
+  // EVERY instantiated width, at BOTH N tiles, against the CPU arm, at the SAME
+  // tier-4 bound the single (3, 1) arm already carried. The bound is not widened
+  // for a new width; a width that needs a looser one has a port defect, not a
+  // tolerance problem (QUANT-EXL3-MUL1 slice G, #2756).
+  //
+  // BOTH N TILES, because each pair is two kernels and not one, and the tile is
+  // chosen from the SHAPE rather than from an argument: `exl3_moe.cu:224-225`
+  // takes MOE_TILESIZE_N 256 only when hidden and intermediate are both
+  // multiples of 256. An intermediate of 128 exercises the 128 form alone and
+  // would have left half of every widened pair ungated.
   //
   // The CPU arm is the reference because it is the width-general one: it threads
   // `args.bits` into `Exl3DecodeTile` and decodes all eight widths, so widening
   // the device arm never widens its own oracle.
   int ran = 0;
   for (const int bits : {3, 4, 5, 6}) {
-    CAPTURE(bits);
-    const MoeFixture m = MakeMoeFixture(H, I, E, 0xA11CEu, bits);
-    REQUIRE(m.bits == bits);
-    REQUIRE(m.gate[0].bits == bits);
-    MoeCall kh;
-    const std::vector<float> host =
-        FusedCall(hq, m, x, T, ids, w, topk, 10.0f, vt::Exl3MoeAct::kSiluAndMulClamp, 128, &kh);
-    const std::vector<float> dev = FusedCallDevice(
-        cb, dq, m, x, T, ids, w, topk, 10.0f, vt::Exl3MoeAct::kSiluAndMulClamp, 128);
-    // A tower that decoded to zeros would agree with itself perfectly. The
-    // reference has to be non-trivial before its agreement means anything.
-    double mx = 0.0;
-    for (const float v : host) mx = std::max(mx, std::fabs(static_cast<double>(v)));
-    CHECK(mx > 1.0e-3);
-    const double rel = RelRms(dev, host);
-    MESSAGE("tier 4, device vs CPU at bits ", bits, ": relative RMS ", rel);
-    CHECK(rel <= 2.0e-2);
-    ++ran;
+    for (const int64_t I : {int64_t{128}, int64_t{256}}) {
+      CAPTURE(bits);
+      CAPTURE(I);
+      const bool n256 = (H % 256 == 0) && (I % 256 == 0);
+      CAPTURE(n256);
+      const MoeFixture m = MakeMoeFixture(H, I, E, 0xA11CEu, bits);
+      REQUIRE(m.bits == bits);
+      REQUIRE(m.gate[0].bits == bits);
+      MoeCall kh;
+      const std::vector<float> host =
+          FusedCall(hq, m, x, T, ids, w, topk, 10.0f, vt::Exl3MoeAct::kSiluAndMulClamp, 128, &kh);
+      const std::vector<float> dev = FusedCallDevice(
+          cb, dq, m, x, T, ids, w, topk, 10.0f, vt::Exl3MoeAct::kSiluAndMulClamp, 128);
+      // A tower that decoded to zeros would agree with itself perfectly. The
+      // reference has to be non-trivial before its agreement means anything.
+      double mx = 0.0;
+      for (const float v : host) mx = std::max(mx, std::fabs(static_cast<double>(v)));
+      CHECK(mx > 1.0e-3);
+      const double rel = RelRms(dev, host);
+      MESSAGE("tier 4, device vs CPU at bits ", bits, " interm ", I, " n256 ", n256,
+              ": relative RMS ", rel);
+      CHECK(rel <= 2.0e-2);
+      ++ran;
+    }
   }
   // The loop is what this case is FOR. A body that never entered would leave
   // every CHECK above unexecuted and the case would still report a pass.
-  CHECK(ran == 4);
+  CHECK(ran == 8);  // 4 widths x 2 N tiles
   cb.DestroyQueue(dq);
 }
 
