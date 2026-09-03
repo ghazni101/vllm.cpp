@@ -3,7 +3,9 @@
 Row: `QUANT-EXL3-MUL1`
 Issues: [#2495](https://github.com/mudler/vllm.cpp/issues/2495) (primary),
 [#2574](https://github.com/mudler/vllm.cpp/issues/2574) (slice F, the recount
-and the `(3, 2)` arm)
+and the `(3, 2)` arm),
+[#2756](https://github.com/mudler/vllm.cpp/issues/2756) (slice G, the fused MoE
+widths)
 Base SHA: `11fed3ba5`
 Parent row: [`QUANT-EXL3`](quant-exl3-shared.md)
 Matrix: [`.agents/quantization-matrix.md`](../quantization-matrix.md)
@@ -20,7 +22,10 @@ supplies the trellis format and its kernels only.
 the loader accepts a `mul1` marker. Slices C, D and E are described below with
 what each one still owes. **Slice F is the recount** (#2574): slice D was
 specified against a tensor census that omitted 137 modules, so `(3, 2)` was
-never instantiated and the checkpoint could not run on CUDA at all.
+never instantiated and the checkpoint could not run on CUDA at all. **Slice G is
+the fused MoE** (#2756): `kExl3MoeMlp` was still the tree's narrowest EXL3
+surface at one arm, `(3, mcg)`, and a mcg expert tower at any other width could
+not run on a CUDA queue by any path.
 
 ## The gap
 
@@ -199,6 +204,9 @@ gate does not depend on any implementation of it.
 - **F — the recount, and `(3, 2)`.** `Exl3ArmInstantiated`,
   `GemmKernelForShape` and the refusal message again, plus the corrected census
   in `docs/FEATURES.md` and in this spec. See the section below.
+- **G — the fused MoE widths.** `Exl3MoeArmInstantiated` and `MoeKernel` in
+  `src/vt/cuda/cuda_exl3.cu`. The fused arm alone, at codebook 1; the codebook
+  half is a LOADER slice and is owed. See the section below.
 
 ## Slice F — the recount, and the `(3, 2)` arm (#2574)
 
@@ -424,6 +432,183 @@ A device that is absent SKIPS this case, and a skip that asserts nothing reports
 `assertions: 0`, which reads as a pass. The case already asserts its own
 precondition on the skip path, and this row does not weaken that.
 
+## Slice G — the fused MoE widths (#2756)
+
+### The gap, and its two independent halves
+
+`Exl3MoeMlpKernelCuda` instantiates one arm. `kMoeBits = 3`, `kMoeCb = 1`, and
+every other pair refuses by name. That is a much narrower surface than the
+regular GEMM beside it in the same file, which slice F took to seven pairs, and
+narrower than the CPU arm, which threads `args.bits` and `args.codebook` into
+`Exl3DecodeTile` unchanged and therefore decodes all eight widths over all three
+codebooks.
+
+The narrowness has two halves and they are NOT the same problem.
+
+**The widths are reachable and refuse.** `deepseek_v4.cpp:1546-1548` reads the
+bit width per projection off the checkpoint — `e0.w1.bits`, `e0.w3.bits`,
+`e0.w2.bits` — and assigns it straight into `Exl3MoeArgs`. Nothing between the
+loader and the launcher clamps it. A DeepSeek-V4 EXL3 expert tower quantized at
+4, 5 or 6 bits therefore reaches `Exl3MoeMlpKernelCuda` with that width and is
+refused there.
+
+**That refusal is not caught, and there is no second path.** `MoeBlock` calls
+`Exl3FusedMoePass` unguarded (`deepseek_v4.cpp:1811`), and the fused arm is
+default-ON — `Dsv4Exl3FusedMoeFlagIsOn` reads an unset `VT_DSV4_EXL3_FUSED_MOE`
+as on — so the exception leaves the forward rather than degrading to the loop.
+Setting `VT_DSV4_EXL3_FUSED_MOE=0` does not rescue it either: the per-expert loop
+calls `vt::Exl3Gemm`, and `Exl3ArmInstantiated` has no `(4, 1)`, `(5, 1)` or
+`(6, 1)`. A 4-, 5- or 6-bit mcg expert tower cannot run on a CUDA queue by ANY
+path today. Widening the fused launcher restores the default path, which is the
+one production takes.
+
+**The codebook is NOT reachable and would land dead.** Four sites pin it to 1
+before the kernel is chosen, and they have to widen together or not at all:
+
+| Site | What it does |
+|---|---|
+| `deepseek_v4_weights.cpp:1017` | `VT_CHECK(codebook == "mcg", ...)` — refuses any other marker at load |
+| `deepseek_v4.cpp:1336` | `args.codebook = 1;` hardcoded |
+| `deepseek_v4.cpp:1371` | `args.codebook = 1;` hardcoded |
+| `deepseek_v4.cpp:1549` | `args.codebook = 1;` hardcoded, on the fused MoE call |
+| `src/vt/ops.cpp:5609` | `VT_CHECK(args.codebook == 1, ...)` in the SHARED seam, refusing for every backend including the CPU reference |
+
+`vt::Exl3MoeMlp` has exactly two production callers, both inside
+`Exl3FusedMoePass` (`deepseek_v4.cpp:1659` and `:1693`), and no second
+architecture reaches the op — `qwen3_5_moe.cpp` contains zero EXL3. So a
+codebook-2 MoE instantiation added in this slice would be unreachable from any
+production entry point at its own merge commit, which "Nothing lands dead"
+forbids. It is owed below, as a LOADER slice that happens to end in a kernel.
+
+### What upstream instantiates, and the two bounds it already carries
+
+`exl3_moe.cu:22-33` builds the table and `:226` indexes it:
+
+```
+fp_exl3_moe_kernel kernel = exl3_moe_kernel_instances[4 * K + 2 * cb_idx + N_off];
+```
+
+`K` in 0..8, `cb_idx` in {0, 1}, `N_off` in {0, 1} — 36 instantiations, split one
+file per (K, cb) in `comp_units/exl3_moe_inst_k*_cb*.cu`. Two of upstream's own
+bounds are load-bearing and neither appears in our refusal message:
+
+- **Codebook 0 is not a MoE arm upstream either.** `exl3_moe.cu:184` is
+  `TORCH_CHECK(gate_mcg != gate_mul1, "MoE kernel: Only mcg and mul1 codebooks
+  are supported")`, and `:185` derives `cb_idx = gate_mul1 ? 1 : 0`. A 3INST
+  checkpoint is refused before the table is indexed. So the MoE's reachable
+  codebook set is at most `{1, 2}` — it is NOT the GEMM's `{0, 1, 2}`, and a
+  refusal message that implies otherwise is wrong about upstream.
+- **`K == 0` is upstream's RUNTIME-width instance**, for a tower whose gate, up
+  and down widths differ (`exl3_moe_kernel.cuh:139-149`). Our port takes
+  `K_gate`, `K_up` and `K_down` as kernel arguments and then discards them —
+  `cuda_exl3.cu:1779` is `(void)K;` — so it serves only `Kg == Ku == Kd`. That
+  is a separate owed item from the width set, and `deepseek_v4.cpp:1450` already
+  refuses a disagreeing tower by name, so nothing silently decodes one expert
+  with another's width.
+
+### The width set this slice takes, and why it is four and not eight
+
+`dq_dispatch` (`cuda_exl3.cu:453-454`) static_asserts `bits == 3 || 4 || 5 || 6`
+and the reason is arithmetic rather than taste: the eight-window span
+`16 + bits*7` leaves the 64-bit funnel once the start shift is added at bits 5,
+which is why 5 and 6 route through two `dq4`s, and 1, 2, 7 and 8 have no route
+in this tree at all. Widths outside that set are a DECODER question the GEMM
+shares, not a MoE question, and this slice does not open it.
+
+So the set is `bits` in {3, 4, 5, 6} at `cb == 1`: four pairs, eight kernels
+against the current two, since each pair carries the `MOE_TILESIZE_N` 128 and 256
+forms upstream carries.
+
+**Shared memory admits every one of them, and the guard is already in the tree.**
+For the MoE shape (`TILESIZE_M` 16, `TILESIZE_K` 32, `SH_STAGES` 3) the
+`static_assert` in `exl3_gemm_kernel_inner` resolves to
+`kSmemMax >= 3*(2*512 + 2*512*bits) + 4*4096` at `MOE_TILESIZE_N == 256`, which
+is 28672 bytes at bits 3 and 37888 at bits 6 against a `kSmemMax` of 92160. The
+128 form is smaller still. A width that did not fit would fail to COMPILE on
+that assert rather than mis-stage silently, which is what makes widening here
+safe to attempt.
+
+### The dead predicate this slice also repairs
+
+`cuda_exl3.cu:2323-2325` refuses on `args.codebook != kMoeCb`. It cannot fire.
+`vt::Exl3MoeMlp` is the only route to the registered op and `ops.cpp:5609`
+refuses `codebook != 1` first, so the codebook half of that condition is
+unreachable and its refusal text can never print. The launcher keeps a codebook
+predicate — it is the right place for one — but the message now states
+upstream's `{1, 2}` bound rather than implying the GEMM's `{0, 1, 2}`.
+
+### Design
+
+Mirroring `Exl3ArmInstantiated`/`GemmKernelForShape`, which slice F left in the
+shape this needs:
+
+- `Exl3MoeArmInstantiated(int bits, int cb)`, `constexpr`, the single source of
+  truth for the arm set, carrying upstream's cb bound in its comment.
+- `MoeKernel(int bits, int cb, bool n256)` returning `const void*`, a dense
+  switch over the instantiated pairs, `nullptr` for anything else.
+- The launcher asks the predicate, refuses by name with both bounds stated, then
+  asks `MoeKernel`. A `nullptr` from `MoeKernel` on a pair the predicate admitted
+  is a `std::runtime_error` and not a launch, so the two can never disagree
+  silently.
+
+`Exl3MoeArgs`, `ops.cpp`'s shared validation and the CPU arm are UNCHANGED by
+this slice. The CPU arm already serves every width; that is what makes it the
+reference the device arm is gated against.
+
+### Tests
+
+`tests/vt/test_exl3_moe.cpp`:
+
+- `MakeMoeFixture` gains a `bits` parameter. It hardcoded `MakeFixture(..., 3,
+  ...)` three times while carrying an unused `MoeFixture::bits = 3` field, so
+  the fixture could not build a tower the widened arm needs.
+- The device case loops `bits` in {3, 4, 5, 6} and gates each against the CPU arm
+  at the SAME tier-4 bound the `(3, 1)` arm already carries, `rel <= 2.0e-2`
+  (`test_exl3_moe.cpp:585`). The bound is not widened for any new width.
+- The case asserts the arm RAN. A device case that skips reports its skip
+  through a `CHECK_FALSE` on the registration, exactly as the existing case
+  does, so `assertions: 0` can never read as a pass.
+- A host case pins the refusal: bits 7 refuses BY NAME and the message names
+  both the width and upstream's codebook bound.
+
+### Gates
+
+```sh
+ctest --test-dir build -R '^test_exl3_moe$' --output-on-failure
+ctest --test-dir build -R '^test_exl3_gemm$' --output-on-failure
+ctest --test-dir build -R '^test_cuda_deepseek_v4$' --output-on-failure
+scripts/agent-preflight.sh --staged
+```
+
+The device half needs an `rc` lease and a CUDA build. A CPU-only green says
+nothing about an arm that only exists in `cuda_exl3.cu`, and is never reported
+as one.
+
+### Mutations required
+
+| # | Mutation | Must |
+|---|---|---|
+| M1 | Drop bits 4 from `Exl3MoeArmInstantiated` | RED — the 4-bit device case refuses |
+| M2 | Drop bits 5 from `Exl3MoeArmInstantiated` | RED |
+| M3 | Drop bits 6 from `Exl3MoeArmInstantiated` | RED |
+| M4 | Swap one `MoeKernel` entry's `cb` template argument from 1 to 2 | RED — the wrong multiplier yields a correctly distributed and completely wrong weight, which a shape-checking gate cannot see |
+| M5 | Swap one `MoeKernel` entry's `bits` template argument to its neighbour | RED |
+| M6 | Delete the `vt::Exl3MoeMlp` call at `deepseek_v4.cpp:1659` | RED on the DSV4 forward case — the reachability proof |
+
+Each records the sha256 before and after, that the object rebuilt and its mtime
+moved, and that the tree was restored byte-for-byte.
+
+### Stop conditions for this slice
+
+- A new width's device result exceeds `2.0e-2` against the CPU arm → the port is
+  wrong. Never raise the bound.
+- The `static_assert` on `kSmemMax` fires for a width → record the number and
+  drop that width from the set; never raise `kSmemMax`.
+- The compile cost of `cuda_exl3.cu` at one architecture more than doubles →
+  the per-K translation-unit split this spec already owes stops being deferrable
+  and this slice carries it. The number is recorded with the evidence, measured
+  and not estimated.
+
 ## Tests
 
 - `tests/vt/test_exl3_dequant.cpp` — the hand-computed cb 2 table, a
@@ -492,9 +677,37 @@ green is not a device result and is never reported as one.
   rather than a gap this row opened. Bits 4 cb 2 IS in upstream's list, and
   reaching it is a kernel port: `LSTRIDE` is `bits == 3 ? 24 : 32`, `LOADS` is
   `WNT`, and a `dq8_regs_4bits` register extractor does not exist in this tree.
-- **The fused MoE arm is `(3, 1)` only** (`kMoeBits`/`kMoeCb`). Out of scope
-  here because the #2495 checkpoint is dense, and named so the next MoE EXL3
-  artifact does not rediscover it.
+- **The fused MoE at codebook 2 is a LOADER slice, not a kernel slice** (slice G,
+  #2756). Five sites pin the codebook to 1 before the kernel is chosen —
+  `deepseek_v4_weights.cpp:1017` refuses any marker but `mcg`,
+  `deepseek_v4.cpp:1336`, `:1371` and `:1549` each assign `args.codebook = 1`,
+  and `ops.cpp:5609` refuses `codebook != 1` in the SHARED seam for every
+  backend including the CPU reference. They have to widen together; a cb-2
+  instantiation added alone would be dead code. Upstream's own bound is
+  `{mcg, mul1}` (`exl3_moe.cu:184-185`), so cb 0 is never owed here.
+- **Upstream's `K == 0` runtime-width MoE instance is not ported.** A tower whose
+  gate, up and down widths differ takes upstream's runtime switch
+  (`exl3_moe_kernel.cuh:139-149`); this port discards `K_gate`/`K_up`/`K_down`
+  (`cuda_exl3.cu`, `(void)K;`) and refuses such a tower by name.
+- **`Exl3ArmInstantiated` has no `(4, 1)`, `(5, 1)` or `(6, 1)`, so after slice G
+  the fused MoE serves widths its own fallback does not.** The
+  `VT_DSV4_EXL3_FUSED_MOE=0` rollback lever therefore cannot serve a 4-, 5- or
+  6-bit mcg tower on a CUDA queue, and the fused arm is the only device path for
+  it. Named rather than fixed, because widening the GEMM's cb-1 set costs three
+  more pairs in the same translation unit for an artifact this tree has not
+  seen; the fused widening is driven by the reachability of `args.bits_gate`,
+  which the GEMM's own set does not share.
+- **`kExl3MoeMlp` on ROCm and on Vulkan.** Both are owed on their own rows with
+  their own reasons and neither is a transcription:
+  [`backend-rocm-exl3.md`](backend-rocm-exl3.md) `## Owed` ("unreached,
+  unwritten, and unmeasurable on this fleet" — no AMD board here holds the
+  ~99.5 GiB artifact that reaches it) and
+  [`backend-vulkan-exl3.md`](backend-vulkan-exl3.md) `## Owed` ("a rewrite and
+  not a transcription"). The Vulkan blocker is structural: the fused MoE is a
+  persistent cooperative launch whose group barrier is legal only because
+  `cudaLaunchCooperativeKernel` guarantees co-residency, and Vulkan has no
+  equivalent guarantee. Their `kExl3Gemm` arms are NOT narrowed — both decode
+  every width the host does — so only the fused op is missing.
 - **No end-to-end run of the #2495 checkpoint, and no benchmark.** This row
   ports the format. It does not produce the number #2495 asks for, which is why
   the commits say `Refs` and not `Closes`.
