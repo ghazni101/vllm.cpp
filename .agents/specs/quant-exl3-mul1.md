@@ -648,6 +648,44 @@ That claim had never been measured. The changed tree's number is beside it in th
 gate evidence below, so the split is argued from a ratio rather than from an
 estimate.
 
+### Slice G evidence — the `orin:gpu0` leg, 2026-09-03: COMPILES, cannot execute
+
+Tree `9a1014e0728899342aca1c8c26301d6f6f493434`, `cuda_exl3.cu` sha256
+`1add305e...5068eb3b`, tar asserted before the build. nvcc 13.3, `sm_87`,
+Release, `-j 4`. Leases `981e84ef-...` and `592d0142-...`.
+
+**What it establishes.** `RESULT GREEN BUILD_RC 0` — every one of the eight new
+instantiations compiles: bits 3, 4, 5 and 6 crossed with `MOE_TILESIZE_N` 128 and
+256, on an Ampere target. That was a live risk rather than a formality, because
+the MoE tile shape (`TILESIZE_M` 16, `TILESIZE_K` 32, `SH_STAGES` 3) had never
+been instantiated at any width but 3. Both compile-time guards the design leans
+on hold for every new width: `dq_dispatch`'s `static_assert(bits == 3 || 4 || 5 ||
+6)` and `exl3_gemm_kernel_inner`'s `static_assert(kSmemMax >= ...)`. A width that
+overflowed the staged tiles would have failed HERE, loudly, and none did.
+
+**What it cannot establish, and why.** No numeric result. The box has
+`/dev/nvidia0` and driver 540.4.0 against a CUDA 13.3 runtime, so
+`cudaGetDeviceCount` returns rc=35, "CUDA driver version is insufficient for CUDA
+runtime version". `cuda_backend.cu`'s registrar returns silently on a non-success
+rc, `kCUDA` is never registered, `vt::GetBackend(kCUDA)` throws, and both device
+cases took their no-device skip. The numbers are owed to `thor:gpu0`.
+
+**This leg is also where #2769 was found**, and the shape is worth keeping. The
+run came back `9 test cases | 7 passed | 2 failed`, `assertions: 42 | 40 passed |
+2 failed` — two red assertions against code that is fine, because the skip branch
+asserted `CHECK_FALSE(OpRegistered(kExl3MoeMlp, kCUDA))` and the CUDA op registrar
+is unconditional. An environment fault arrived wearing a code fault's costume. The
+environment half is recorded in [`environment.md`](../environment.md).
+
+**Two instrument defects were repaired inside this leg, and both would have read
+as results.** The job wrapper took its exit status from `wait` on an
+already-reaped child, which returns 127, and reported `CONFIGURE_RC=127` for a
+cmake that had printed "Build files have been written"; it now reads the status
+from a file the subshell writes. And the provisioning loop tested
+`command -v time`, which SUCCEEDS because `time` is a bash keyword, so
+`/usr/bin/time` was never installed and the compile-time measurement was lost;
+the timing is now a wall clock, which needs no package.
+
 ### Mutations required
 
 | # | Mutation | Must |
