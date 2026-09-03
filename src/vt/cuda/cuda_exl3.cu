@@ -2324,9 +2324,11 @@ void Exl3GemmKernelCuda(Queue& q, Tensor& c, const Tensor& a, const Tensor& trel
 //   widths differ (`exl3_moe_kernel.cuh:139-149`). This port takes K_gate, K_up
 //   and K_down as kernel arguments and discards them (`(void)K;` in
 //   `exl3_moe_kernel`'s `gemm_band`), so it serves only Kg == Ku == Kd. That is
-//   owed separately from the width set, and `deepseek_v4.cpp` already refuses a
-//   disagreeing tower BY NAME, so nothing decodes one expert with another's
-//   width.
+//   owed separately from the width set. NOTHING ELSE CATCHES IT: the only width
+//   check above this one is `deepseek_v4.cpp`'s, and it compares each projection
+//   ACROSS EXPERTS (`xe.w1.bits == e0.w1.bits` and its two siblings) rather than
+//   the three projections against each other, so a tower whose gate and down
+//   widths differ passes it. The launcher refuses that below.
 //
 // WIDTHS 3..6 AND CODEBOOK 1, and each half of that has its own reason.
 //

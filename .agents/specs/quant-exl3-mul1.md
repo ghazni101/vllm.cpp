@@ -503,9 +503,11 @@ bounds are load-bearing and neither appears in our refusal message:
   and down widths differ (`exl3_moe_kernel.cuh:139-149`). Our port takes
   `K_gate`, `K_up` and `K_down` as kernel arguments and then discards them —
   `cuda_exl3.cu:1779` is `(void)K;` — so it serves only `Kg == Ku == Kd`. That
-  is a separate owed item from the width set, and `deepseek_v4.cpp:1450` already
-  refuses a disagreeing tower by name, so nothing silently decodes one expert
-  with another's width.
+  is a separate owed item from the width set, and NOTHING ABOVE THE LAUNCHER
+  catches it: `deepseek_v4.cpp:1450` compares each projection ACROSS EXPERTS
+  (`xe.w1.bits == e0.w1.bits` and its two siblings), not the three projections
+  against each other, so a tower whose gate and down widths differ passes it and
+  reaches the kernel. Slice G adds that refusal at the launcher.
 
 ### The width set this slice takes, and why it is four and not eight
 
