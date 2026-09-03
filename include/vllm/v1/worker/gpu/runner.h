@@ -128,6 +128,55 @@ void apply_grammar_bitmask(
         scheduled_spec_decode_tokens,
     vt::Queue& queue, vt::Tensor& logits);
 
+// PAGE-LOCKED host staging for a D2H copy the host does not wait for at the
+// copy's issue point (SPEC-DFLASH2 A2-2, #2802).
+//
+// WHY IT IS NOT A `std::vector`. `cudaMemcpyAsync` of device-to-host into
+// PAGEABLE memory is synchronous with respect to the host: the driver stages the
+// bytes through its own pinned buffer and the call does not return until that
+// staging is done. So a copy into a `std::vector` on a copy queue is not
+// asynchronous at all, and every event around it is decoration. This tree
+// already knows that — the async sampled-id route allocates its destination with
+// `vt::Backend::AllocPinned` (`src/vllm/v1/worker/gpu/async_output.cpp`), which
+// is what upstream gets for free by copying into torch CPU memory
+// (`vllm/v1/worker/gpu/async_utils.py:124-125` @ pin 5559679229).
+//
+// WHY A GROW RETAINS THE OLD BLOCK INSTEAD OF FREEING IT. Freeing a staging
+// block that a queued copy still writes is the same defect this wave's review
+// found in the accept walk's argmax scratch: correct while the wait is in step,
+// silently wrong the moment a later wave moves the wait. Retaining costs one
+// pointer per distinct size ever asked for — a handful over a process lifetime,
+// since the step shape is bounded by the batch — and it cannot be wrong.
+// Everything is released together in the destructor.
+//
+// On a backend without page-locked memory `AllocPinned` forwards to `Alloc`
+// (`vt::Backend::AllocPinned`), so this degrades to a plain host buffer and the
+// CPU tier sees the same tokens either way.
+class PinnedGrowStaging {
+ public:
+  PinnedGrowStaging() = default;
+  ~PinnedGrowStaging();
+  PinnedGrowStaging(const PinnedGrowStaging&) = delete;
+  PinnedGrowStaging& operator=(const PinnedGrowStaging&) = delete;
+
+  // A block of at least `elems` int32 values, page-locked. Stable until the
+  // NEXT call that asks for more than the current block holds; the block it
+  // replaces stays allocated, so a copy still in flight into the old block is
+  // writing memory this object still owns.
+  int32_t* Get(vt::Backend& backend, size_t elems);
+
+  // How many blocks are alive, so the retain rule above is assertable and not
+  // only readable. One after the first `Get`; one more per grow.
+  size_t live_blocks() const { return blocks_.size(); }
+  // The element count the current block holds.
+  size_t elems() const { return elems_; }
+
+ private:
+  vt::Backend* backend_ = nullptr;
+  std::vector<int32_t*> blocks_;
+  size_t elems_ = 0;
+};
+
 // The batched paged model runner (upstream GPUModelRunner, T0 slice).
 class GPUModelRunner final : public ModelRunnerBase {
  public:
@@ -841,6 +890,11 @@ class GPUModelRunner final : public ModelRunnerBase {
   vt::Event verify_fork_event_{};
   vt::Event verify_ready_event_{};
   bool verify_events_created_ = false;
+  // The kCopyQueueEvent route's D2H destination: one page-locked block holding
+  // the accept walk's `sampled` rows followed by its `num_sampled`. Pageable
+  // memory would make the copy host-synchronous and the events above decorative
+  // (see PinnedGrowStaging). Grown, never shrunk, and freed in the dtor.
+  PinnedGrowStaging verify_download_staging_;
   // Persistent pool of the per-step overlap resources (device sampled-id buffer +
   // pinned host buffer + events), so sample_tokens_async does NO per-step
   // cudaMalloc/cudaHostAlloc/cudaEventCreate (each of which device-syncs and
@@ -946,11 +1000,17 @@ class GPUModelRunner final : public ModelRunnerBase {
     // drain per verify step. This is what `RejectionSampler::forward` has
     // always done and what the synchronous sampler keeps.
     kMainQueueDrain,
-    // Fork the COPY queue off the main queue with an event, copy there, and
-    // block the HOST on that copy event alone — the main queue is never
-    // drained. Mirrors `AsyncOutput` (async_utils.py:29-44), which is how
-    // upstream gets its spec-step sampled ids across without stalling the
-    // compute stream (model_runner.py:1492-1499).
+    // Fork the COPY queue off the main queue with an event, copy there into
+    // page-locked host memory, and block the HOST on that copy event alone.
+    // The main queue is never SYNCHRONIZED, and the host still waits in step:
+    // the copy waited the fork event, so by the time the host is released the
+    // main queue has drained anyway. What this changes is the SHAPE — the copy
+    // is no longer a main-stream operation and the wait is on a copy-queue
+    // event a later wave can move past the propose. A2-4 and A2-5 are what
+    // actually move it (`.agents/specs/dflash2-async-spec-sampler.md`).
+    // Mirrors `AsyncOutput` (async_utils.py:29-44), which is how upstream gets
+    // its spec-step sampled ids across without stalling the compute stream
+    // (model_runner.py:1492-1499).
     kCopyQueueEvent,
   };
 

@@ -26,6 +26,7 @@ RejectionSamplerDeviceOutput::RejectionSamplerDeviceOutput(
       device_(other.device_),
       sampled_(other.sampled_),
       num_sampled_(other.num_sampled_),
+      target_argmax_(other.target_argmax_),
       num_reqs_(other.num_reqs_),
       width_(other.width_),
       draft_(std::move(other.draft_)),
@@ -33,6 +34,7 @@ RejectionSamplerDeviceOutput::RejectionSamplerDeviceOutput(
   other.backend_ = nullptr;
   other.sampled_ = nullptr;
   other.num_sampled_ = nullptr;
+  other.target_argmax_ = nullptr;
   other.num_reqs_ = 0;
   other.width_ = 0;
 }
@@ -45,6 +47,7 @@ RejectionSamplerDeviceOutput& RejectionSamplerDeviceOutput::operator=(
   device_ = other.device_;
   sampled_ = other.sampled_;
   num_sampled_ = other.num_sampled_;
+  target_argmax_ = other.target_argmax_;
   num_reqs_ = other.num_reqs_;
   width_ = other.width_;
   draft_ = std::move(other.draft_);
@@ -52,6 +55,7 @@ RejectionSamplerDeviceOutput& RejectionSamplerDeviceOutput::operator=(
   other.backend_ = nullptr;
   other.sampled_ = nullptr;
   other.num_sampled_ = nullptr;
+  other.target_argmax_ = nullptr;
   other.num_reqs_ = 0;
   other.width_ = 0;
   return *this;
@@ -61,9 +65,14 @@ void RejectionSamplerDeviceOutput::Release() {
   if (backend_ != nullptr) {
     if (sampled_ != nullptr) backend_->Free(sampled_);
     if (num_sampled_ != nullptr) backend_->Free(num_sampled_);
+    // The argmax scratch is freed HERE and nowhere else. It was a process-global
+    // in the CUDA backend, freed by whichever later call needed more rows, which
+    // is a free under a still-queued accept kernel (SPEC-DFLASH2 A2-2, #2802).
+    if (target_argmax_ != nullptr) backend_->Free(target_argmax_);
   }
   sampled_ = nullptr;
   num_sampled_ = nullptr;
+  target_argmax_ = nullptr;
   // The staging goes with them: it is only alive because the kernel reads it.
   draft_.reset();
   cu_.reset();
@@ -129,14 +138,27 @@ RejectionSamplerDeviceOutput RejectionSampler::verify(
       backend.Alloc(static_cast<size_t>(num_reqs * width) * sizeof(int32_t));
   dev_out.num_sampled_ =
       backend.Alloc(static_cast<size_t>(num_reqs) * sizeof(int32_t));
+  // The accept walk's own scratch, allocated PER CALL and owned by this object
+  // for the same reason its outputs are (SPEC-DFLASH2 A2-2, #2802): the argmax
+  // kernel writes it and the accept kernel reads it, both after this function
+  // returns. A shared grow-only buffer in the backend was the previous shape and
+  // it freed this window's memory whenever a later, larger call grew it. The
+  // per-step allocation is not a new cost class either — the two lines above
+  // already allocate per call.
+  dev_out.target_argmax_ =
+      backend.Alloc(static_cast<size_t>(num_logits) * sizeof(int32_t));
 
   vt::Tensor sampled_t = vt::Tensor::Contiguous(dev_out.sampled_, vt::DType::kI32,
                                                 dev, {num_reqs, width});
   vt::Tensor num_sampled_t =
       vt::Tensor::Contiguous(dev_out.num_sampled_, vt::DType::kI32, dev, {num_reqs});
-  vt::GreedyRejectionSample(q, sampled_t, num_sampled_t, logits,
+  vt::Tensor target_argmax_t =
+      vt::Tensor::Contiguous(dev_out.target_argmax_, vt::DType::kI32, dev, {num_logits});
+  vt::GreedyRejectionSample(q, sampled_t, num_sampled_t, target_argmax_t, logits,
                             dev_out.draft_->tensor(), dev_out.cu_->tensor());
-  // NOTHING is copied and NO queue is waited on here. That is the whole split.
+  // NOTHING is copied and NO queue is waited on here. That is the whole split,
+  // and it is now true of the backend too: the op no longer reaches a global it
+  // has to free, so no allocator call inside it can synchronize the device.
   return dev_out;
 }
 

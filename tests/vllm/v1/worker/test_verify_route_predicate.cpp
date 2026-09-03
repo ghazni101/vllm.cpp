@@ -21,14 +21,29 @@
 // paired with a per-step route predicate (#2710,
 // `tests/vllm/v1/worker/test_combine_row_predicate.cpp`). It survived 27
 // mutations because every test used `num_reqs == 1`, so the two readings agreed
-// on every input. The DISAGREEMENT case below is the input that separates them,
-// and it is the reason this file is not a restatement of `> 0`.
+// on every input.
 //
-// RED-first for this file: before the change neither `StepRoutesToVerify` nor
-// `RowCarriesDraftTokens` existed, and the binary did not compile. After the
-// change, mutating `StepRoutesToVerify` to the per-row reading
-// (`return per_req[0] > 0`-shaped, i.e. any reading that is not the total) reds
-// the MIXED case below while every single-request case here stays green.
+// WHAT ACTUALLY PREVENTS THE #2710 SHAPE HERE IS THE SIGNATURE, NOT THIS FILE,
+// and an earlier version of this comment claimed otherwise. `StepRoutesToVerify`
+// takes ONE `int32_t` (`prepare_inputs.h`). There is no per-request vector in
+// scope inside it, so the per-row mutation that comment described
+// (`return per_req[0] > 0`) cannot be written at all — a reader who tried it
+// would find the file does not compile, which is not a red and not evidence.
+// The mutation this file DOES detect is one on the same scalar: widen the
+// boundary to `!= 0` and the negative-total case goes red; invert it and every
+// case goes red.
+//
+// AND THE TWO READINGS ARE NOT INDEPENDENT. For non-negative per-request counts
+// — the only kind `prepare_inputs` can build, since they are sizes —
+// `any_i RowCarriesDraftTokens(k_i)` is IDENTICALLY equal to
+// `StepRoutesToVerify(Σ k_i)`: a sum of non-negative numbers is positive exactly
+// when one term is. The DISAGREEMENT case below asserts that equality rather
+// than a disagreement, and what it pins is narrower and still worth pinning: the
+// MAJORITY of the per-row answers is false on a mixed step, so a re-derivation
+// that took the per-row answer for the row it happens to be looking at — which
+// is what #2710 did — answers wrongly for the step, and the tensor the sampler
+// is handed has Σ(1 + k_i) rows rather than one per request. That is the fact
+// this file exists to keep executable.
 #include <doctest/doctest.h>
 
 #include <cstdint>
@@ -71,7 +86,7 @@ TEST_CASE("the row predicate answers about ONE row and never about the step") {
   CHECK(RowCarriesDraftTokens(3));
 }
 
-TEST_CASE("THE DISAGREEMENT CASE: a MIXED step routes to verify on rows that drafted nothing") {
+TEST_CASE("THE MIXED STEP: rows that drafted nothing still route to verify") {
   // ── Three requests in one step. Rows 0 and 2 drafted NOTHING this step (a
   // request that was just admitted, or whose drafts were all rolled back); row 1
   // carries two drafts.
@@ -83,17 +98,21 @@ TEST_CASE("THE DISAGREEMENT CASE: a MIXED step routes to verify on rows that dra
   // reading answers "verify" for the whole step, which is the only answer that
   // matches the tensor the sampler is handed.
   //
-  // This input is the only kind that separates the two readings, which is why a
-  // `num_reqs == 1` suite cannot gate this rule at all.
+  // This case does NOT separate `any_i RowCarriesDraftTokens(k_i)` from
+  // `StepRoutesToVerify(Σ k_i)`; for non-negative counts nothing can, and the
+  // last block below asserts they agree. What it separates is a reading that
+  // answers for ONE row from a reading that answers for the step, which is the
+  // mistake #2710 made and which a `num_reqs == 1` suite cannot see.
   const std::vector<int32_t> per_req{0, 2, 0};
   const int32_t total = StepTotal(per_req);
   CHECK(total == 2);
   CHECK(StepRoutesToVerify(total));
 
   // The two readings, side by side and executable. The MAJORITY of the per-row
-  // answers is false while the step answer is true. If these ever agreed on
-  // every row, this case would have stopped discriminating, and this block says
-  // so rather than leaving it to inspection.
+  // answers is false while the step answer is true, so a re-derivation that
+  // reads one row and calls it the step's answer is wrong here two times in
+  // three. That is the discriminating fact, and it is a fact about the ROWS,
+  // not about the aggregate — which agrees, as the last block states.
   CHECK_FALSE(RowCarriesDraftTokens(per_req[0]));
   CHECK(RowCarriesDraftTokens(per_req[1]));
   CHECK_FALSE(RowCarriesDraftTokens(per_req[2]));
@@ -128,18 +147,22 @@ TEST_CASE("the refusal at the async input combine fires on the MIXED step too") 
   // instrument for it is the reviewer's mutation (change one site's predicate
   // and this file must go red for the route half; the refusal half is
   // unreachable today and is recorded as owed in the row's spec). What this case
-  // DOES pin is the input on which a re-derived per-request refusal would differ
-  // from the route: the mixed step routes to verify, so the refusal must fire,
-  // even though two of its three rows drafted nothing.
+  // DOES pin is that route and refusal PARTITION the input: on the mixed step
+  // the route fires and the refusal does not, and there is no value of the total
+  // for which both or neither hold. The refusal site carries one check the route
+  // does not — a separate `>= 0` on the total — because negating `> 0` admits a
+  // negative total that the pre-A2-2 `== 0` refusal rejected; that check is a
+  // structural guard beside the predicate, not a second reading of it.
   const std::vector<int32_t> mixed{0, 2, 0};
   const bool routes = StepRoutesToVerify(StepTotal(mixed));
   const bool refuses = !StepRoutesToVerify(StepTotal(mixed));
   CHECK(routes);
   CHECK_FALSE(refuses);
 
-  // The per-request reading a re-derivation would have used, made explicit: it
-  // says "no drafts" for the majority of the rows, and on this step that answer
-  // is wrong for the step.
+  // The per-request reading a re-derivation would have used, made explicit. The
+  // OR over the rows agrees with the step answer — it must, for non-negative
+  // counts — so the danger was never that the aggregate differs. It is that the
+  // rows individually say "no drafts" for the majority of this step.
   bool any_row = false;
   for (const int32_t k : mixed) any_row = any_row || RowCarriesDraftTokens(k);
   CHECK(any_row == routes);

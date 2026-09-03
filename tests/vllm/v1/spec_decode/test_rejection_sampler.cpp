@@ -261,7 +261,17 @@ TEST_CASE("rejection_sampler: placeholder draft token (-1) is rejected") {
 }
 
 // A chunked-prefilling row samples and rejects nothing
-// (_get_num_sampled_and_rejected_kernel, gpu/input_batch.py:421-433).
+// (_get_num_sampled_and_rejected_kernel, gpu/input_batch.py:421-433). Row 0 here
+// both CARRIES DRAFTS (k = 2) and is prefilling, which is the shape the rule is
+// about; a prefilling row with no drafts would zero counts that are already zero.
+//
+// THE SAMPLER IS THE ONLY HALF THIS ASSERTS. `GPUModelRunner` does not pass these
+// two numbers to the propose: it writes `num_accepted_tokens = max(0, 1) = 1` for
+// this row and `propose_after_verify` re-derives `num_sampled = 1`,
+// `num_rejected = k` from that, where upstream passes the kernel's 0 and 0
+// through (`vllm/v1/worker/gpu/model_runner.py:1144` -> `:1533-1546`). That
+// divergence is pre-existing, A2-2 gave it a second entry point, and it is
+// recorded under `## Owed` in `.agents/specs/dflash2-async-spec-sampler.md`.
 TEST_CASE("rejection_sampler: a chunked-prefilling row reports 0 sampled and 0 rejected") {
   VerifyStep s = MakeStep({{1, 2}, {3}}, {{1, 9, 5}, {3, 4}});
   Queue q = Q();
@@ -477,6 +487,143 @@ TEST_CASE("A2-2: the device result moves without losing or double-freeing its bu
   vt::GetBackend(dst.device().type).Synchronize(q);
   CHECK(ns[0] == 3);
   CHECK(out == std::vector<int32_t>{1, 2, 6});
+}
+
+// ─── A2-2 REPAIR: THE ACCEPT WALK'S SCRATCH IS PER CALL, NOT PER PROCESS ─────
+//
+// A fresh review found the ownership paragraph on `RejectionSamplerDeviceOutput`
+// false: the accept walk reads SIX buffers and the object owned four. The one
+// that mattered was the per-row argmax, which the CUDA arm kept in a file-scope
+// grow-only global (`g_reject_argmax`) and `cudaFree`d from
+// `EnsureRejectArgmaxScratch` whenever a later call needed more rows. `verify`
+// returns with both kernels still queued, so that free lands under a still-
+// queued accept kernel, and `target_argmax[start + i]` then reads whatever took
+// the allocation's place. Speculative decoding is lossless, so the outcome is a
+// wrong accept prefix and wrong emitted ids with no exception anywhere — reason
+// A's class exactly (#1366). It is reachable with two runners in one process
+// today, and reachable from one engine's own next step as soon as A2-4/A2-5 move
+// the wait past the propose, which is what this type exists for.
+//
+// WHAT THIS TIER CAN AND CANNOT SHOW. On CPU the kernel has already finished
+// when `verify` returns, so a shared scratch corrupts nothing here and no CPU
+// test can turn the defect into a wrong token. What IS observable is the
+// aliasing itself: two device results that are alive at the same time must hold
+// DIFFERENT scratch. That is the property the fix installs, and it is the one a
+// mutation can flip.
+//
+// RED-first, by mutation, since the buffer is new: making `verify` hand both
+// calls one shared buffer (a function-static `int32_t*` grown on demand — the
+// exact shape the CUDA global had) reds the pointer assertion below while every
+// token case in this file stays green, which is the point: the tokens never
+// moved on this backend either.
+TEST_CASE("A2-2 repair: two live verifies own SEPARATE argmax scratch") {
+  const VerifyStep small = MakeStep({{1}}, {{1, 2}});
+  const VerifyStep big = MakeStep({{1, 2, 3}, {4, 5, 6}}, {{1, 2, 3, 7}, {4, 5, 6, 8}});
+  Queue q = Q();
+  Tensor small_logits = Tensor::Contiguous(const_cast<float*>(small.logits.data()), DType::kF32,
+                                           Cpu(), {small.num_logits, static_cast<int64_t>(kVocab)});
+  Tensor big_logits = Tensor::Contiguous(const_cast<float*>(big.logits.data()), DType::kF32, Cpu(),
+                                         {big.num_logits, static_cast<int64_t>(kVocab)});
+  RejectionSampler sampler(3);
+
+  // The first walk is issued and NOT waited on, exactly as the copy-queue route
+  // leaves it. The second is larger, which is precisely the input that made the
+  // old grow-only global free the first one's buffer.
+  vllm::v1::RejectionSamplerDeviceOutput first =
+      sampler.verify(q, small_logits, small.draft_sampled, small.cu_num_logits);
+  vllm::v1::RejectionSamplerDeviceOutput second =
+      sampler.verify(q, big_logits, big.draft_sampled, big.cu_num_logits);
+
+  REQUIRE(first.target_argmax_scratch() != nullptr);
+  REQUIRE(second.target_argmax_scratch() != nullptr);
+  CHECK(first.target_argmax_scratch() != second.target_argmax_scratch());
+
+  // Non-vacuous: the scratch is the walk's real input, not an unused allocation.
+  // On this backend it is host-readable, so assert the values the accept walk
+  // read — the per-row argmaxes of each step's OWN logits, which is what a
+  // shared buffer would have lost for the first result.
+  const int32_t* first_argmax = static_cast<const int32_t*>(first.target_argmax_scratch());
+  CHECK(first_argmax[0] == 1);  // row 0 argmax: request 0's first target token
+  CHECK(first_argmax[1] == 2);  // row 1 argmax: the bonus row
+  const int32_t* second_argmax = static_cast<const int32_t*>(second.target_argmax_scratch());
+  CHECK(second_argmax[0] == 1);
+  CHECK(second_argmax[3] == 7);
+  CHECK(second_argmax[4] == 4);
+  CHECK(second_argmax[7] == 8);
+
+  // And both results still decode correctly after the interleaving, read in the
+  // order that would have been corrupted (the OLDER one last).
+  std::vector<int32_t> big_sampled(static_cast<size_t>(second.num_reqs() * second.width()));
+  std::vector<int32_t> big_ns(static_cast<size_t>(second.num_reqs()));
+  second.CopyToHost(q, big_sampled.data(), big_ns.data());
+  std::vector<int32_t> small_sampled(static_cast<size_t>(first.num_reqs() * first.width()));
+  std::vector<int32_t> small_ns(static_cast<size_t>(first.num_reqs()));
+  first.CopyToHost(q, small_sampled.data(), small_ns.data());
+  vt::GetBackend(first.device().type).Synchronize(q);
+  CHECK(small_ns[0] == 2);
+  CHECK(big_ns[0] == 4);
+  CHECK(big_ns[1] == 4);
+  const RejectionSamplerOutput small_out = RejectionSampler::finalize(
+      small_sampled, first.width(), small_ns, small.cu_num_logits, {});
+  CHECK(small_out.sampled_token_ids[0] == std::vector<int32_t>{1, 2});
+}
+
+// ─── A2-2 REPAIR: THE EVENT CHOREOGRAPHY, RUN RATHER THAN READ ──────────────
+//
+// A fresh review found the copy-queue route's event sequence untested on every
+// tier: `RunSplit` above waits with `Backend::Synchronize(q)` and never touches
+// `RecordEvent`, `QueueWaitEvent`, `SynchronizeEvent` or a second queue, so the
+// five-call sequence the runner actually issues existed only in inspection.
+//
+// This case issues that sequence — the runner's, call for call and in its order:
+// record a fork event on the MAIN queue, make a SECOND queue wait it, issue both
+// D2H copies on the second queue, record a ready event there, block the host on
+// that event alone, and never synchronize the main queue.
+//
+// WHAT IT GATES, exactly: that the sequence is well formed and loses nothing. On
+// this backend every event is a null-handle no-op and `Copy` is a memcpy, so it
+// CANNOT observe an overlap and does not claim one — that is G3/G4 at A2-5 and
+// needs a GPU. A test that "passes" here is a test that the ordering primitives
+// are called on the right queues with the right buffers and the tokens survive.
+TEST_CASE("A2-2 repair: the fork/copy/ready event sequence is token-identical") {
+  const VerifyStep s = MakeStep({{}, {1, 2}, {7, 8, 9}},
+                                {{4}, {1, 2, 6}, {7, 3, 9, 5}});
+  vt::Backend& backend = vt::GetBackend(DeviceType::kCPU);
+  Queue main_q = Q();
+  Queue copy_q = backend.CreateQueue();
+  vt::Event fork = backend.CreateEvent();
+  vt::Event ready = backend.CreateEvent();
+
+  Tensor logits = Tensor::Contiguous(const_cast<float*>(s.logits.data()), DType::kF32,
+                                     Cpu(), {s.num_logits, static_cast<int64_t>(kVocab)});
+  RejectionSampler sampler(3);
+  vllm::v1::RejectionSamplerDeviceOutput dev =
+      sampler.verify(main_q, logits, s.draft_sampled, s.cu_num_logits);
+  const int64_t rows = dev.num_reqs();
+  const int64_t width = dev.width();
+  std::vector<int32_t> host_sampled(static_cast<size_t>(rows * width));
+  std::vector<int32_t> host_num_sampled(static_cast<size_t>(rows));
+
+  backend.RecordEvent(fork, main_q);
+  backend.QueueWaitEvent(copy_q, fork);
+  dev.CopyToHost(copy_q, host_sampled.data(), host_num_sampled.data());
+  backend.RecordEvent(ready, copy_q);
+  backend.SynchronizeEvent(ready);
+  // The main queue is NOT synchronized anywhere in this case, which is the one
+  // structural property the route exists for.
+
+  const RejectionSamplerOutput out = RejectionSampler::finalize(
+      host_sampled, width, host_num_sampled, s.cu_num_logits, {});
+  CheckSameTokens(out, RunWhole(s, 3, {}));
+  // Non-vacuous, and the same three shapes A2-2.2 uses.
+  REQUIRE(out.sampled_token_ids[0] == std::vector<int32_t>{4});
+  REQUIRE(out.sampled_token_ids[1] == std::vector<int32_t>{1, 2, 6});
+  REQUIRE(out.sampled_token_ids[2] == std::vector<int32_t>{7, 3});
+  REQUIRE(out.num_rejected[2] == 2);
+
+  backend.DestroyEvent(fork);
+  backend.DestroyEvent(ready);
+  backend.DestroyQueue(copy_q);
 }
 
 // SKIPPED (test-porting rule 6), tracked to M-mtp-3 (spec §5):

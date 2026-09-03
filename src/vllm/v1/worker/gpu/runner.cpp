@@ -2410,8 +2410,21 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
     // The refusal reads the ROUTE predicate itself, negated, rather than a
     // re-derivation of it (SPEC-DFLASH2 A2-2, #2802). A refusal whose predicate
     // is a second reading of its route's predicate is the shape this tree has
-    // already shipped once (#2710), and the two are `> 0` and `== 0` on the same
-    // per-STEP total precisely so they cannot disagree on any input.
+    // already shipped once (#2710). Negation is exact: the route is `> 0` and
+    // this is its complement on the same per-STEP total, so the two partition
+    // every input and no value routes and refuses, or does neither.
+    //
+    // THAT IS NOT THE SAME AS THE REFUSAL THIS REPLACED, and the difference is
+    // one class of input. The pre-A2-2 check was `step.num_draft_tokens == 0`,
+    // which refused a NEGATIVE total; `!StepRoutesToVerify` is `<= 0`, which
+    // admits one. A negative total is not constructible — `prepare_inputs.cpp`
+    // builds it by summing per-request draft counts, which are sizes — so the
+    // change is unreachable rather than harmless, and the check below restores
+    // the strictly stronger refusal without splitting the route predicate in
+    // two. A count that went negative is a corrupt step, not a decode step.
+    VT_CHECK(step.num_draft_tokens >= 0,
+             "async input combine: the step's draft-token total is negative, which "
+             "is a corrupt step (it is a sum of per-request counts)");
     VT_CHECK(!StepRoutesToVerify(step.num_draft_tokens),
              "async input combine: this step scheduled draft tokens, but the "
              "draft buffer the combine scatters from is not wired yet "
@@ -3219,9 +3232,17 @@ ModelRunnerOutput GPUModelRunner::sample_tokens_with_rejection(
     // returns with its outputs still on the device and nothing waited on. We
     // then do exactly what AsyncOutput does for the non-spec sampled ids
     // (async_utils.py:29-44): record a fork event on the main queue, make the
-    // copy queue wait it, issue the two D2H copies THERE, record a completion
-    // event on the copy queue, and block the host on that event alone. The main
-    // queue is never synchronized, which is the drain this wave removes.
+    // copy queue wait it, issue the two D2H copies THERE into PAGE-LOCKED host
+    // memory, record a completion event on the copy queue, and block the host on
+    // that event alone. The main queue is never synchronized; the host still is,
+    // right here, and the paragraph below says what that does and does not buy.
+    //
+    // The destination is `verify_download_staging_` and not a `std::vector` on
+    // purpose: a device-to-host `cudaMemcpyAsync` into PAGEABLE memory is
+    // host-synchronous, so a pageable destination would make the two events
+    // above decorative and no later wave could obtain any overlap from them
+    // (PinnedGrowStaging, runner.h). The host vectors below are filled from that
+    // block AFTER the wait, which is a host-to-host copy of a few hundred ints.
     //
     // `dev_out` outlives the wait, so the buffers the kernel writes and the
     // staging it reads are alive for the whole in-flight window — the lifetime
@@ -3234,7 +3255,7 @@ ModelRunnerOutput GPUModelRunner::sample_tokens_with_rejection(
     // an event: the copy waited the fork event, so by the time it completes the
     // main queue has drained anyway. What changed is the SHAPE — the copy is no
     // longer a main-stream operation and the wait is on a copy-queue event that
-    // a later wave can move past the propose. The drain is removable from here;
+    // a later wave can move past the propose. The drain is REMOVABLE from here;
     // it is not removed here, and no overlap is claimed on this head.
     RejectionSamplerDeviceOutput dev_out =
         rejection_sampler.verify(queue_, logits, draft_sampled, step.cu_num_logits);
@@ -3246,11 +3267,19 @@ ModelRunnerOutput GPUModelRunner::sample_tokens_with_rejection(
       vt::Backend& backend = vt::GetBackend(dev_out.device().type);
       vt::Queue& copy_q = get_or_create_async_copy_queue();
       ensure_verify_events();
+      // One page-locked block for both copies: `sampled` [rows, width] first,
+      // then `num_sampled` [rows].
+      const size_t sampled_elems = static_cast<size_t>(rows * width);
+      int32_t* pinned =
+          verify_download_staging_.Get(backend, sampled_elems + static_cast<size_t>(rows));
       backend.RecordEvent(verify_fork_event_, queue_);
       backend.QueueWaitEvent(copy_q, verify_fork_event_);
-      dev_out.CopyToHost(copy_q, host_sampled.data(), host_num_sampled.data());
+      dev_out.CopyToHost(copy_q, pinned, pinned + sampled_elems);
       backend.RecordEvent(verify_ready_event_, copy_q);
       backend.SynchronizeEvent(verify_ready_event_);
+      std::copy(pinned, pinned + sampled_elems, host_sampled.begin());
+      std::copy(pinned + sampled_elems, pinned + sampled_elems + static_cast<size_t>(rows),
+                host_num_sampled.begin());
     }
     rs = RejectionSampler::finalize(host_sampled, width, host_num_sampled,
                                     step.cu_num_logits, chunked_prefilling);
@@ -4680,6 +4709,33 @@ vt::Queue& GPUModelRunner::get_or_create_async_copy_queue() {
   return async_copy_queue_;
 }
 
+// ─── PinnedGrowStaging (SPEC-DFLASH2 A2-2, #2802) ───────────────────────────
+// See the header for why the destination of an unwaited D2H must be page-locked
+// and why a grow keeps the block it replaces.
+
+PinnedGrowStaging::~PinnedGrowStaging() {
+  if (backend_ == nullptr) return;
+  for (int32_t* block : blocks_) {
+    if (block != nullptr) backend_->FreePinned(block);
+  }
+  blocks_.clear();
+}
+
+int32_t* PinnedGrowStaging::Get(vt::Backend& backend, size_t elems) {
+  if (elems == 0) elems = 1;
+  if (!blocks_.empty() && elems <= elems_ && backend_ == &backend) {
+    return blocks_.back();
+  }
+  // A backend swap can only happen if the runner's device changed, which it
+  // cannot; assert it by construction rather than silently mixing allocators.
+  VT_CHECK(backend_ == nullptr || backend_ == &backend,
+           "verify download staging: the backend must not change under a live block");
+  backend_ = &backend;
+  blocks_.push_back(static_cast<int32_t*>(backend.AllocPinned(elems * sizeof(int32_t))));
+  elems_ = elems;
+  return blocks_.back();
+}
+
 void GPUModelRunner::ensure_verify_events() {
   // SPEC-DFLASH2 A2-2. Two events, created on the first copy-queue verify and
   // re-recorded every step after that. `blocking=false` matches the async
@@ -4947,9 +5003,11 @@ std::unique_ptr<AsyncModelRunnerOutput> GPUModelRunner::sample_tokens_async(
   //
   // The download route is the wave's payload. `kCopyQueueEvent` forks the copy
   // queue off the main queue with an event and waits only that event, so the
-  // accept walk no longer drains the compute stream — mirroring how upstream
-  // gets its spec-step ids across (AsyncOutput, model_runner.py:1492-1499).
-  // The TOKENS are unchanged: same kernel, same numbers, only the wait moves.
+  // accept walk's copy is no longer a main-stream operation and its wait is a
+  // copy-queue event — mirroring how upstream gets its spec-step ids across
+  // (AsyncOutput, model_runner.py:1492-1499). The host STILL waits in step, and
+  // the shape is what changed, not the stall: A2-4 and A2-5 are the waves that
+  // move the wait. The TOKENS are unchanged: same kernel, same numbers.
   if (StepRoutesToVerify(exec_state_.step.num_draft_tokens)) {
     ModelRunnerOutput out_rej =
         sample_tokens_with_rejection(logits, VerifyDownload::kCopyQueueEvent);

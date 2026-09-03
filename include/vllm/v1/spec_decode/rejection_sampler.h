@@ -115,20 +115,48 @@ struct RejectionSamplerOutput {
 //     queue and drains it, which is byte-for-byte the pre-split behaviour and
 //     the route every synchronous caller keeps. The async verify arm forks a
 //     COPY queue off the main queue with an event, copies there, and blocks the
-//     host on that copy event alone, so the main queue is never drained.
+//     host on that copy event alone, so the wait is a copy-queue event rather
+//     than a main-queue drain. The HOST still waits in step; see `## Owed` in
+//     `.agents/specs/dflash2-async-spec-sampler.md` for what A2-4 and A2-5 move.
 //
 // LIFETIME IS THE POINT OF THE TYPE, not a detail of it. On a discrete backend
-// the accept-walk kernel is still running when `verify` returns, and it reads
-// the uploaded `draft_sampled` / `cu_num_logits` staging and writes the two
-// output buffers. Freeing any of the four before the caller has waited is a
-// device use-after-free — and a unified-memory backend (CPU, GB10) cannot show
+// the accept walk is still queued when `verify` returns, and its two kernels
+// read or write SIX buffers. Freeing any of them before the caller has waited is
+// a device use-after-free — and a unified-memory backend (CPU, GB10) cannot show
 // it, because there the staging is an in-place wrap of the caller's host vector
-// and the kernel has already finished. So this object owns all four and frees
-// them in its destructor: "still on device" and "still alive" are one statement.
+// and the kernels have already finished. So the invariant is stated here per
+// buffer, because "the object owns everything" was written once and was FALSE:
 //
-// One consequence the caller owns: on a unified-memory backend the staging IS
-// the caller's `draft_sampled` / `cu_num_logits` vectors, wrapped in place. They
-// must outlive this object, exactly as they must outlive a `forward` call.
+//   OWNED, and freed in the destructor — "still on device" and "still alive" are
+//   one statement for these five:
+//     * `sampled_`      [num_reqs, width] i32, the accept kernel's output;
+//     * `num_sampled_`  [num_reqs] i32, its other output;
+//     * `draft_`        the uploaded `draft_sampled` staging it reads;
+//     * `cu_`           the uploaded `cu_num_logits` staging it reads;
+//     * `target_argmax_` [num_logits] i32, the buffer the argmax kernel writes
+//       and the accept kernel reads. This one is owned HERE and is a parameter
+//       of `vt::GreedyRejectionSample` precisely because it cannot be a private
+//       static in the backend: a process-global grow-only scratch that a later,
+//       larger call `cudaFree`s is a free under this object's still-queued
+//       accept kernel, and the damage it does is a wrong accept prefix that no
+//       token gate in this tree can see (SPEC-DFLASH2 A2-2, #2802).
+//
+//   NOT OWNED, and therefore a CALLER OBLIGATION with no destructor to enforce
+//   it:
+//     * `logits` — the [num_logits, vocab] tensor passed to `verify`. It is the
+//       forward's own output buffer on the device path
+//       (`GPUModelRunner::assemble_sample_logits` hands the sampler
+//       `exec_state_.logits.device_tensor` directly), and the next step's
+//       forward WRITES THAT BUFFER. The argmax kernel reads it after `verify`
+//       returns, so the caller must not free it, reuse it, or run the next
+//       forward until it has waited for this object's outputs. Every caller in
+//       the tree satisfies this today because the wait is still in step. A2-4
+//       and A2-5 move that wait, and moving it past the next forward without
+//       double-buffering the logits is the failure this paragraph names in
+//       advance.
+//     * on a unified-memory backend the `draft_` / `cu_` staging IS the caller's
+//       `draft_sampled` / `cu_num_logits` vectors, wrapped in place. They must
+//       outlive this object, exactly as they must outlive a `forward` call.
 class RejectionSamplerDeviceOutput {
  public:
   RejectionSamplerDeviceOutput() = default;
@@ -154,6 +182,14 @@ class RejectionSamplerDeviceOutput {
   void CopyToHost(vt::Queue& q, int32_t* sampled_out,
                   int32_t* num_sampled_out) const;
 
+  // The accept walk's [num_logits] i32 argmax scratch, so a test can assert the
+  // ownership rule above rather than read it: two device results that are alive
+  // at the same time must not share this pointer. That is the ONE property of
+  // the fix a unified-memory tier can observe — on CPU the kernel has already
+  // finished, so a shared buffer corrupts nothing there and only the aliasing
+  // itself is visible. Null when num_reqs == 0.
+  const void* target_argmax_scratch() const { return target_argmax_; }
+
  private:
   friend class RejectionSampler;
   void Release();
@@ -162,6 +198,9 @@ class RejectionSamplerDeviceOutput {
   vt::Device device_{};
   void* sampled_ = nullptr;      // [num_reqs, width] i32, device-resident
   void* num_sampled_ = nullptr;  // [num_reqs] i32, device-resident
+  // [num_logits] i32, device-resident: written by the argmax kernel, read by the
+  // accept kernel, both after `verify` returns. Owned here for that reason.
+  void* target_argmax_ = nullptr;
   int64_t num_reqs_ = 0;
   int64_t width_ = 0;
   // The kernel's INPUTS, held for the same reason the outputs are.

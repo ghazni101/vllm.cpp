@@ -18,10 +18,13 @@ ships beside an implementation; `## Now` states the position and
 `## What was measured` states which head each measurement belongs to.
 
 The spec exists because its measurement turned the row's premise around: the
-veto at `src/vllm/v1/worker/gpu/runner.cpp:480`, and again at `:553` —
-GPUModelRunner has TWO constructors and each carries its own
-`async_input_combine_ =` assignment — is not a stale guard that a mirror
-argument can lift. When the spec was written it was load-bearing on two
+veto at the two `src/vllm/v1/worker/gpu/runner.cpp::async_input_combine_`
+assignments — GPUModelRunner has TWO constructors and each carries its own —
+is not a stale guard that a mirror argument can lift. It is cited by SYMBOL and
+not by line because this citation has now gone stale three times: it read
+`:472`/`:537`, then `:480`/`:553`, and the lines were 485 and 563 by the time a
+review checked. `scripts/check-symbol-anchors.py` gates the symbol form; nothing
+can gate a line number. When the spec was written it was load-bearing on two
 independent counts, one of them invisible to every token gate in this tree.
 A2-1 discharged that invisible count (reason A, the combine's arithmetic) and
 built G2 to hold it. **The veto still stands on reason B**, which A2-1 did not
@@ -351,7 +354,8 @@ a GPU and a device case that is not visibly skipped is a skip wearing a pass.
   `vt::cuda::LaunchCombineSampledAndDraftTokens`
   (`src/vt/cuda/cuda_combine_tokens.cu`) landed with no production step able to
   reach them: `async_input_combine_` is vetoed for every speculative engine at
-  BOTH construction sites, `runner.cpp:480` and `:553`, so every call site passes
+  BOTH construction sites, the two
+  `src/vllm/v1/worker/gpu/runner.cpp::async_input_combine_` assignments, so every call site passes
   an arange `cu_num_logits` and an empty draft buffer, and `num_draft_tokens` is
   always 0. The call sites refuse
   loudly (`VT_CHECK(step.num_draft_tokens == 0, ...)`) rather than combine a
@@ -413,7 +417,8 @@ a GPU and a device case that is not visibly skipped is a skip wearing a pass.
   `sample_tokens` routes on and the same one, negated, that the async input
   combine refuses on. Nothing reaches it: the function returns
   `sample_tokens(...)` unchanged when `!async_input_combine_`, and the veto at
-  `runner.cpp:480` and `:553` keeps `async_input_combine_` false for every
+  the two `src/vllm/v1/worker/gpu/runner.cpp::async_input_combine_` assignments
+  keeps `async_input_combine_` false for every
   speculative engine. The reachability mutation was run and it is silent, as
   expected: the whole `if` disabled (`if (false && StepRoutesToVerify(...))`),
   `test_mtp_depth` 10/10, `test_dflash2_runner_reach` 10/10 and `test_runner`
@@ -427,8 +432,10 @@ a GPU and a device case that is not visibly skipped is a skip wearing a pass.
   unreached for the same reason, and the CPU tier could not measure it even if
   it were.** It is the payload of the wave — the accept walk's two D2H copies
   move off the main queue onto the async copy queue, ordered by a fork event and
-  waited through a completion event, so the verify step stops draining the
-  compute stream. On the CPU backend `Copy` is a memcpy and every event is a
+  waited through a completion event, so the accept walk's copy stops being a
+  main-stream operation and its wait becomes a copy-queue event. The step still
+  stalls once: the host waits that event IN STEP, and the next bullet is the
+  entry that owns the distinction. On the CPU backend `Copy` is a memcpy and every event is a
   null-handle no-op (`vt::Backend` base implementations), so the route is
   observably token-identical and observably nothing else. The overlap is G3/G4
   at A2-5 and needs a GPU; nothing in this wave claims a throughput or latency
@@ -449,14 +456,95 @@ a GPU and a device case that is not visibly skipped is a skip wearing a pass.
   sampler byte-identical. The speculator's own draft download and `Synchronize`
   inside `propose_drafts` is untouched and is A2-3's. Owner: row `SPEC-DFLASH2`,
   issue #2802.
+- **THE `logits` BUFFER IS NOT OWNED BY THE ACCEPT WALK, AND A2-4/A2-5 ARE WHAT
+  MAKE THAT DANGEROUS.** A fresh review found the ownership paragraph on
+  `RejectionSamplerDeviceOutput` false: the walk reads six buffers and the object
+  owned four. Five are now owned, including the per-row argmax scratch this
+  repair moved out of the CUDA backend (see the entry below). The sixth cannot
+  be: `logits` is the FORWARD's own output buffer on the device path —
+  `include/vllm/v1/worker/gpu/runner.h::assemble_sample_logits` hands the sampler
+  `exec_state_.logits.device_tensor` directly — and the next step's forward
+  writes it. The argmax kernel reads it AFTER `verify` returns.
+
+  Today every caller is safe because the wait is still in step. The failure this
+  entry books is precise: **the moment A2-4 or A2-5 moves the wait past the next
+  forward, that forward overwrites the rows the argmax kernel has not read yet.
+  Speculative decoding is lossless, so the result is a garbage accept prefix and
+  wrong emitted ids with no exception anywhere** — reason A's class, invisible to
+  every token gate in this tree (#1366). A2-4 either keeps the wait ahead of the
+  next forward or double-buffers the logits; it may not simply move the wait.
+  The contract is written per buffer in
+  `include/vllm/v1/spec_decode/rejection_sampler.h` so the obligation is on the
+  type rather than in this file alone. Owner: row `SPEC-DFLASH2`, issue #2802.
+- **The CUDA arm of this repair was NOT COMPILED.** No `nvcc` on the CPU box and
+  no `rc` lease was taken, so `src/vt/cuda/cuda_sample.cu` carries its edit read
+  line for line and unbuilt. The edit is a deletion plus a substitution: the
+  file-scope `g_reject_argmax` / `g_reject_argmax_cap` / `EnsureRejectArgmaxScratch`
+  are gone, and both kernels take the caller's `target_argmax` tensor instead.
+  That global was the defect — `EnsureRejectArgmaxScratch` `cudaFree`d it to grow
+  it, and `GreedyRejectionSampleCuda` returns with both kernels still queued, so
+  a second caller with more rows freed the buffer the first caller's queued
+  accept kernel reads. It was reachable with two runners in one process and
+  reachable from one engine's next step as soon as the wait moves. The grow path
+  was also a device-wide synchronize inside a function that advertises waiting on
+  nothing. `tests/vt/test_cuda_ops.cpp` (CUDA-only, also unbuilt here) carries the
+  matching call-site change. Owner: row `SPEC-DFLASH2`, issue #2802.
+- **The copy-queue route's D2H destination is now PAGE-LOCKED, and the CUDA half
+  of that is unbuilt too.** It was a plain `std::vector<int32_t>`, and a
+  device-to-host `cudaMemcpyAsync` into pageable memory is host-synchronous —
+  driver-staged, returning only when the bytes are across — so the fork and ready
+  events around it were decorative and no later wave could have obtained overlap
+  from them. Upstream copies into torch CPU memory
+  (`vllm/v1/worker/gpu/async_utils.py:124-125` @ pin 5559679229) and this tree's
+  own async sampled-id route, the one this route mirrors, already uses
+  `AllocPinned` (`src/vllm/v1/worker/gpu/async_output.cpp`). The destination is
+  now `include/vllm/v1/worker/gpu/runner.h::PinnedGrowStaging`, which grows and
+  never frees the block it replaces, because freeing a block a queued copy still
+  writes is the same defect one level up. On CPU `AllocPinned` forwards to
+  `Alloc`, so the CPU tier gates the tokens and nothing else; whether the copy
+  actually overlaps is G3/G4 at A2-5 and needs a GPU. Owner: row `SPEC-DFLASH2`,
+  issue #2802.
+- **`propose_after_verify` DIVERGES from upstream for a row that both carries
+  drafts and is chunked-prefilling, and A2-2 doubled that divergence's reach.**
+  `RejectionSampler::finalize` zeroes both counts for such a row, mirroring
+  `vllm/v1/worker/gpu/input_batch.py:425-434`. The runner then writes
+  `num_accepted_tokens[i] = max(num_sampled, 1) = 1` (the GDN slot select's own
+  rule), and `propose_after_verify` re-derives the propose's inputs from THAT:
+  `num_sampled[i] = 1`, `num_rejected[i] = k`. Upstream passes the kernel's `0`
+  and `0` straight through to the propose
+  (`vllm/v1/worker/gpu/model_runner.py:1144` -> `:1533-1546`), so we hand the
+  proposer a rollback of `k` where upstream hands it none.
+
+  PRE-EXISTING: this is a byte-faithful lift of `e64f00560:runner.cpp:3560-3574`
+  and A2-2 neither wrote nor moved the arithmetic. What A2-2 did was give it a
+  SECOND entry point, so the same divergence now reaches from
+  `sample_tokens_async` as well. NOT FIXED HERE, deliberately: the fix is for the
+  propose to consume the sampler's `num_sampled` / `num_rejected` instead of
+  re-deriving them from `num_accepted_tokens`, which changes what the REACHABLE
+  synchronous propose receives and belongs with A2-3, the wave that owns the
+  propose's inputs. The sampler half of the shape is covered
+  (`tests/vllm/v1/spec_decode/test_rejection_sampler.cpp`, both the `forward` and
+  the split routes drive a row that carries drafts and is prefilling); the runner
+  half has no test, and `grep propose_after_verify tests/` returns nothing.
+  Owner: row `SPEC-DFLASH2`, issue #2802.
+- **The event choreography rests on a CPU-tier well-formedness test and on
+  inspection, never on an observed overlap.** `test_rejection_sampler.cpp` now
+  drives the runner's exact sequence — fork event recorded on the main queue,
+  a SECOND queue made to wait it, both D2H copies issued there, ready event
+  recorded on the copy queue, host blocked on that event alone — and asserts the
+  result is token-identical to `forward`. On the CPU backend every one of those
+  events is a null-handle no-op and `Copy` is a memcpy, so what the test gates is
+  that the sequence is well formed and loses nothing, NOT that anything overlaps.
+  Whether the copy runs concurrently with the compute stream is G3/G4 at A2-5 and
+  needs a GPU. Owner: row `SPEC-DFLASH2`, issue #2802.
 - **The `nsys` read (G4).** Needs `dgx:gpu0` under an `rc` lease. Not taken
   here; the task that produced this spec was explicitly denied a device.
 
 ## Now
 
-`SPEC-DFLASH2` stays `ACTIVE`. The veto STANDS at both construction sites,
-`runner.cpp:480` and `:553`, and its comment names the reasons that still hold
-rather than the one A2-1 removed.
+`SPEC-DFLASH2` stays `ACTIVE`. The veto STANDS at both construction sites, the
+two `src/vllm/v1/worker/gpu/runner.cpp::async_input_combine_` assignments, and
+its comment names the reasons that still hold rather than the one A2-1 removed.
 
 **A2-1 has landed** (#2644): `combine_sampled_and_draft_tokens` takes its
 per-request `num_logits` from `cu_num_logits`, carries the
@@ -470,10 +558,21 @@ accept walk and returns a `RejectionSamplerDeviceOutput` whose buffers are still
 on the device with nothing waited on, `CopyToHost` issues the two D2H copies on
 whatever queue the caller names, and `finalize` is the pure-host reduction.
 `forward` is those three in a row on one queue and is byte-for-byte its
-pre-split self. `sample_tokens_async` has a verify arm routing on
+pre-split self. A fresh review then returned FAIL on eight findings and they are
+repaired on the same branch: the accept walk's per-row argmax buffer moved out of
+a CUDA process-global and into the device result, which now states its ownership
+PER BUFFER and names `logits` as the one it does not own; the copy-queue route's
+D2H destination is page-locked; and the drain claim is stated as a change of
+SHAPE everywhere it appears, because the host still waits in step. The two
+findings that are not repaired here — the `logits` lifetime obligation A2-4/A2-5
+inherit, and `propose_after_verify`'s chunked-prefill divergence — are `## Owed`
+entries above, each with the failure written out. `sample_tokens_async` has a
+verify arm routing on
 `StepRoutesToVerify(exec_state_.step.num_draft_tokens)`, the one expression
 `sample_tokens` and the input-combine refusal also read, and it takes the
-copy-queue download route so the accept walk does not drain the main queue.
+copy-queue download route, so the accept walk's copy leaves the main queue and
+its wait becomes a copy-queue event. The host still waits in step; the `## Owed`
+entry on the removable drain says what A2-4 and A2-5 have to do to move it.
 
 **Reason B is closed in the code and NOT yet in the run.** The arm exists and is
 correct; nothing reaches it while the veto stands, exactly as A2-1's draft lane
