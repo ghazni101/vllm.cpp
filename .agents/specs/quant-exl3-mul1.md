@@ -604,6 +604,40 @@ The device half needs an `rc` lease and a CUDA build. A CPU-only green says
 nothing about an arm that only exists in `cuda_exl3.cu`, and is never reported
 as one.
 
+### Slice G evidence — the BASELINE leg, `thor:gpu0`, 2026-09-03
+
+Taken on the UNCHANGED tree at `3047871581bc55a0ab1a44006421bbe02698d5b8`, whose
+tar carried sha256 `eba5a1b8...4f3f706` and was asserted by the job before it
+built. `NVIDIA Thor`, compute capability 11.0, driver `595.78`, nvcc 13.0,
+aarch64, one architecture (`sm_110a`), Release, `-j 4`, ccache on for the build
+and OFF for the timed object. Lease `f0045063-48a4-4c71-9a95-dc58abd98b2a`.
+
+| Axis | Value |
+|---|---|
+| `BUILD_RC` | 0 |
+| `test_exl3_moe` | `rc=0`, `assertions: 41 \| 41 passed \| 0 failed` |
+| `cuda_exl3.cu`, alone, ccache OFF | **67.84 s**, max RSS 380344 kB |
+| the device case | **SKIPPED** |
+
+**The skip is the finding, and it is now measured rather than argued.** On a real
+CUDA device the case printed
+
+```
+test_exl3_moe.cpp:561: MESSAGE: SKIPPED, CUDA present but host pointers are not
+dereferenceable: the coalesced EXL3 tower is host-resident
+```
+
+so the tree's only fused-MoE device gate reported nothing about the device, on
+hardware, at `rc=0`, inside a green 41-assertion run. That is #2762, and it is
+why the widened arm could not have been gated without the upload first. The 41
+assertions are all host-arm ones.
+
+**67.84 s is the denominator for the compile-cost claim** this spec's `## Owed`
+makes about widening ("Upstream's own answer is a per-K compilation-unit split").
+That claim had never been measured. The changed tree's number is beside it in the
+gate evidence below, so the split is argued from a ratio rather than from an
+estimate.
+
 ### Mutations required
 
 | # | Mutation | Must |
