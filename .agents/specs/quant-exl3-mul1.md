@@ -463,7 +463,17 @@ calls `vt::Exl3Gemm`, and `Exl3ArmInstantiated` has no `(4, 1)`, `(5, 1)` or
 path today. Widening the fused launcher restores the default path, which is the
 one production takes.
 
-**The codebook is NOT reachable and would land dead.** Four sites pin it to 1
+**And the loader ADMITS those widths.** `deepseek_v4_weights.cpp:1024` is
+`VT_CHECK(bits >= 1 && bits <= 8 && ...)` on `quantization_config.bits` — any
+whole number in [1, 8] loads. The same function's only codebook check, twelve
+lines above at `:1017`, refuses everything but `mcg`. So the two halves of this
+gap are asymmetric AT THE LOADER, which is where the reachability argument
+actually rests: a DeepSeek-V4 EXL3 artifact declaring `bits: 4` loads, reaches
+`ModelRegistry::Forward`, reaches `MoeBlock`, reaches `Exl3FusedMoePass`, reaches
+`vt::Exl3MoeMlp` — and was refused at the launcher with no way back. One
+declaring `mul1` never loads at all.
+
+**The codebook is NOT reachable and would land dead.** Five sites pin it to 1
 before the kernel is chosen, and they have to widen together or not at all:
 
 | Site | What it does |
