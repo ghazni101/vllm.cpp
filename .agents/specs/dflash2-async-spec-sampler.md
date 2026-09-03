@@ -1,10 +1,12 @@
 # Spec: the device-resident async spec sampler (SPEC-DFLASH2, A2)
 
 Row: `SPEC-DFLASH2`.
-Issue: [#2644](https://github.com/mudler/vllm.cpp/issues/2644), which owns wave
-A2-1 and replaces #2116 as this spec's live issue. #2116 and #2108 no longer
-resolve, authenticated or anonymously; they stay in the text below as
-provenance, and nothing should be read from their numbers.
+Issue: [#2802](https://github.com/mudler/vllm.cpp/issues/2802), which owns wave
+A2-2 and is this spec's live issue.
+[#2644](https://github.com/mudler/vllm.cpp/issues/2644) owns wave A2-1, which
+has landed; it replaced #2116 and still owns that wave's `## Owed` entries.
+#2116 and #2108 no longer resolve, authenticated or anonymously; they stay in
+the text below as provenance, and nothing should be read from their numbers.
 Discharges: `## Owed` **A2** of
 [`spec-decode-async-scheduling.md`](spec-decode-async-scheduling.md), the wave
 that turned async SCHEDULING on for the Eagle-type family and deliberately left
@@ -136,9 +138,15 @@ refusal it now hits is the one guarding the unwired draft buffer, which is
 A2-3's half of reason B rather than A2-2's; the sampler still has no verify arm
 either, and that half simply no longer gets the chance to refuse first.
 
-### Reason B: the async sampler has no verify arm at all
+### Reason B: the async sampler has no verify arm at all — CLOSED BY A2-2
 
-This reason is unchanged by A2-1 and is the reason the veto still stands.
+**Historical from here down.** This subsection records the state A2-1 left and
+the evidence for it. A2-2 gave `sample_tokens_async` its verify arm, so the
+`file:line` and the grep below no longer describe the tree; they describe the
+head this section was written against. What SURVIVES A2-2 is the other half of
+the paragraph — `pending_drafts_` is still host-resident and the propose still
+consumes host `num_sampled` / `num_rejected` — and that half is A2-3's, which is
+why the veto still stands. Read `## Now` for the current position.
 
 `GPUModelRunner::sample_tokens_async` (`runner.cpp:4039-4212`) contains
 no reference to `sample_tokens_with_rejection`, to `propose_drafts`, to
@@ -399,6 +407,48 @@ a GPU and a device case that is not visibly skipped is a skip wearing a pass.
   turning it into a `VT_CHECK` changes a refusal's behaviour in released builds
   and that is its own change with its own red-before. Owner: row
   `SPEC-DFLASH2`, issue #2644.
+- **A2-2's async VERIFY ARM is UNREACHED, and A2-5 owns the wiring.** The arm
+  `sample_tokens_async` gained (`src/vllm/v1/worker/gpu/runner.cpp`) routes on
+  `StepRoutesToVerify(exec_state_.step.num_draft_tokens)` — the same expression
+  `sample_tokens` routes on and the same one, negated, that the async input
+  combine refuses on. Nothing reaches it: the function returns
+  `sample_tokens(...)` unchanged when `!async_input_combine_`, and the veto at
+  `runner.cpp:480` and `:553` keeps `async_input_combine_` false for every
+  speculative engine. The reachability mutation was run and it is silent, as
+  expected: the whole `if` disabled (`if (false && StepRoutesToVerify(...))`),
+  `test_mtp_depth` 10/10, `test_dflash2_runner_reach` 10/10 and `test_runner`
+  38/38 all stay green, exit 0. No CPU-tier test can reach it either, and that
+  is not a gap in the tests: with `async_input_combine_` forced on, a
+  speculative step refuses one stage EARLIER, at the A2-3 draft-buffer
+  `VT_CHECK` in `execute_model`, so the route cannot be made real without A2-3.
+  A2-3 supplies that buffer and A2-5 lifts the veto. Owner: row `SPEC-DFLASH2`,
+  issue [#2802](https://github.com/mudler/vllm.cpp/issues/2802).
+- **The COPY-QUEUE download route (`VerifyDownload::kCopyQueueEvent`) is
+  unreached for the same reason, and the CPU tier could not measure it even if
+  it were.** It is the payload of the wave — the accept walk's two D2H copies
+  move off the main queue onto the async copy queue, ordered by a fork event and
+  waited through a completion event, so the verify step stops draining the
+  compute stream. On the CPU backend `Copy` is a memcpy and every event is a
+  null-handle no-op (`vt::Backend` base implementations), so the route is
+  observably token-identical and observably nothing else. The overlap is G3/G4
+  at A2-5 and needs a GPU; nothing in this wave claims a throughput or latency
+  result. Owner: row `SPEC-DFLASH2`, issue #2802.
+- **A2-2 makes the first drain REMOVABLE; it does not remove it, and the
+  distinction is the one a reader will get wrong.** On the copy-queue route the
+  host still waits IN STEP, because the write-back and `propose_drafts` both
+  need `num_sampled` and the emitted ids on the host. Waiting on the ready event
+  is not free merely because it is an event: the copy waits the fork event, so
+  by the time it completes the main queue has drained anyway. What A2-2 changed
+  is the SHAPE — the copy is no longer a main-stream operation, and the wait is
+  on a copy-queue event a later wave can move past the propose. A2-3 (the propose
+  stops consuming host `num_sampled` / `num_rejected`) and A2-4 (the optimistic
+  `prev_num_draft_len` with the deferred correction) are what actually move it.
+  Until then the step still stalls once, and NO wave before A2-5 may report a
+  latency or throughput result for this. `RejectionSampler::forward` also keeps
+  its own `Synchronize`, deliberately, because that is what keeps the synchronous
+  sampler byte-identical. The speculator's own draft download and `Synchronize`
+  inside `propose_drafts` is untouched and is A2-3's. Owner: row `SPEC-DFLASH2`,
+  issue #2802.
 - **The `nsys` read (G4).** Needs `dgx:gpu0` under an `rc` lease. Not taken
   here; the task that produced this spec was explicitly denied a device.
 
@@ -415,5 +465,24 @@ per-request `num_logits` from `cu_num_logits`, carries the
 which refuse the same shapes. G2 exists and is green; G1 was green before and
 after. The draft lane is UNREACHED, as the `## Owed` entry above discloses.
 
-A2-2 is the next wave. It closes reason B, and A2-3 behind it is what makes
-A2-1's draft scatter reachable.
+**A2-2 has landed** (#2802). `RejectionSampler` is split: `verify` issues the
+accept walk and returns a `RejectionSamplerDeviceOutput` whose buffers are still
+on the device with nothing waited on, `CopyToHost` issues the two D2H copies on
+whatever queue the caller names, and `finalize` is the pure-host reduction.
+`forward` is those three in a row on one queue and is byte-for-byte its
+pre-split self. `sample_tokens_async` has a verify arm routing on
+`StepRoutesToVerify(exec_state_.step.num_draft_tokens)`, the one expression
+`sample_tokens` and the input-combine refusal also read, and it takes the
+copy-queue download route so the accept walk does not drain the main queue.
+
+**Reason B is closed in the code and NOT yet in the run.** The arm exists and is
+correct; nothing reaches it while the veto stands, exactly as A2-1's draft lane
+is unreached, and both `## Owed` entries say so. What A2-2 changed about the
+veto is that lifting it would no longer sample verify rows as decode rows — the
+half of reason B this wave owns. The other half is A2-3: `pending_drafts_` is
+still host-resident, `propose_drafts` still consumes host `num_sampled` /
+`num_rejected`, and the A2-3 `VT_CHECK` in `execute_model` still refuses a
+speculative step ahead of everything else.
+
+A2-3 is the next wave. It is what makes both A2-1's draft scatter and A2-2's
+verify arm reachable.

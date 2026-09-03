@@ -835,6 +835,12 @@ class GPUModelRunner final : public ModelRunnerBase {
   vt::Queue async_copy_queue_{};
   // Lazily create + return the async-output copy queue on the runner's device.
   vt::Queue& get_or_create_async_copy_queue();
+  // SPEC-DFLASH2 A2-2: the two persistent events of the verify D2H's
+  // kCopyQueueEvent route (see ensure_verify_events). Null-handle no-ops on a
+  // synchronous backend; destroyed in the dtor.
+  vt::Event verify_fork_event_{};
+  vt::Event verify_ready_event_{};
+  bool verify_events_created_ = false;
   // Persistent pool of the per-step overlap resources (device sampled-id buffer +
   // pinned host buffer + events), so sample_tokens_async does NO per-step
   // cudaMalloc/cudaHostAlloc/cudaEventCreate (each of which device-syncs and
@@ -932,13 +938,45 @@ class GPUModelRunner final : public ModelRunnerBase {
   int prompt_logprob_positions(const std::string& req_id) const;
   // Forget in-progress prompt logprobs whose request left the batch (abort).
   void drop_stale_prompt_logprobs();
+  // WHERE THE ACCEPT WALK'S OUTPUTS CROSS TO THE HOST (SPEC-DFLASH2 A2-2,
+  // #2802). The walk itself is identical either way — same kernel, same queue,
+  // same numbers; only the wait moves, and moving it is the point of the wave.
+  enum class VerifyDownload {
+    // Copy on the MAIN queue and `Synchronize` it. One full compute-stream
+    // drain per verify step. This is what `RejectionSampler::forward` has
+    // always done and what the synchronous sampler keeps.
+    kMainQueueDrain,
+    // Fork the COPY queue off the main queue with an event, copy there, and
+    // block the HOST on that copy event alone — the main queue is never
+    // drained. Mirrors `AsyncOutput` (async_utils.py:29-44), which is how
+    // upstream gets its spec-step sampled ids across without stalling the
+    // compute stream (model_runner.py:1492-1499).
+    kCopyQueueEvent,
+  };
+
   // The SPEC-DECODE VERIFY half (SPEC-REJECTION I3): route the expanded
   // [Σ(1+k_i), vocab] logits through the greedy rejection sampler, write the
-  // accepted tokens back, and record num_accepted_tokens. Called by sample_tokens
-  // IFF exec_state_.step.num_draft_tokens > 0, which requires a configured
-  // SpeculativeConfig — unreachable on the production default path. Mirrors
-  // gpu/model_runner.py:1065-1077.
-  ModelRunnerOutput sample_tokens_with_rejection(vt::Tensor& logits);
+  // accepted tokens back, and record num_accepted_tokens. Called by BOTH
+  // sample_tokens and sample_tokens_async, each IFF
+  // StepRoutesToVerify(exec_state_.step.num_draft_tokens) — the one predicate,
+  // which requires a configured SpeculativeConfig. Mirrors
+  // gpu/model_runner.py:1129-1140.
+  ModelRunnerOutput sample_tokens_with_rejection(
+      vt::Tensor& logits,
+      VerifyDownload download = VerifyDownload::kMainQueueDrain);
+
+  // The PROPOSE that follows a verify (SPEC-MTP I5d): derive num_sampled /
+  // num_rejected from the num_accepted_tokens the verify just wrote and call
+  // propose_drafts. Shared by both sampling entry points so the two cannot
+  // derive the same two vectors differently. Inert unless spec_on().
+  void propose_after_verify(int num_reqs);
+
+  // Lazily create the two persistent events the kCopyQueueEvent route records
+  // (fork: copy-queue-waits-main; ready: D2H completion). Created ONCE and
+  // re-recorded each step — never a per-step CreateEvent, which on CUDA
+  // device-syncs and would serialize the very overlap this route buys
+  // (the AsyncOutputPool comment records that measurement).
+  void ensure_verify_events();
 
   // ── SPEC-MTP I5d verify/propose loop helpers ────────────────────────────────
   // Whether a speculator is configured (nullopt on the production default path,

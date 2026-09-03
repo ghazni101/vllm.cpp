@@ -460,21 +460,26 @@ GPUModelRunner::GPUModelRunner(
   // cu_num_logits, so a verify step keeps that draft. Do not read the veto as
   // waiting on the combine's arithmetic — that half has landed.
   //
-  // TWO reasons keep it standing, and A2-2 and A2-3 own them:
-  //   Reason B — sample_tokens_async has NO verify arm at all: no rejection
-  //   sampler, no propose. With the veto lifted a spec engine would sample the
-  //   EXPANDED (1 + k) verify rows as if they were decode rows and propose
-  //   nothing. A2-2 closes this.
+  // SPEC-DFLASH2 A2-2 (#2802) removed the OTHER half this comment used to lead
+  // with. sample_tokens_async now HAS a verify arm, routing on the same
+  // StepRoutesToVerify(step.num_draft_tokens) that sample_tokens routes on, so
+  // a spec engine on the async front would no longer sample the EXPANDED
+  // (1 + k) verify rows as if they were decode rows. Do not read the veto as
+  // waiting on the async sampler either — that half has landed too, and its arm
+  // is UNREACHED precisely because this line stands (spec `## Owed`).
+  //
+  // ONE reason keeps it standing, and A2-3 owns it:
   //   The draft buffer is still UNWIRED — pending_drafts_ is host-resident and
   //   per-request, so the draft_tokens argument A2-1's scatter reads does not
-  //   exist yet. A2-3 supplies it, and until it does the async input-combine
+  //   exist yet, and propose_drafts still consumes host num_sampled /
+  //   num_rejected. A2-3 supplies it, and until it does the async input-combine
   //   call site refuses any step that scheduled drafts.
   // Measured on the CPU tier at this head: deleting !spec_config_.has_value()
   // at both construction sites reds test_mtp_depth to 5 of 10 cases failed
   // (29 assertions, exit 1). Every one of the five throws at that call site's
   // own VT_CHECK ("the draft buffer the combine scatters from is not wired
   // yet"), which fires ahead of the combine, so no verify block is reached and
-  // reason B's own refusal below never gets the chance to fire. The wave
+  // the async sampler's own arm never gets the chance to run. The wave
   // order and the gates are in
   // .agents/specs/dflash2-async-spec-sampler.md.
   async_input_combine_ = AsyncRunnerEnvDefault() && !spec_config_.has_value() &&
@@ -533,21 +538,26 @@ GPUModelRunner::GPUModelRunner(
   // cu_num_logits, so a verify step keeps that draft. Do not read the veto as
   // waiting on the combine's arithmetic — that half has landed.
   //
-  // TWO reasons keep it standing, and A2-2 and A2-3 own them:
-  //   Reason B — sample_tokens_async has NO verify arm at all: no rejection
-  //   sampler, no propose. With the veto lifted a spec engine would sample the
-  //   EXPANDED (1 + k) verify rows as if they were decode rows and propose
-  //   nothing. A2-2 closes this.
+  // SPEC-DFLASH2 A2-2 (#2802) removed the OTHER half this comment used to lead
+  // with. sample_tokens_async now HAS a verify arm, routing on the same
+  // StepRoutesToVerify(step.num_draft_tokens) that sample_tokens routes on, so
+  // a spec engine on the async front would no longer sample the EXPANDED
+  // (1 + k) verify rows as if they were decode rows. Do not read the veto as
+  // waiting on the async sampler either — that half has landed too, and its arm
+  // is UNREACHED precisely because this line stands (spec `## Owed`).
+  //
+  // ONE reason keeps it standing, and A2-3 owns it:
   //   The draft buffer is still UNWIRED — pending_drafts_ is host-resident and
   //   per-request, so the draft_tokens argument A2-1's scatter reads does not
-  //   exist yet. A2-3 supplies it, and until it does the async input-combine
+  //   exist yet, and propose_drafts still consumes host num_sampled /
+  //   num_rejected. A2-3 supplies it, and until it does the async input-combine
   //   call site refuses any step that scheduled drafts.
   // Measured on the CPU tier at this head: deleting !spec_config_.has_value()
   // at both construction sites reds test_mtp_depth to 5 of 10 cases failed
   // (29 assertions, exit 1). Every one of the five throws at that call site's
   // own VT_CHECK ("the draft buffer the combine scatters from is not wired
   // yet"), which fires ahead of the combine, so no verify block is reached and
-  // reason B's own refusal below never gets the chance to fire. The wave
+  // the async sampler's own arm never gets the chance to run. The wave
   // order and the gates are in
   // .agents/specs/dflash2-async-spec-sampler.md.
   async_input_combine_ = AsyncRunnerEnvDefault() && !spec_config_.has_value() &&
@@ -2397,7 +2407,12 @@ std::optional<ModelRunnerOutput> GPUModelRunner::execute_model(
     // draft buffer with an arange cu_num_logits. Refuse loudly rather than
     // combine a verify step against a draft buffer that is not there, if that
     // veto ever moves before A2-3 lands.
-    VT_CHECK(step.num_draft_tokens == 0,
+    // The refusal reads the ROUTE predicate itself, negated, rather than a
+    // re-derivation of it (SPEC-DFLASH2 A2-2, #2802). A refusal whose predicate
+    // is a second reading of its route's predicate is the shape this tree has
+    // already shipped once (#2710), and the two are `> 0` and `== 0` on the same
+    // per-STEP total precisely so they cannot disagree on any input.
+    VT_CHECK(!StepRoutesToVerify(step.num_draft_tokens),
              "async input combine: this step scheduled draft tokens, but the "
              "draft buffer the combine scatters from is not wired yet "
              "(SPEC-DFLASH2 A2-3, #2644)");
@@ -3166,7 +3181,8 @@ void GPUModelRunner::drop_stale_prompt_logprobs() {
 // populated scheduled_spec_decode_tokens, which requires a configured
 // SpeculativeConfig. See the greedy accept rule in
 // include/vllm/v1/spec_decode/rejection_sampler.h.
-ModelRunnerOutput GPUModelRunner::sample_tokens_with_rejection(vt::Tensor& logits) {
+ModelRunnerOutput GPUModelRunner::sample_tokens_with_rejection(
+    vt::Tensor& logits, VerifyDownload download) {
   const int num_reqs = exec_state_.num_reqs;
   const StepInputs& step = exec_state_.step;
   const int num_logits = step_num_logits();
@@ -3190,9 +3206,55 @@ ModelRunnerOutput GPUModelRunner::sample_tokens_with_rejection(vt::Tensor& logit
   int max_k = 0;
   for (const int32_t k : step.num_draft_tokens_per_req) max_k = k > max_k ? k : max_k;
   const RejectionSampler rejection_sampler(max_k);
-  const RejectionSamplerOutput rs =
-      rejection_sampler.forward(queue_, logits, draft_sampled, step.cu_num_logits,
-                                chunked_prefilling);
+  // SPEC-DFLASH2 A2-2: the accept walk is the same kernel on the same queue on
+  // both routes; `download` decides only where the caller waits for its two
+  // outputs. kMainQueueDrain goes through `forward`, which is byte-for-byte the
+  // pre-split behaviour.
+  RejectionSamplerOutput rs;
+  if (download == VerifyDownload::kMainQueueDrain) {
+    rs = rejection_sampler.forward(queue_, logits, draft_sampled, step.cu_num_logits,
+                                   chunked_prefilling);
+  } else {
+    // The COPY-QUEUE route. `verify` issues the walk on the MAIN queue and
+    // returns with its outputs still on the device and nothing waited on. We
+    // then do exactly what AsyncOutput does for the non-spec sampled ids
+    // (async_utils.py:29-44): record a fork event on the main queue, make the
+    // copy queue wait it, issue the two D2H copies THERE, record a completion
+    // event on the copy queue, and block the host on that event alone. The main
+    // queue is never synchronized, which is the drain this wave removes.
+    //
+    // `dev_out` outlives the wait, so the buffers the kernel writes and the
+    // staging it reads are alive for the whole in-flight window — the lifetime
+    // contract RejectionSamplerDeviceOutput exists to make explicit.
+    //
+    // WHAT THIS DOES NOT YET DO, stated here so nobody reads more into it. The
+    // host still waits IN STEP, because the write-back and `propose_drafts`
+    // below both need these numbers on the host, and that is A2-3's and A2-4's
+    // to remove. Waiting on `verify_ready_event_` is not free just because it is
+    // an event: the copy waited the fork event, so by the time it completes the
+    // main queue has drained anyway. What changed is the SHAPE — the copy is no
+    // longer a main-stream operation and the wait is on a copy-queue event that
+    // a later wave can move past the propose. The drain is removable from here;
+    // it is not removed here, and no overlap is claimed on this head.
+    RejectionSamplerDeviceOutput dev_out =
+        rejection_sampler.verify(queue_, logits, draft_sampled, step.cu_num_logits);
+    const int64_t rows = dev_out.num_reqs();
+    const int64_t width = dev_out.width();
+    std::vector<int32_t> host_sampled(static_cast<size_t>(rows * width));
+    std::vector<int32_t> host_num_sampled(static_cast<size_t>(rows));
+    if (rows != 0) {
+      vt::Backend& backend = vt::GetBackend(dev_out.device().type);
+      vt::Queue& copy_q = get_or_create_async_copy_queue();
+      ensure_verify_events();
+      backend.RecordEvent(verify_fork_event_, queue_);
+      backend.QueueWaitEvent(copy_q, verify_fork_event_);
+      dev_out.CopyToHost(copy_q, host_sampled.data(), host_num_sampled.data());
+      backend.RecordEvent(verify_ready_event_, copy_q);
+      backend.SynchronizeEvent(verify_ready_event_);
+    }
+    rs = RejectionSampler::finalize(host_sampled, width, host_num_sampled,
+                                    step.cu_num_logits, chunked_prefilling);
+  }
 
   ModelRunnerOutput out;
   out.req_ids.reserve(static_cast<size_t>(num_reqs));
@@ -3212,7 +3274,9 @@ ModelRunnerOutput GPUModelRunner::sample_tokens_with_rejection(vt::Tensor& logit
     const int32_t kr = step.num_draft_tokens_per_req.empty()
                            ? 0
                            : step.num_draft_tokens_per_req[static_cast<size_t>(i)];
-    if (kr > 0 && !chunked_prefilling[static_cast<size_t>(i)]) {
+    // The PER-ROW reading, and it is deliberately not the route predicate: this
+    // decides only whether row i contributes to the acceptance telemetry.
+    if (RowCarriesDraftTokens(kr) && !chunked_prefilling[static_cast<size_t>(i)]) {
       spec_drafts_proposed_ += kr;
       spec_drafts_accepted_ += (ns > 1 ? ns - 1 : 0);
       // SPEC-MTP-K-GT-1 (#81): the same accounting split by DEPTH. The rejection
@@ -3296,6 +3360,29 @@ ModelRunnerOutput GPUModelRunner::sample_tokens_with_rejection(vt::Tensor& logit
     }
   }
   return out;
+}
+
+// SPEC-MTP I5d: propose the next verify step's drafts after committing this
+// step's accepted tokens. The accept accounting lives in num_accepted_tokens
+// (num_sampled = accepted, seeded/overwritten there); num_rejected is derived.
+//
+// SPEC-DFLASH2 A2-2 lifted this out of `sample_tokens` so `sample_tokens_async`
+// calls the SAME derivation rather than writing a second copy of it. Upstream
+// has exactly one, at model_runner.py:1533-1546, because upstream has exactly
+// one sampling entry point.
+void GPUModelRunner::propose_after_verify(int num_reqs) {
+  if (!spec_on()) return;
+  std::vector<int32_t> num_sampled(static_cast<size_t>(num_reqs), 1);
+  std::vector<int32_t> num_rejected(static_cast<size_t>(num_reqs), 0);
+  for (int i = 0; i < num_reqs; ++i) {
+    const int32_t acc = input_batch_.num_accepted_tokens[static_cast<size_t>(i)];
+    const int32_t k = exec_state_.step.num_draft_tokens_per_req.empty()
+                          ? 0
+                          : exec_state_.step.num_draft_tokens_per_req[static_cast<size_t>(i)];
+    num_sampled[static_cast<size_t>(i)] = acc;              // == accepted count
+    num_rejected[static_cast<size_t>(i)] = k - (acc - 1);   // (1+k) - num_sampled
+  }
+  propose_drafts(num_sampled, num_rejected);
 }
 
 // ARCH-ONE-SURFACE ROW 6: the pooling counterpart of sample_tokens. Mirror of
@@ -3553,25 +3640,10 @@ ModelRunnerOutput GPUModelRunner::sample_tokens(
   // scheduled_spec_decode_tokens, which needs an actually-configured
   // SpeculativeConfig. On the production default it is 0 on every step, so this
   // branch is never taken and the sampler path below is byte-identical.
-  if (exec_state_.step.num_draft_tokens > 0) {
+  if (StepRoutesToVerify(exec_state_.step.num_draft_tokens)) {
     ModelRunnerOutput out_rej = sample_tokens_with_rejection(logits);
     out_rej.prompt_logprobs_dict = std::move(out.prompt_logprobs_dict);
-    // SPEC-MTP I5d: propose the next verify step's drafts after committing this
-    // step's accepted tokens. The accept accounting lives in num_accepted_tokens
-    // (num_sampled = accepted, seeded/overwritten there); num_rejected is derived.
-    if (spec_on()) {
-      std::vector<int32_t> num_sampled(static_cast<size_t>(num_reqs), 1);
-      std::vector<int32_t> num_rejected(static_cast<size_t>(num_reqs), 0);
-      for (int i = 0; i < num_reqs; ++i) {
-        const int32_t acc = input_batch_.num_accepted_tokens[static_cast<size_t>(i)];
-        const int32_t k = exec_state_.step.num_draft_tokens_per_req.empty()
-                              ? 0
-                              : exec_state_.step.num_draft_tokens_per_req[static_cast<size_t>(i)];
-        num_sampled[static_cast<size_t>(i)] = acc;              // == accepted count
-        num_rejected[static_cast<size_t>(i)] = k - (acc - 1);   // (1+k) - num_sampled
-      }
-      propose_drafts(num_sampled, num_rejected);
-    }
+    propose_after_verify(num_reqs);
     return out_rej;
   }
 
@@ -4575,6 +4647,14 @@ GPUModelRunner::~GPUModelRunner() {
   if (async_copy_queue_.id != 0) {
     vt::DestroyQueue(async_copy_queue_);
   }
+  // SPEC-DFLASH2 A2-2: the verify D2H's fork/ready events, created once and
+  // re-recorded per step, released with the queue that carried them.
+  if (verify_events_created_) {
+    vt::Backend& b = vt::GetBackend(queue_.device.type);
+    b.DestroyEvent(verify_fork_event_);
+    b.DestroyEvent(verify_ready_event_);
+    verify_events_created_ = false;
+  }
   // W4 device mirror. Freed here rather than leaked like the scratch pool: these
   // are per-runner, and a serving process can construct more than one runner.
   if (async_device_inputs_ != nullptr) {
@@ -4598,6 +4678,18 @@ vt::Queue& GPUModelRunner::get_or_create_async_copy_queue() {
     async_copy_queue_ = vt::CreateQueue(queue_.device);
   }
   return async_copy_queue_;
+}
+
+void GPUModelRunner::ensure_verify_events() {
+  // SPEC-DFLASH2 A2-2. Two events, created on the first copy-queue verify and
+  // re-recorded every step after that. `blocking=false` matches the async
+  // sampled-id path: at depth-1 the host is going to wait on this copy
+  // immediately, so a spin is the right wait.
+  if (verify_events_created_) return;
+  vt::Backend& b = vt::GetBackend(queue_.device.type);
+  verify_fork_event_ = b.CreateEvent();
+  verify_ready_event_ = b.CreateEvent();
+  verify_events_created_ = true;
 }
 
 AsyncOutputPool& GPUModelRunner::get_or_create_async_output_pool() {
@@ -4837,6 +4929,42 @@ std::unique_ptr<AsyncModelRunnerOutput> GPUModelRunner::sample_tokens_async(
   // is where the logits still are — the async output only defers the sampled
   // IDS. Inert unless a request asked.
   collect_prompt_logprobs(skeleton.prompt_logprobs_dict);
+
+  // ─── SPEC-DECODE VERIFY ROUTING (SPEC-DFLASH2 A2-2, #2802) ────────────────
+  //
+  // THE SAME PREDICATE `sample_tokens` ROUTES ON, read from the same field
+  // through the same function (`StepRoutesToVerify`, prepare_inputs.h). Upstream
+  // has one sampling entry point and asks this once
+  // (model_runner.py:1129 @ pin 5559679229); we have two, so the rule is asked
+  // twice and must be the one expression, not two agreeing readings.
+  //
+  // Without this arm the async sampler would take the expanded Σ(1 + k_i) verify
+  // rows straight to `assemble_sample_logits` and sample them as if they were
+  // decode rows: no draft would ever be verified, no next block proposed,
+  // `pending_drafts_` would stay empty and the async scheduler's `-1`
+  // placeholders would have nothing to fill. That is reason B of this row's
+  // veto, and this arm is what closes it.
+  //
+  // The download route is the wave's payload. `kCopyQueueEvent` forks the copy
+  // queue off the main queue with an event and waits only that event, so the
+  // accept walk no longer drains the compute stream — mirroring how upstream
+  // gets its spec-step ids across (AsyncOutput, model_runner.py:1492-1499).
+  // The TOKENS are unchanged: same kernel, same numbers, only the wait moves.
+  if (StepRoutesToVerify(exec_state_.step.num_draft_tokens)) {
+    ModelRunnerOutput out_rej =
+        sample_tokens_with_rejection(logits, VerifyDownload::kCopyQueueEvent);
+    out_rej.prompt_logprobs_dict = std::move(skeleton.prompt_logprobs_dict);
+    propose_after_verify(num_reqs);
+    // A verify step emits a RAGGED token list per request (accepted drafts plus
+    // the bonus/replacement), which the single-id AsyncGPUModelRunnerOutput
+    // cannot carry: its pinned buffer is one int64 per request. The tokens are
+    // already host-resident above, so the result is handed back ready. Deferring
+    // the ragged materialization is A2-4's half of this wave (the optimistic
+    // `prev_num_draft_len` plus the deferred correction), and it needs the
+    // propose to stop consuming host num_sampled first, which is A2-3.
+    return std::make_unique<ReadyModelRunnerOutput>(std::move(out_rej));
+  }
+
   const SamplingMetadata sm = input_batch_.make_sampling_metadata();
 
   // Sample DEVICE-RESIDENT: the sampler writes the ids into the pool slot's

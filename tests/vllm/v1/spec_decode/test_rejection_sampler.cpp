@@ -27,6 +27,7 @@
 
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "vllm/v1/spec_decode/rejection_sampler.h"
@@ -273,6 +274,209 @@ TEST_CASE("rejection_sampler: a chunked-prefilling row reports 0 sampled and 0 r
   CHECK(out.num_rejected[0] == 0);
   CHECK(out.num_sampled[1] == 2);
   CHECK(out.num_rejected[1] == 0);
+}
+
+// ─── SPEC-DFLASH2 A2-2 (#2802): THE DEVICE-RESIDENT SPLIT ───────────────────
+//
+// `forward` used to be one call that ran the accept walk, copied both outputs to
+// the host and drained the queue. A2-2 splits it so the walk's outputs can stay
+// on the device and the caller decides where the wait goes — a copy-queue event
+// instead of a main-queue drain, which is one of the two compute-stream drains a
+// speculative step pays. Upstream never pays the first one: its
+// `RejectionSampler.__call__` returns DEVICE tensors
+// (rejection_sampler.py:262-272 @ pin 5559679229) and the D2H is issued later by
+// `AsyncOutput` on the copy stream (model_runner.py:1492-1499).
+//
+// WHAT THE CPU TIER CAN GATE HERE IS TOKEN IDENTITY, AND ONLY THAT. On this
+// backend `Copy` is a memcpy and every event is a null-handle no-op, so nothing
+// here can observe an overlap, and nothing here claims one — that is G3/G4 at
+// A2-5 and needs a GPU. What it CAN observe is that the split did not move a
+// token: every id, every `num_sampled` and every `num_rejected` that comes out
+// of `verify` + `CopyToHost` + `finalize` must equal what `forward` produces on
+// the identical step.
+//
+// RED-first: before the change none of `RejectionSamplerDeviceOutput`,
+// `verify`, `CopyToHost` or `finalize` existed and this binary did not compile.
+// After the change, mutating `finalize`'s `num_rejected` to `row_logits - 1`, or
+// its emitted-token loop bound from `ns` to `ns - 1`, reds these cases while
+// every pre-existing case in this file stays green — because those all go
+// through `forward`, which is the same two halves in one call.
+namespace {
+
+// Drive the SPLIT halves by hand, exactly as the runner's copy-queue route does:
+// issue the walk, copy the two outputs, wait, reduce on the host.
+RejectionSamplerOutput RunSplit(const VerifyStep& s, int num_speculative_steps,
+                                const std::vector<char>& is_chunked_prefilling) {
+  Queue q = Q();
+  Tensor logits = Tensor::Contiguous(const_cast<float*>(s.logits.data()), DType::kF32,
+                                     Cpu(), {s.num_logits, static_cast<int64_t>(kVocab)});
+  RejectionSampler sampler(num_speculative_steps);
+  vllm::v1::RejectionSamplerDeviceOutput dev =
+      sampler.verify(q, logits, s.draft_sampled, s.cu_num_logits);
+  const int64_t rows = dev.num_reqs();
+  const int64_t width = dev.width();
+  std::vector<int32_t> host_sampled(static_cast<size_t>(rows * width));
+  std::vector<int32_t> host_num_sampled(static_cast<size_t>(rows));
+  dev.CopyToHost(q, host_sampled.data(), host_num_sampled.data());
+  vt::GetBackend(dev.device().type).Synchronize(q);
+  return RejectionSampler::finalize(host_sampled, width, host_num_sampled,
+                                    s.cu_num_logits, is_chunked_prefilling);
+}
+
+// `forward` on the identical step, for the comparison.
+RejectionSamplerOutput RunWhole(const VerifyStep& s, int num_speculative_steps,
+                                const std::vector<char>& is_chunked_prefilling) {
+  Queue q = Q();
+  Tensor logits = Tensor::Contiguous(const_cast<float*>(s.logits.data()), DType::kF32,
+                                     Cpu(), {s.num_logits, static_cast<int64_t>(kVocab)});
+  RejectionSampler sampler(num_speculative_steps);
+  return sampler.forward(q, logits, s.draft_sampled, s.cu_num_logits,
+                         is_chunked_prefilling);
+}
+
+// Assert the two results id for id, not vector for vector, so a failure names
+// the request and the position rather than saying "these differ".
+void CheckSameTokens(const RejectionSamplerOutput& split,
+                     const RejectionSamplerOutput& whole) {
+  REQUIRE(split.num_sampled.size() == whole.num_sampled.size());
+  REQUIRE(split.sampled_token_ids.size() == whole.sampled_token_ids.size());
+  for (size_t r = 0; r < whole.num_sampled.size(); ++r) {
+    INFO("request ", r);
+    CHECK(split.num_sampled[r] == whole.num_sampled[r]);
+    CHECK(split.num_rejected[r] == whole.num_rejected[r]);
+    REQUIRE(split.sampled_token_ids[r].size() == whole.sampled_token_ids[r].size());
+    for (size_t j = 0; j < whole.sampled_token_ids[r].size(); ++j) {
+      INFO("token ", j);
+      CHECK(split.sampled_token_ids[r][j] == whole.sampled_token_ids[r][j]);
+    }
+  }
+}
+
+}  // namespace
+
+// A2-2.1 — the single-request shapes this file already covers, across the split.
+TEST_CASE("A2-2: the split emits the same tokens as forward, one request") {
+  SUBCASE("perfect match") {
+    const VerifyStep s = MakeStep({{1, 2, 3}}, {{1, 2, 3, 4}});
+    const RejectionSamplerOutput split = RunSplit(s, 3, {});
+    CheckSameTokens(split, RunWhole(s, 3, {}));
+    // Non-vacuous: the step really did emit four tokens, so the comparison above
+    // was over something. Two empty results would compare equal.
+    REQUIRE(split.sampled_token_ids[0] == std::vector<int32_t>{1, 2, 3, 4});
+  }
+  SUBCASE("early mismatch") {
+    const VerifyStep s = MakeStep({{1, 2, 3}}, {{1, 5, 3, 4}});
+    const RejectionSamplerOutput split = RunSplit(s, 3, {});
+    CheckSameTokens(split, RunWhole(s, 3, {}));
+    REQUIRE(split.sampled_token_ids[0] == std::vector<int32_t>{1, 5});
+    REQUIRE(split.num_rejected[0] == 2);
+  }
+  SUBCASE("placeholder draft id") {
+    const VerifyStep s = MakeStep({{-1}}, {{5, 6}});
+    const RejectionSamplerOutput split = RunSplit(s, 1, {});
+    CheckSameTokens(split, RunWhole(s, 1, {}));
+    REQUIRE(split.sampled_token_ids[0] == std::vector<int32_t>{5});
+  }
+}
+
+// A2-2.2 — THE MIXED STEP, and it is the case that matters.
+//
+// `num_reqs == 1` cannot separate a per-step reading of anything from a
+// per-request one, which is the failure this repository has already paid for
+// (#2710, and the note at the top of tests/vllm/v1/worker/
+// test_combine_row_predicate.cpp). So the split is exercised on a batch whose
+// rows carry DIFFERENT k: one row drafts nothing at all (k = 0, one expanded row
+// — the shape the plain sampler would have handled), one accepts every draft,
+// one rejects at its first. The expanded tensor is 1 + 3 + 4 = 8 rows for 3
+// requests, so a reduction that used `num_reqs` where it needed `cu_num_logits`
+// reads the wrong rows and this case says which request and which position.
+TEST_CASE("A2-2: the split is token-identical on a MIXED step, num_reqs > 1") {
+  const VerifyStep s = MakeStep({{}, {1, 2}, {7, 8, 9}},
+                                {{4}, {1, 2, 6}, {7, 3, 9, 5}});
+  const RejectionSamplerOutput split = RunSplit(s, 3, {});
+  const RejectionSamplerOutput whole = RunWhole(s, 3, {});
+  CheckSameTokens(split, whole);
+
+  // Non-vacuous, and the three rows are genuinely different shapes:
+  //   row 0: k = 0            -> one token, the plain greedy argmax
+  //   row 1: k = 2, all accepted -> the two drafts plus the bonus
+  //   row 2: k = 3, reject at 1  -> the first draft plus the target's argmax
+  REQUIRE(split.sampled_token_ids[0] == std::vector<int32_t>{4});
+  REQUIRE(split.num_rejected[0] == 0);
+  REQUIRE(split.sampled_token_ids[1] == std::vector<int32_t>{1, 2, 6});
+  REQUIRE(split.num_rejected[1] == 0);
+  REQUIRE(split.sampled_token_ids[2] == std::vector<int32_t>{7, 3});
+  REQUIRE(split.num_rejected[2] == 2);
+  // The rows the sampler was handed are NOT one per request, which is the whole
+  // reason the route predicate is a per-step one.
+  REQUIRE(s.num_logits == 8);
+}
+
+// A2-2.3 — the chunked-prefill zeroing lives in `finalize`, the HOST half, and
+// must survive the split. It never reaches the kernel, so this is the one place
+// the split could have dropped a rule silently.
+TEST_CASE("A2-2: the split keeps the chunked-prefill zeroing, on a mixed step") {
+  const VerifyStep s = MakeStep({{1, 2}, {3}}, {{1, 9, 5}, {3, 4}});
+  const std::vector<char> prefilling{1, 0};
+  const RejectionSamplerOutput split = RunSplit(s, 2, prefilling);
+  CheckSameTokens(split, RunWhole(s, 2, prefilling));
+  REQUIRE(split.num_sampled[0] == 0);
+  REQUIRE(split.num_rejected[0] == 0);
+  REQUIRE(split.num_sampled[1] == 2);
+}
+
+// A2-2.4 — `verify` leaves its outputs ON THE DEVICE and waits for nothing. The
+// CPU backend cannot show the overlap that buys, but it CAN show the shape the
+// runner's copy-queue route depends on: the walk is issued, the result is a
+// live object carrying [num_reqs, width], and the bytes only appear on the host
+// when the caller asks for them.
+TEST_CASE("A2-2: verify returns device-resident outputs, shaped num_reqs x width") {
+  const VerifyStep s = MakeStep({{}, {1, 2}}, {{4}, {1, 2, 6}});
+  Queue q = Q();
+  Tensor logits = Tensor::Contiguous(const_cast<float*>(s.logits.data()), DType::kF32,
+                                     Cpu(), {s.num_logits, static_cast<int64_t>(kVocab)});
+  RejectionSampler sampler(2);
+  vllm::v1::RejectionSamplerDeviceOutput dev =
+      sampler.verify(q, logits, s.draft_sampled, s.cu_num_logits);
+  CHECK(dev.num_reqs() == 2);
+  // Upstream's row stride: num_speculative_steps + 1
+  // (rejection_sampler_utils.py:1026-1028).
+  CHECK(dev.width() == 3);
+  CHECK(dev.device().type == DeviceType::kCPU);
+
+  // The download is a separate act, and it can happen more than once from the
+  // same device result — which is what lets the runner put the wait on a queue
+  // the walk did not run on.
+  std::vector<int32_t> a(6), b(6), na(2), nb(2);
+  dev.CopyToHost(q, a.data(), na.data());
+  dev.CopyToHost(q, b.data(), nb.data());
+  vt::GetBackend(dev.device().type).Synchronize(q);
+  CHECK(a == b);
+  CHECK(na == nb);
+  CHECK(na[0] == 1);  // k = 0 row: exactly the one greedy argmax
+  CHECK(na[1] == 3);  // k = 2, all accepted: two drafts plus the bonus
+}
+
+// A2-2.5 — the device result is MOVE-ONLY and owns what the kernel touches.
+// Moving it must not double-free and must not lose the buffers, because the
+// runner's copy-queue route holds it across the fork/copy/wait window.
+TEST_CASE("A2-2: the device result moves without losing or double-freeing its buffers") {
+  const VerifyStep s = MakeStep({{1, 2}}, {{1, 2, 6}});
+  Queue q = Q();
+  Tensor logits = Tensor::Contiguous(const_cast<float*>(s.logits.data()), DType::kF32,
+                                     Cpu(), {s.num_logits, static_cast<int64_t>(kVocab)});
+  RejectionSampler sampler(2);
+  vllm::v1::RejectionSamplerDeviceOutput src =
+      sampler.verify(q, logits, s.draft_sampled, s.cu_num_logits);
+  vllm::v1::RejectionSamplerDeviceOutput dst = std::move(src);
+  CHECK(src.num_reqs() == 0);  // moved-from is empty and safe to destroy
+  CHECK(dst.num_reqs() == 1);
+  CHECK(dst.width() == 3);
+  std::vector<int32_t> out(3), ns(1);
+  dst.CopyToHost(q, out.data(), ns.data());
+  vt::GetBackend(dst.device().type).Synchronize(q);
+  CHECK(ns[0] == 3);
+  CHECK(out == std::vector<int32_t>{1, 2, 6});
 }
 
 // SKIPPED (test-porting rule 6), tracked to M-mtp-3 (spec §5):

@@ -5,6 +5,7 @@
 #include "vllm/v1/spec_decode/rejection_sampler.h"
 
 #include <cstddef>
+#include <utility>
 
 #include "vllm/v1/sample/device_scratch.h"
 #include "vt/backend.h"
@@ -13,53 +14,80 @@
 
 namespace vllm::v1 {
 
-namespace {
+// ─── RejectionSamplerDeviceOutput ───────────────────────────────────────────
+// The accept walk's outputs, still on the device. See the header for why this
+// object owns the kernel's INPUTS as well as its outputs.
 
-// Owns a device-side output buffer and downloads it to host. Same shape as the
-// sampler's DeviceBuffer (src/vllm/v1/sample/sampler.cpp): on unified backends
-// Alloc is host-addressable and Copy is a memcpy, so this works on CPU and CUDA.
-class OutBuffer {
- public:
-  OutBuffer(vt::Device device, vt::Queue& q, vt::DType dtype,
-            std::initializer_list<int64_t> shape)
-      : backend_(&vt::GetBackend(device.type)), q_(q) {
-    int64_t numel = 1;
-    for (int64_t s : shape) numel *= s;
-    bytes_ = static_cast<size_t>(numel) * vt::SizeOf(dtype);
-    owned_ = backend_->Alloc(bytes_ == 0 ? 1 : bytes_);
-    tensor_ = vt::Tensor::Contiguous(owned_, dtype, device, shape);
+RejectionSamplerDeviceOutput::~RejectionSamplerDeviceOutput() { Release(); }
+
+RejectionSamplerDeviceOutput::RejectionSamplerDeviceOutput(
+    RejectionSamplerDeviceOutput&& other) noexcept
+    : backend_(other.backend_),
+      device_(other.device_),
+      sampled_(other.sampled_),
+      num_sampled_(other.num_sampled_),
+      num_reqs_(other.num_reqs_),
+      width_(other.width_),
+      draft_(std::move(other.draft_)),
+      cu_(std::move(other.cu_)) {
+  other.backend_ = nullptr;
+  other.sampled_ = nullptr;
+  other.num_sampled_ = nullptr;
+  other.num_reqs_ = 0;
+  other.width_ = 0;
+}
+
+RejectionSamplerDeviceOutput& RejectionSamplerDeviceOutput::operator=(
+    RejectionSamplerDeviceOutput&& other) noexcept {
+  if (this == &other) return *this;
+  Release();
+  backend_ = other.backend_;
+  device_ = other.device_;
+  sampled_ = other.sampled_;
+  num_sampled_ = other.num_sampled_;
+  num_reqs_ = other.num_reqs_;
+  width_ = other.width_;
+  draft_ = std::move(other.draft_);
+  cu_ = std::move(other.cu_);
+  other.backend_ = nullptr;
+  other.sampled_ = nullptr;
+  other.num_sampled_ = nullptr;
+  other.num_reqs_ = 0;
+  other.width_ = 0;
+  return *this;
+}
+
+void RejectionSamplerDeviceOutput::Release() {
+  if (backend_ != nullptr) {
+    if (sampled_ != nullptr) backend_->Free(sampled_);
+    if (num_sampled_ != nullptr) backend_->Free(num_sampled_);
   }
-  ~OutBuffer() { backend_->Free(owned_); }
-  OutBuffer(const OutBuffer&) = delete;
-  OutBuffer& operator=(const OutBuffer&) = delete;
+  sampled_ = nullptr;
+  num_sampled_ = nullptr;
+  // The staging goes with them: it is only alive because the kernel reads it.
+  draft_.reset();
+  cu_.reset();
+}
 
-  vt::Tensor& tensor() { return tensor_; }
-  // SPEC-DFLASH2 W8 (#1837): the copy WITHOUT the queue drain, so a caller
-  // reading two output buffers issues both copies and synchronizes ONCE —
-  // `forward` below used to take two full-queue Synchronizes per verify step
-  // for one dependency. The caller owns the single Synchronize.
-  void copy_to(void* dst) {
-    if (bytes_ != 0) backend_->Copy(q_, dst, owned_, bytes_);
-  }
-  void download(void* dst) {
-    copy_to(dst);
-    backend_->Synchronize(q_);
-  }
+void RejectionSamplerDeviceOutput::CopyToHost(vt::Queue& q, int32_t* sampled_out,
+                                              int32_t* num_sampled_out) const {
+  if (num_reqs_ == 0 || backend_ == nullptr) return;
+  // Two copies, NO drain (SPEC-DFLASH2 W8 #1837 kept the single-drain property;
+  // A2-2 moves the drain itself out to the caller). Both buffers come off the
+  // same kernel on the same queue, so ONE wait — wherever the caller puts it —
+  // orders both reads.
+  backend_->Copy(q, sampled_out, sampled_,
+                 static_cast<size_t>(num_reqs_ * width_) * sizeof(int32_t));
+  backend_->Copy(q, num_sampled_out, num_sampled_,
+                 static_cast<size_t>(num_reqs_) * sizeof(int32_t));
+}
 
- private:
-  vt::Backend* backend_ = nullptr;
-  vt::Queue& q_;
-  void* owned_ = nullptr;
-  size_t bytes_ = 0;
-  vt::Tensor tensor_;
-};
+// ─── RejectionSampler ───────────────────────────────────────────────────────
 
-}  // namespace
-
-RejectionSamplerOutput RejectionSampler::forward(
-    vt::Queue& q, const vt::Tensor& logits, const std::vector<int32_t>& draft_sampled,
-    const std::vector<int32_t>& cu_num_logits,
-    const std::vector<char>& is_chunked_prefilling) const {
+RejectionSamplerDeviceOutput RejectionSampler::verify(
+    vt::Queue& q, const vt::Tensor& logits,
+    const std::vector<int32_t>& draft_sampled,
+    const std::vector<int32_t>& cu_num_logits) const {
   VT_CHECK(logits.rank == 2, "rejection_sampler: logits must be [num_logits, vocab]");
   VT_CHECK(logits.dtype == vt::DType::kF32, "rejection_sampler: logits must be f32");
   VT_CHECK(cu_num_logits.size() >= 1,
@@ -71,11 +99,8 @@ RejectionSamplerOutput RejectionSampler::forward(
   VT_CHECK(draft_sampled.size() == static_cast<size_t>(num_logits),
            "rejection_sampler: draft_sampled must have one entry per expanded logits row");
 
-  RejectionSamplerOutput out;
-  out.sampled_token_ids.resize(static_cast<size_t>(num_reqs));
-  out.num_sampled.assign(static_cast<size_t>(num_reqs), 0);
-  out.num_rejected.assign(static_cast<size_t>(num_reqs), 0);
-  if (num_reqs == 0) return out;
+  RejectionSamplerDeviceOutput dev_out;
+  if (num_reqs == 0) return dev_out;
 
   // `sampled` row width: upstream sizes it num_speculative_steps + 1
   // (rejection_sampler_utils.py:1026-1028). Widen if a request somehow carries
@@ -89,21 +114,50 @@ RejectionSamplerOutput RejectionSampler::forward(
   }
 
   const vt::Device dev = logits.device;
-  DeviceScratch draft(dev, q, draft_sampled.data(), vt::DType::kI32, {num_logits});
-  DeviceScratch cu(dev, q, cu_num_logits.data(), vt::DType::kI32, {num_reqs + 1});
-  OutBuffer sampled(dev, q, vt::DType::kI32, {num_reqs, width});
-  OutBuffer num_sampled(dev, q, vt::DType::kI32, {num_reqs});
+  vt::Backend& backend = vt::GetBackend(dev.type);
+  dev_out.backend_ = &backend;
+  dev_out.device_ = dev;
+  dev_out.num_reqs_ = num_reqs;
+  dev_out.width_ = width;
+  dev_out.draft_ = std::make_unique<DeviceScratch>(dev, q, draft_sampled.data(),
+                                                   vt::DType::kI32,
+                                                   std::initializer_list<int64_t>{num_logits});
+  dev_out.cu_ = std::make_unique<DeviceScratch>(dev, q, cu_num_logits.data(),
+                                                vt::DType::kI32,
+                                                std::initializer_list<int64_t>{num_reqs + 1});
+  dev_out.sampled_ =
+      backend.Alloc(static_cast<size_t>(num_reqs * width) * sizeof(int32_t));
+  dev_out.num_sampled_ =
+      backend.Alloc(static_cast<size_t>(num_reqs) * sizeof(int32_t));
 
-  vt::GreedyRejectionSample(q, sampled.tensor(), num_sampled.tensor(), logits, draft.tensor(),
-                            cu.tensor());
+  vt::Tensor sampled_t = vt::Tensor::Contiguous(dev_out.sampled_, vt::DType::kI32,
+                                                dev, {num_reqs, width});
+  vt::Tensor num_sampled_t =
+      vt::Tensor::Contiguous(dev_out.num_sampled_, vt::DType::kI32, dev, {num_reqs});
+  vt::GreedyRejectionSample(q, sampled_t, num_sampled_t, logits,
+                            dev_out.draft_->tensor(), dev_out.cu_->tensor());
+  // NOTHING is copied and NO queue is waited on here. That is the whole split.
+  return dev_out;
+}
 
-  std::vector<int32_t> host_sampled(static_cast<size_t>(num_reqs * width));
-  std::vector<int32_t> host_num_sampled(static_cast<size_t>(num_reqs));
-  // Two copies, ONE queue drain (SPEC-DFLASH2 W8, #1837): both buffers come off
-  // the same kernel on the same queue, so one Synchronize orders both reads.
-  sampled.copy_to(host_sampled.data());
-  num_sampled.copy_to(host_num_sampled.data());
-  vt::GetBackend(dev.type).Synchronize(q);
+RejectionSamplerOutput RejectionSampler::finalize(
+    const std::vector<int32_t>& host_sampled, int64_t width,
+    const std::vector<int32_t>& host_num_sampled,
+    const std::vector<int32_t>& cu_num_logits,
+    const std::vector<char>& is_chunked_prefilling) {
+  VT_CHECK(cu_num_logits.size() >= 1,
+           "rejection_sampler: cu_num_logits must have num_reqs+1 entries");
+  const int64_t num_reqs = static_cast<int64_t>(cu_num_logits.size()) - 1;
+
+  RejectionSamplerOutput out;
+  out.sampled_token_ids.resize(static_cast<size_t>(num_reqs));
+  out.num_sampled.assign(static_cast<size_t>(num_reqs), 0);
+  out.num_rejected.assign(static_cast<size_t>(num_reqs), 0);
+  if (num_reqs == 0) return out;
+  VT_CHECK(host_num_sampled.size() == static_cast<size_t>(num_reqs),
+           "rejection_sampler: finalize needs one num_sampled entry per request");
+  VT_CHECK(host_sampled.size() == static_cast<size_t>(num_reqs * width),
+           "rejection_sampler: finalize needs a [num_reqs, width] sampled buffer");
 
   // get_num_sampled_and_rejected (gpu/input_batch.py:408-453): num_rejected =
   // num_logits - num_sampled; a still-chunked-prefilling row samples nothing and
@@ -127,6 +181,29 @@ RejectionSamplerOutput RejectionSampler::forward(
     }
   }
   return out;
+}
+
+RejectionSamplerOutput RejectionSampler::forward(
+    vt::Queue& q, const vt::Tensor& logits, const std::vector<int32_t>& draft_sampled,
+    const std::vector<int32_t>& cu_num_logits,
+    const std::vector<char>& is_chunked_prefilling) const {
+  // The SAME-QUEUE route: issue the walk, copy on `q`, drain `q`. Byte-for-byte
+  // what this function did before the A2-2 split, and it stays the route every
+  // synchronous caller takes. The async verify arm calls `verify` / `CopyToHost`
+  // / `finalize` directly so it can put the wait on a copy queue instead.
+  RejectionSamplerDeviceOutput dev_out =
+      verify(q, logits, draft_sampled, cu_num_logits);
+  const int64_t num_reqs = dev_out.num_reqs();
+  if (num_reqs == 0) {
+    return finalize({}, dev_out.width(), {}, cu_num_logits, is_chunked_prefilling);
+  }
+  const int64_t width = dev_out.width();
+  std::vector<int32_t> host_sampled(static_cast<size_t>(num_reqs * width));
+  std::vector<int32_t> host_num_sampled(static_cast<size_t>(num_reqs));
+  dev_out.CopyToHost(q, host_sampled.data(), host_num_sampled.data());
+  vt::GetBackend(dev_out.device().type).Synchronize(q);
+  return finalize(host_sampled, width, host_num_sampled, cu_num_logits,
+                  is_chunked_prefilling);
 }
 
 }  // namespace vllm::v1
