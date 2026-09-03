@@ -66,15 +66,21 @@ struct MoeFixture {
   std::vector<Exl3Fixture> gate, up, down;
 };
 
-MoeFixture MakeMoeFixture(int64_t hidden, int64_t interm, int64_t experts, uint32_t seed) {
+// `bits` is a PARAMETER and not three literals. `MoeFixture::bits` sat beside
+// them unused and always 3, so `args.bits_gate = m.bits` read as if the fixture
+// followed the trellis when it could not. QUANT-EXL3-MUL1 slice G instantiates
+// the fused CUDA arm at bits 3..6 and this is what feeds it (#2756).
+MoeFixture MakeMoeFixture(int64_t hidden, int64_t interm, int64_t experts, uint32_t seed,
+                          int bits = 3) {
   MoeFixture m;
   m.hidden = hidden;
   m.interm = interm;
   m.experts = experts;
+  m.bits = bits;
   for (int64_t e = 0; e < experts; ++e) {
-    m.gate.push_back(MakeFixture(hidden, interm, 3, seed + static_cast<uint32_t>(e) * 7u + 1u));
-    m.up.push_back(MakeFixture(hidden, interm, 3, seed + static_cast<uint32_t>(e) * 7u + 2u));
-    m.down.push_back(MakeFixture(interm, hidden, 3, seed + static_cast<uint32_t>(e) * 7u + 3u));
+    m.gate.push_back(MakeFixture(hidden, interm, bits, seed + static_cast<uint32_t>(e) * 7u + 1u));
+    m.up.push_back(MakeFixture(hidden, interm, bits, seed + static_cast<uint32_t>(e) * 7u + 2u));
+    m.down.push_back(MakeFixture(interm, hidden, bits, seed + static_cast<uint32_t>(e) * 7u + 3u));
   }
   return m;
 }
@@ -567,21 +573,97 @@ TEST_CASE("exl3 device: the fused MoE arm agrees with the CPU arm within tier 4"
   vt::Queue dq = cb.CreateQueue();
   vt::Queue hq = CpuQueue();
   const int64_t H = 256, I = 128, E = 4, T = 3, topk = 2;
-  const MoeFixture m = MakeMoeFixture(H, I, E, 0xA11CEu);
   Rng rng;
   std::vector<float> x(static_cast<size_t>(T * H));
   for (auto& v : x) v = vt::F16ToF32(vt::F32ToF16(rng.next(0.5f)));
   const std::vector<int64_t> ids = {2, 0, 3, 2, 1, 2};
   const std::vector<float> w = {0.5f, 0.25f, 0.75f, 0.125f, 0.4f, 0.6f};
 
-  MoeCall kh, kd;
-  const std::vector<float> host =
-      FusedCall(hq, m, x, T, ids, w, topk, 10.0f, vt::Exl3MoeAct::kSiluAndMulClamp, 128, &kh);
-  const std::vector<float> dev =
-      FusedCall(dq, m, x, T, ids, w, topk, 10.0f, vt::Exl3MoeAct::kSiluAndMulClamp, 128, &kd);
-  cb.Synchronize(dq);
-  const double rel = RelRms(dev, host);
-  MESSAGE("tier 4, device vs CPU: relative RMS ", rel);
-  CHECK(rel <= 2.0e-2);
+  // EVERY instantiated width, against the CPU arm, at the SAME tier-4 bound the
+  // single (3, 1) arm already carried. The bound is not widened for a new width;
+  // a width that needs a looser one has a port defect, not a tolerance problem
+  // (QUANT-EXL3-MUL1 slice G, #2756).
+  //
+  // The CPU arm is the reference because it is the width-general one: it threads
+  // `args.bits` into `Exl3DecodeTile` and decodes all eight widths, so widening
+  // the device arm never widens its own oracle.
+  int ran = 0;
+  for (const int bits : {3, 4, 5, 6}) {
+    CAPTURE(bits);
+    const MoeFixture m = MakeMoeFixture(H, I, E, 0xA11CEu, bits);
+    REQUIRE(m.bits == bits);
+    REQUIRE(m.gate[0].bits == bits);
+    MoeCall kh, kd;
+    const std::vector<float> host =
+        FusedCall(hq, m, x, T, ids, w, topk, 10.0f, vt::Exl3MoeAct::kSiluAndMulClamp, 128, &kh);
+    const std::vector<float> dev =
+        FusedCall(dq, m, x, T, ids, w, topk, 10.0f, vt::Exl3MoeAct::kSiluAndMulClamp, 128, &kd);
+    cb.Synchronize(dq);
+    // A tower that decoded to zeros would agree with itself perfectly. The
+    // reference has to be non-trivial before its agreement means anything.
+    double mx = 0.0;
+    for (const float v : host) mx = std::max(mx, std::fabs(static_cast<double>(v)));
+    CHECK(mx > 1.0e-3);
+    const double rel = RelRms(dev, host);
+    MESSAGE("tier 4, device vs CPU at bits ", bits, ": relative RMS ", rel);
+    CHECK(rel <= 2.0e-2);
+    ++ran;
+  }
+  // The loop is what this case is FOR. A body that never entered would leave
+  // every CHECK above unexecuted and the case would still report a pass.
+  CHECK(ran == 4);
+  cb.DestroyQueue(dq);
+}
+
+// ─── Slice G: the arms this launcher does NOT have refuse BY NAME ────────────
+//
+// Device-only, because every one of these is legal for the CPU arm: it carries a
+// width per projection and decodes all eight of them over all three codebooks.
+// The refusal being tested is `Exl3MoeMlpKernelCuda`'s, and reaching it means
+// getting past `ops.cpp`'s shared validation first — which admits bits 1..8 and
+// therefore does not stand in the way here.
+TEST_CASE("exl3 device: an uninstantiated fused-MoE arm refuses BY NAME") {
+  if (!HasCudaMoe()) {
+    MESSAGE("SKIPPED, no CUDA device. Reproduce with: rc run --device thor:gpu0 -- ctest "
+            "--test-dir build -R '^test_exl3_moe$' --output-on-failure");
+    CHECK_FALSE(vt::OpRegistered(vt::OpId::kExl3MoeMlp, vt::DeviceType::kCUDA));
+    return;
+  }
+  vt::Backend& cb = vt::GetBackend(vt::DeviceType::kCUDA);
+  if (!cb.DeviceMemoryIsHostAddressable()) {
+    MESSAGE("SKIPPED, CUDA present but host pointers are not dereferenceable.");
+    CHECK_FALSE(cb.DeviceMemoryIsHostAddressable());
+    return;
+  }
+  vt::Queue dq = cb.CreateQueue();
+  const int64_t H = 256, I = 128, E = 4, T = 3, topk = 2;
+  Rng rng;
+  std::vector<float> x(static_cast<size_t>(T * H));
+  for (auto& v : x) v = vt::F16ToF32(vt::F32ToF16(rng.next(0.5f)));
+  const std::vector<int64_t> ids = {2, 0, 3, 2, 1, 2};
+  const std::vector<float> w = {0.5f, 0.25f, 0.75f, 0.125f, 0.4f, 0.6f};
+
+  // A width with no device decode route at all. `dq_dispatch` static_asserts
+  // 3..6, so bits 7 is not an instantiation this arm declined to make — it is a
+  // width the GEMM cannot decode either.
+  {
+    const MoeFixture m7 = MakeMoeFixture(H, I, E, 0xA11CEu, 7);
+    MoeCall k;
+    std::string msg;
+    try {
+      (void)FusedCall(dq, m7, x, T, ids, w, topk, 10.0f, vt::Exl3MoeAct::kSiluAndMulClamp, 128,
+                      &k);
+      cb.Synchronize(dq);
+    } catch (const std::exception& e) {
+      msg = e.what();
+    }
+    MESSAGE("bits 7 refusal: ", msg);
+    REQUIRE_FALSE(msg.empty());
+    CHECK(msg.find("exl3_moe") != std::string::npos);
+    CHECK(msg.find("{3, 4, 5, 6}") != std::string::npos);
+    // The message must say WHERE the width can still run, or the caller learns
+    // only that it failed.
+    CHECK(msg.find("CPU") != std::string::npos);
+  }
   cb.DestroyQueue(dq);
 }
