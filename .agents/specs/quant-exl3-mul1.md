@@ -686,6 +686,52 @@ from a file the subshell writes. And the provisioning loop tested
 `/usr/bin/time` was never installed and the compile-time measurement was lost;
 the timing is now a wall clock, which needs no package.
 
+### Slice G evidence — the numeric device gate is PENDING on `thor:gpu0`
+
+**No numeric device result for the widened widths is claimed, and none may be
+quoted from this branch yet.** What exists is above: the arm compiles at every
+instantiated width on `sm_87`, and the pre-change tree is green on `thor:gpu0`
+with its device case skipped. Neither is a parity number.
+
+The leg that produces one is queued, not skipped. `job-gate2.sh` on the shared
+share runs, in one lease against one build directory, with the tree's sha256
+asserted before it builds:
+
+| Leg | Edit | Must |
+|---|---|---|
+| `GREEN` | none | `rc=0`, `widths_reported=8` |
+| `REDBEFORE` | `Exl3MoeArmInstantiated` narrowed to `bits == 3` — the pre-change arm set exactly | RED |
+| `M1` | bits 4 out of the predicate | RED |
+| `M2` | bits 5 out of the predicate | RED |
+| `M3` | bits 6 out of the predicate | RED |
+| `M4` | the bits-3 entry's `cb` template argument 1 -> 2 | RED |
+| `M5` | the bits-4 entry's `bits` template argument 4 -> 3 | RED |
+
+Each leg records the file's sha256 before and after, refuses to proceed if the
+mutation did not apply uniquely, asserts the OBJECT's mtime MOVED (a mutation
+that never compiled reads as a passing test), distinguishes a build failure from
+a red test, and restores the file from a pristine copy whose sha256 is checked
+against the original.
+
+Reproduce, or read the result, at:
+
+```sh
+rc run --device thor:gpu0 -- bash /workspace/exl3moe-widen/job-gate2.sh
+# results land in /workspace/exl3moe-widen/out-gate-sm110/results.txt
+```
+
+**Until that leg lands, the widened widths are gated by compilation and by the
+CPU arm's own tier-4 case only.** The tolerance is not in question — the case
+reuses the `2.0e-2` bound the single `(3, 1)` arm already carried and widens it
+for nothing — but an untaken gate is PENDING and is never a pass.
+
+**M4 is the leg that matters most and the one a shape-checking gate cannot
+replace.** `(3, 1)` and `(3, 2)` are the confusable pair: same width, same `dq8`
+route, same tile shapes. A `cb` threaded wrongly between them does not fail to
+compile and does not change a shape. It decodes with the other codebook's
+multiplier and yields a weight with the right distribution and no correlation to
+the true one.
+
 ### Mutations required
 
 | # | Mutation | Must |
@@ -742,6 +788,11 @@ green is not a device result and is never reported as one.
 
 ## Owed
 
+- **Slice G's numeric device gate is PENDING on `thor:gpu0`**, queued and not
+  skipped; the leg table and the reproduction command are in its evidence
+  section above. What IS taken: the arm compiles at every instantiated width on
+  `sm_87`, and the pre-change tree is green on `thor:gpu0` with its device case
+  skipped. Neither is a parity number and neither is reported as one.
 - **Slice C is UNVERIFIED ON A DEVICE until a CUDA build runs it.** A CPU-only
   gate cannot compile `cuda_exl3.cu` at all, so a green CPU preflight says
   nothing about the device arm. Named here so it is visible debt rather than an
