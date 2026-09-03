@@ -36,6 +36,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -696,8 +697,16 @@ TEST_CASE("exl3 device: the fused MoE arm agrees with the CPU arm within tier 4"
         "the launch-count claim (3 * topk * T -> 1 per layer). dgx.casa is flapping. "
         "Reproduce with: "
         "rc run --device dgx:gpu0 -- ctest --test-dir build-cuda -R test_exl3_moe -V");
-    // A skip that asserts NOTHING reports `assertions: 0`, which reads as a pass.
-    CHECK_FALSE(vt::OpRegistered(vt::OpId::kExl3MoeMlp, vt::DeviceType::kCUDA));
+    // A skip that asserts NOTHING reports `assertions: 0`, which reads as a
+    // pass. The predicate has to be one that is actually FALSE here, and
+    // `OpRegistered` is not: `cuda_exl3.cu`'s registrar takes no device count,
+    // so the ops are registered on every build that compiles the CUDA
+    // translation units, device or no device. Only `cuda_backend.cu`'s registrar
+    // consults `cudaGetDeviceCount`, and it registers the BACKEND. Asserting the
+    // op false here put two red assertions on a green tree on `orin:gpu0`, whose
+    // container has CUDA 13.3 and no visible GPU (#2769). `GetBackend` is what
+    // `HasCudaMoe()` failed on, so assert that.
+    CHECK_THROWS_AS((void)vt::GetBackend(vt::DeviceType::kCUDA), std::runtime_error);
     return;
   }
   // NO host-addressability guard. `CudaBackend` inherits
@@ -775,7 +784,8 @@ TEST_CASE("exl3 device: an uninstantiated fused-MoE arm refuses BY NAME") {
   if (!HasCudaMoe()) {
     MESSAGE("SKIPPED, no CUDA device. Reproduce with: rc run --device thor:gpu0 -- ctest "
             "--test-dir build -R '^test_exl3_moe$' --output-on-failure");
-    CHECK_FALSE(vt::OpRegistered(vt::OpId::kExl3MoeMlp, vt::DeviceType::kCUDA));
+    // The backend, not the op: see the sibling case above and #2769.
+    CHECK_THROWS_AS((void)vt::GetBackend(vt::DeviceType::kCUDA), std::runtime_error);
     return;
   }
   vt::Backend& cb = vt::GetBackend(vt::DeviceType::kCUDA);
