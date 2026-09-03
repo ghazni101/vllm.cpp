@@ -2344,7 +2344,8 @@ void Exl3GemmKernelCuda(Queue& q, Tensor& c, const Tensor& a, const Tensor& trel
 // ever chosen: the loader refuses any marker but `mcg`, three separate
 // `args.codebook = 1` assignments, and `ops.cpp`'s own
 // `VT_CHECK(args.codebook == 1, ...)` in the SHARED seam -- which refuses for
-// every backend, the CPU reference included. Widening here alone would instantiate a kernel nothing can reach.
+// every backend, the CPU reference included. Widening here alone would
+// instantiate a kernel nothing can reach.
 // QUANT-EXL3-MUL1 slice G records it as owed, as a LOADER slice that ends in a
 // kernel (#2756).
 //
@@ -2402,10 +2403,12 @@ const void* MoeKernel(int bits, int cb, bool n256) {
 void Exl3MoeMlpKernelCuda(Queue& q, Tensor& output_state, const Tensor& hidden_state,
                           const Exl3MoeExpertTables& tables, const Exl3MoeRouting& routing,
                           const Exl3MoeTemps& temps, const Exl3MoeArgs& args) {
-  // `exl3_moe.cu:188` -- upstream's own `if (K_gate == K_up && K_up == K_down)
-  // K = K_gate;`, whose `else` leaves K at 0 and takes the runtime-width
-  // instance this port does not carry. A disagreeing tower refuses here rather
-  // than decoding one band with another's width.
+  // `exl3_moe.cu:188-189` -- upstream is `int K = 0;` then
+  // `if (K_gate == K_up && K_up == K_down) K = K_gate;`. A tower whose widths
+  // disagree therefore leaves K at 0 and takes the runtime-width instance,
+  // whose per-band `switch (K)` is `exl3_moe_kernel.cuh:139-149`. This port does
+  // not carry that instance, so a disagreeing tower refuses here rather than
+  // decoding one band with another's width.
   if (args.bits_gate != args.bits_up || args.bits_up != args.bits_down) {
     throw std::runtime_error(
         "vt cuda exl3: exl3_moe carries ONE width for all three projections; got bits (" +
