@@ -244,3 +244,58 @@ TEST_CASE("FromModelDir rejects an unknown dense architecture before loading") {
       "'Qwen4ExpForConditionalGeneration', 'StableLmForCausalLM'])",
       std::runtime_error);
 }
+
+// MODEL-MM-dots3-note W9a (#2882). The dots3-note GGUF refusal was CAREFUL and
+// UNREACHABLE: `LoadDots3NoteForCausalLM` refused `Kind::kGguf` by name, naming
+// the row and the brick, but `HfConfigFromGgufDispatch` (model_loader.cpp:2668)
+// runs long before `ModelSource::FromGguf` (:3069), so a real `dots3note` file
+// died at the build-level default naming neither the model, the row, the brick,
+// nor what is owed. These cases drive `LoadedEngine::FromModelDir` — the entry
+// point every server and CLI `.gguf` argument takes — exactly as the #809 cases
+// above do, and they are the whole gate for this slice: it adds no arithmetic,
+// so its gate is the refusal's REACHABILITY and its TEXT (spec §4.19.4).
+TEST_CASE("a dots3note GGUF is refused by dots3-note's OWN message") {
+  const std::string message = RefusalFor(GgufWithArchitecture("dots3note"));
+  REQUIRE_FALSE(message.empty());
+
+  // It names the MODEL...
+  CHECK(message.find("Dots3NoteForCausalLM") != std::string::npos);
+  CHECK(message.find("dots3-note") != std::string::npos);
+  // ...the ROW that owes the arm...
+  CHECK(message.find("MODEL-MM-dots3-note-dots3-note-for-causal-lm") !=
+        std::string::npos);
+  // ...the BRICK...
+  CHECK(message.find("W9") != std::string::npos);
+  // ...and the spec section a reader lands on.
+  CHECK(message.find(".agents/specs/dots3-note.md") != std::string::npos);
+  // And it is NOT the build-level default, which names none of those.
+  CHECK(message.find("is not supported by this build") == std::string::npos);
+}
+
+// The SECOND defect #2882 names, and it is a defect in PRODUCT OUTPUT rather
+// than in a record: the W1 message told the operator that llama.cpp has no
+// `dots3_note` architecture and therefore no converter to reuse. False at
+// llama.cpp `master` — `LLM_ARCH_DOTS3NOTE -> "dots3note"`
+// (`src/llama-arch.cpp:114`), merged by `ggml-org/llama.cpp`
+// 5a32f7b66ef6cfb3e60deea26e3454cc6ad3438c ("model: add dots3-note", #27060,
+// 2026-08-21) and 54ee5ee643f29abba6852903ddfdb688c2361b5b ("mtmd: support
+// dots3-note vision+audio", #27524, 2026-08-22), with the converter at
+// `conversion/dots3.py`. A record correction that leaves the lie in the throw
+// is not a fix, so the SHAs are asserted in the message a user actually reads.
+TEST_CASE("the dots3note GGUF refusal tells the truth about llama.cpp") {
+  const std::string message = RefusalFor(GgufWithArchitecture("dots3note"));
+  REQUIRE_FALSE(message.empty());
+
+  // The two merge commits, so the reader can check the claim instead of
+  // trusting it.
+  CHECK(message.find("5a32f7b66ef6cfb3e60deea26e3454cc6ad3438c") !=
+        std::string::npos);
+  CHECK(message.find("54ee5ee643f29abba6852903ddfdb688c2361b5b") !=
+        std::string::npos);
+  // The false claim is GONE, in either of the two spellings W1 used.
+  CHECK(message.find("llama.cpp has no") == std::string::npos);
+  CHECK(message.find("no upstream converter to reuse") == std::string::npos);
+  // And it does NOT oversell the position: this build still cannot read one.
+  // W9b/W9c/W9e/W9f own that (spec §4.19.5).
+  CHECK(message.find("cannot read it yet") != std::string::npos);
+}
