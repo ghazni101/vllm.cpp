@@ -245,6 +245,13 @@ the taps the Gated DeltaNet feeds:
 | `L00 mhc.mix` | 4.999e-04 | **4.324e-05** | **11.6x** |
 | `L00 mhc.inj` | 3.884e-05 | **0.000e+00** | exact |
 
+**ANNOTATION 2026-09-04 ([#2877](https://github.com/mudler/vllm.cpp/issues/2877)):
+THE TABLE ABOVE IS MISMATCHED IN THE SAME WAY THE PARAGRAPH BELOW IS.** Its
+"PREFILLDIV" column is CPU-**sequential** vs CUDA-**chunked** and its "this run"
+column is CPU-chunked vs CUDA-chunked, so the factors are read across a change of
+algorithm on one side. Read it with the two complete tables in the annotation
+below, which apply ONE framing to every tap instead of one framing per row.
+
 **And the second source is now the dominant one.** The same table's MoE taps move
 the other way: `L00 moe` goes 1.269e-04 -> 2.289e-04 and `L00 s.mlp`
 7.160e-05 -> 1.598e-04, from an input that is now 11.6x closer. That is
@@ -254,72 +261,166 @@ whole-model divergence is made of: `out` improves only 3.189e-03 -> 2.588e-03,
 largest divergence anywhere is at step 2's `out`: 1.471839e-02 between the two
 CPU arms, 2.320338e-02 between CPU and CUDA.
 
-> **ANNOTATION 2026-09-04 — THE PARAGRAPH ABOVE IS FALSIFIED. THE MoE RESIDUE DID
-> NOT GROW** ([#2877](https://github.com/mudler/vllm.cpp/issues/2877)). The text is
-> kept, not rewritten: a later reader needs the shape of the error. Three separate
-> things are wrong with it.
+> **ANNOTATION 2026-09-04 — BOTH READINGS ABOVE ARE FALSIFIED. WHETHER THE MoE
+> RESIDUE GREW IS UNMEASURED, AND SO IS THE 20x AT THE BLOCK**
+> ([#2877](https://github.com/mudler/vllm.cpp/issues/2877)). The text is kept, not
+> rewritten: a later reader needs the shape of the error. The claim that replaces
+> it is NOT "the residue did not grow" — that is the same overreach with its sign
+> flipped. It is that **the metric these tables are built from cannot answer the
+> question**, and that **no tap was taken at a step where the two arms disagree**.
+> Four numbered points, and one correction this annotation owes itself.
 >
-> **1. `rel(sumabs)` is a difference of NORMS, not a norm of DIFFERENCES.**
-> `run2-job.sh`'s `rel(a,b)` is evaluated on the tap's scalar `sumabs`, so the
-> published quantity is `| S|a| - S|b| | / max`. Its zero means "the two tensors
-> have equal L1 norm", not "the two tensors are equal", and it is not monotone in
-> divergence. At this tap's real size — `moe` is `o.tensor` `[T,H] = 5 x 2560 =
-> 12800` bf16 — a hermetic control at the committed scale (`sumabs ~ 390`) reads a
-> perturbation aligned with `sign(a)` at **1.00x** (the positive control, where the
-> two measures must agree) and under-reports a **zero-mean** one by **122.7x** at
-> sigma 1e-3 and **229.8x** at sigma 1e-4. Every reassociation and rounding
-> difference is zero-mean, so it cancels at `O(sqrt(n)) = sqrt(12800) ~ 113`, which
-> is the observed factor. Decisively: holding the true divergence **fixed** at sigma
-> 1e-3 and varying only the perturbation's sign structure over six seeds,
-> `rel(sumabs)` spans **4.64x** (1.52e-04 .. 7.06e-04) while the true divergence
-> spans 1.009x. The move reported above is **1.80x** at n = 1 per side. **It is
-> inside the instrument.**
+> **0. THE HEADLINE, AND IT IS THE ONE THAT SURVIVES EVERYTHING BELOW.** `LayerFp`
+> returns early on `s.step >= s.budget`
+> (`src/vllm/model_executor/models/qwen4_exp_forward.cpp:118`), so
+> `VT_Q4EXP_LAYER_FP=3` fingerprints model forwards **0, 1 and 2** and nothing
+> else. MOEDIV's committed digests count **48** MoE calls at `T=5` and **336** at
+> `T=1` — 8 forwards for 8 tokens — so this window is tokens `11751 13 15767`,
+> **which AGREE on both arms**. The three ids that disagree are at indices **4, 6
+> and 7**. **No instrument on this row has yet observed a single disagreeing
+> step.** Every number below is a measurement of three forwards on which the two
+> arms produce the same token.
 >
-> **2. The two readings do not hold the GDN algorithm fixed.** PREFILLDIV's
-> `1.269e-04` is CPU-**sequential** vs CUDA-**chunked**; this run's `2.289e-04` is
-> CPU-chunked vs CUDA-chunked. The like-for-like baseline is PREFILLDIV's *other*
-> matched pair, CPU-sequential vs CUDA-sequential, which that file publishes:
+> **1. `rel(sumabs)` is a difference of NORMS, not a norm of DIFFERENCES, and its
+> under-report is a DISTRIBUTION.** `run2-job.sh`'s `rel(a,b)` is evaluated on the
+> tap's scalar `sumabs`, so the published quantity is `| S|a| - S|b| | / max`. Its
+> zero means "the two tensors have equal L1 norm", not "the two tensors are
+> equal", and it is not monotone in divergence. `S|x|` is sign-insensitive, so a
+> zero-mean perturbation — which is every reassociation and rounding difference —
+> cancels at `O(sqrt(n))`.
 >
-> | pair | GDN algorithms | `mhc.mix` (the MoE input) | `moe` | moe/input |
-> |---|---|---|---|---|
-> | cpu-SEQ vs cuda-CHUNKED (the "before") | **MISMATCHED** | 4.999e-04 | 1.269e-04 | **0.25x** |
-> | cpu-SEQ vs cuda-SEQ | matched (sequential) | 2.139e-05 | 7.269e-05 | 3.40x |
-> | cpu-CHUNKED vs cuda-CHUNKED (this run, the "after") | matched (chunked) | 4.324e-05 | 2.289e-04 | 5.29x |
+> The first version of this annotation quoted **one seed draw** for that factor
+> ("122.7x at sigma 1e-3 and 229.8x at sigma 1e-4") to four significant figures,
+> and said `sqrt(n) = 113` "is the observed factor" beside a table in which
+> nothing equals 113. Over **400 seeds** at this tap's real size (`moe` is
+> `o.tensor` `[T,H] = 5 x 2560 = 12800` bf16, `sum|x| ~ 390`):
 >
-> **Among the two algorithm-matched pairs the MoE input moved 2.02x FURTHER, not
-> closer, and the residue rose 3.15x with it.** The only pair that attenuates is the
-> mismatched one — and a large, sign-varied perturbation is exactly the case the
-> metric of (1) compresses hardest, so `1.269e-04` is an under-reading rather than a
-> low divergence. The four signed `L00 moe` values carry no arm structure either:
-> `CPU-CHUNKED 389.936505 < CUDA-SEQ 389.947936 < CPU-SEQ 389.976283 <
-> CUDA-CHUNKED 390.025768` — alternating by device, with the two *chunked* arms at
-> both extremes. Neither "device" nor "GDN algorithm" orders them.
+> | perturbation | p05 | median | p95 |
+> |---|---|---|---|
+> | aligned with `sign(a)` | 1.00 | **1.00** | 1.00 |
+> | zero-mean, sigma 1e-3 | 31.4 | **69.2** | 568.2 |
+> | zero-mean, sigma 1e-4 | 43.9 | **125.6** | 1264.0 |
+> | zero-mean, sigma 1e-5 | 46.1 | **130.3** | 1398.7 |
+>
+> The first row is the positive control, where the two measures must agree and
+> do. There is no sigma dependence in the linear regime — 1e-4 and 1e-5 agree, and
+> both approach `sqrt(2n/pi)/|z| = 90.3/|z|` for a standard normal `z`, median
+> **133.8**.
+>
+> **What this costs a reader is the SPREAD, and that is what settles #2877.** Hold
+> the TRUE divergence fixed at sigma 1e-3 and vary only the perturbation's sign
+> structure: `rel(sumabs)` spans **18.3x** p05..p95 and **2078x** end to end,
+> while the true divergence spans 1.03x. Two readings **of the same true
+> divergence** differ by a median **2.1x**, 4.0x at p75, 8.9x at p90 and **18.2x**
+> at p95. So, as the probability that an UNCHANGED divergence produces a ratio at
+> least this large:
+>
+> | ratio | tap it is claimed for | P(no change produces it) |
+> |---|---|---|
+> | 24.1x | `s.attn`, defaults framing | 3.9% |
+> | 19.9x | `blk`, defaults framing | 4.6% |
+> | 16.7x | `blk`, matched framing | 5.4% |
+> | 11.6x | `mhc.mix`, defaults framing | 7.6% |
+> | 3.15x | `moe`, matched framing | **32.8%** |
+> | 2.34x | `s.mlp`, matched framing | **44.9%** |
+> | 2.02x | `mhc.mix`, matched framing | **52.2%** |
+> | 1.80x | `moe`, defaults framing | **58.7%** |
+>
+> **Every MoE number in this row is an ordinary reading of no change at all.** The
+> control is standard-library, fixed-seed and hermetic, and it is committed as
+> `MetricSpread` in `tests/scripts/test_q4exp_layerfp_diff.py` so it runs on a
+> lane rather than sitting in prose. It models the perturbation as i.i.d.
+> zero-mean against a Gaussian signal, which is the premise under which
+> `rel(sumabs)` is being read here; it bounds the METRIC's resolution and is not a
+> significance test on the real tensors.
+>
+> **2. ONE FRAMING, APPLIED TO EVERY TAP.** The first version of this annotation
+> disqualified the MoE reading for mixing arms and then left the *favourable* half
+> of the same three measurements standing. That is not admissible: `3.525e-04` and
+> `1.269e-04` come from the same PREFILLDIV column, and a comparison that is
+> mismatched for one is mismatched for the other. Four arms exist across the two
+> runs, and the CPU-sequential and CUDA-chunked readings reproduce byte-for-byte
+> between them, which is what makes the two runs one experiment.
+>
+> **Framing A — algorithm-MATCHED CPU vs CUDA** (the framing that killed the MoE
+> reading, now applied to every tap). `L00 in` is `0.000e+00` on both arms, so
+> layer 0's input is bit-identical and `blk` is the only tap that isolates a
+> block; the rest are propagation from it.
+>
+> | tap | cpu-SEQ vs cuda-SEQ | cpu-CHUNKED vs cuda-CHUNKED | after the port |
+> |---|---|---|---|
+> | `L00 blk` | 1.062e-06 | 1.772e-05 | **16.7x FURTHER** |
+> | `L00 s.attn` | 4.707e-06 | 8.047e-06 | 1.71x further |
+> | `L00 mhc.mix` | 2.139e-05 | 4.324e-05 | 2.02x further |
+> | `L00 mhc.inj` | 2.089e-05 | 0.000e+00 | to exactly zero |
+> | `L00 moe` | 7.269e-05 | 2.289e-04 | 3.15x further |
+> | `L00 s.mlp` | 6.815e-05 | 1.598e-04 | 2.34x further |
+> | `out` | 1.130e-03 | 2.588e-03 | 2.29x further |
+>
+> **Framing B — the two SHIPPED defaults, before and after the port.** This is a
+> true statement about what ships, and it is the only thing "19.9x" ever was. It
+> is not algorithm-matched on the "before" side, because before #2612 the CPU
+> default WAS the sequential arm.
+>
+> | tap | cpu-SEQ vs cuda-CHUNKED (before) | cpu-CHUNKED vs cuda-CHUNKED (after) | after the port |
+> |---|---|---|---|
+> | `L00 blk` | 3.525e-04 | 1.772e-05 | 19.9x closer |
+> | `L00 s.attn` | 1.939e-04 | 8.047e-06 | 24.1x closer |
+> | `L00 mhc.mix` | 4.999e-04 | 4.324e-05 | 11.6x closer |
+> | `L00 mhc.inj` | 3.884e-05 | 0.000e+00 | to exactly zero |
+> | `L00 moe` | 1.269e-04 | 2.289e-04 | 1.80x further |
+> | `L00 s.mlp` | 7.160e-05 | 1.598e-04 | 2.23x further |
+> | `out` | 3.189e-03 | 2.588e-03 | 1.23x closer |
+>
+> **The two framings disagree in DIRECTION on the same three measurements**, and
+> (1) says only the top four ratios are outside the metric at all. So: the port's
+> effect on the block is `19.9x closer` read one way and `16.7x further` read the
+> other, at 4.6% and 5.4% under no change — neither is a result, and quoting only
+> the first is what this repair exists to remove. The MoE taps move FURTHER under
+> **both** framings and are inside the instrument under both, which is why
+> "the residue grew" and "the residue did not grow" are equally unsupported.
+>
+> **Framing A's direction is not a surprise and not a defect.** The chunked
+> decomposition has more reassociation freedom than an exact sequential
+> recurrence, and this tree already measured that: chunked lands `2.29e-04` from
+> the exact answer where sequential lands `1.15e-08`
+> ([decomposition](gdn-chunked-decomposition-20260902.md)). Two chunked arms being
+> further apart than two sequential arms is what that predicts. Accuracy and
+> faithfulness are different things, and #2612 chose faithfulness to vLLM.
 >
 > **3. "This is why the ids did not move" is not supported by anything measured
-> here, because no tap was taken at a step where the ids disagree.**
-> `VT_Q4EXP_LAYER_FP=3` fingerprints the first **three** model forwards. MOEDIV's
-> committed digests count **48** MoE calls at `T=5` and **336** at `T=1` — 8
-> forwards for 8 tokens — so this window is tokens **0, 1, 2** = `11751 13 15767`,
-> **which agree on both arms**. The three disagreeing ids are at indices **4, 6 and
-> 7**, emitted at forwards 4, 6 and 7, **outside the instrumented window entirely**.
+> here.** The precise statement is (0)'s: **no tap was taken at a step where the
+> ids disagree**. The earlier annotation said "nothing measured on this row
+> explains them", and that overshoots in the other direction — forwards 0, 1 and 2
+> are causally UPSTREAM of forward 4 through the Gated DeltaNet recurrent state,
+> so these taps are not irrelevant to the disagreeing ids. They simply do not
+> observe them. Extending `VT_Q4EXP_LAYER_FP` past forward 3 is the measurement
+> that would.
 >
 > **What the residue actually is** was already named by
 > [#2552](https://github.com/mudler/vllm.cpp/issues/2552) and is not superseded:
-> with selections held equal at layer 0 it decomposes onto the **keep-quant grouped
-> expert GEMM** (`exp` 1.421e-04, 6.6x its input; `logit` only 1.1x, so the router
-> GEMM is not the amplifier), above a **bimodal top-k term** at a 32.9%
-> exact-bf16-tie rate. Both are **floors** that do not scale with input distance,
-> which is why the "before" reading sat below the floor. Neither is a defect: #2552
-> read both as faithful mirrors of vLLM and llama.cpp. **This annotation is record
-> and instrument work. It changes no kernel, and the three disagreeing ids remain
-> unexplained by anything measured so far.**
+> with selections held equal at layer 0 it decomposes onto the **keep-quant
+> grouped expert GEMM** (`exp` 1.421e-04, 6.6x its input; `logit` only 1.1x, so
+> the router GEMM is not the amplifier), above a **bimodal top-k term** at a 32.9%
+> exact-bf16-tie rate. Both are **floors** that do not scale with input distance.
+> Neither is a defect: #2552 read both as faithful mirrors of vLLM and llama.cpp.
+> **This annotation is record and instrument work. It changes no kernel.**
 >
 > **The next traceable step, and the residue is NOT closed.** #2552 brackets the
 > layer-0 expert-flip threshold between `2.139e-05` (no flip) and `4.999e-04`
 > (flip). This run's matched pair sits at `4.324e-05` — **inside that bracket** —
 > and `VT_MOE_SEL_FP` was not run on it, so whether the new reading contains a
-> layer-0 selection flip is **unmeasured**. That single run is the next measurement.
-> It needs the 68 GB released artifact and a GPU for the CUDA arm.
+> layer-0 selection flip is **unmeasured**. That single run, and a fingerprint
+> budget that reaches forward 7, are the next two measurements. Both need the
+> 68 GB released artifact and a GPU for the CUDA arm.
+>
+> **AND ONE CORRECTION TO THIS ANNOTATION'S OWN §5 NOTE.** "`42` is layer-0
+> coverage" is wrong for 3 of the 14 tags: `emb`, `wide` and `out` are tapped with
+> `il = -1`, outside the decoder loop, and are never layer 0. The committed
+> differ's own largest value is at `('2', None, 'out')`. Read `42` as "the 14
+> distinct tags x 3 steps that reached the comparator, at whichever `il` printed
+> first for each" — layer 0 for the 11 in-loop tags, `-1` for the other three.
+
 
 ## 6. What this does NOT establish
 

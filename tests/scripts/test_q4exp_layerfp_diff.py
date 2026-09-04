@@ -47,14 +47,26 @@ def tap_line(step, il, tag, sumabs, v=(0.0, 0.0, 0.0, 0.0)):
             % (step, il, tag, "bf16", 0, 12800, 0, 1.0, sumabs, v[0], v[1], v[2], v[3]))
 
 
-def fingerprint(path, layers=48, tags=("blk",), sumabs=lambda il, tag: 100.0, v=None):
+def fingerprint(path, layers=48, tags=("blk",), sumabs=lambda il, tag: 100.0, v=None,
+                steps=1):
+    """Write `steps` fingerprinted forwards, exactly as the instrument prints them.
+
+    `taps=` is CUMULATIVE. `LayerFp` does `++s.taps` on a counter that
+    `LayerFpEndStep` never resets (`qwen4_exp_forward.cpp:153`), so a real
+    three-step run of a 437-tap forward closes its steps with `taps=437`,
+    `taps=874`, `taps=1311` -- which is what the committed
+    `run2-results.txt` records. `steps=1` is the degenerate case where cumulative
+    and per-step are the SAME number, and it is the only case the first version of
+    this file could express.
+    """
     lines, taps = [], 0
-    for il in range(layers):
-        for tag in tags:
-            vv = v(il, tag) if v else (0.0, 0.0, 0.0, 0.0)
-            lines.append(tap_line(0, il, tag, sumabs(il, tag), vv))
-            taps += 1
-    lines.append("q4fp step=0 taps=%d END\n" % taps)
+    for step in range(steps):
+        for il in range(layers):
+            for tag in tags:
+                vv = v(il, tag) if v else (0.0, 0.0, 0.0, 0.0)
+                lines.append(tap_line(step, il, tag, sumabs(il, tag), vv))
+                taps += 1
+        lines.append("q4fp step=%d taps=%d END\n" % (step, taps))
     path.write_text("".join(lines), encoding="utf-8")
     return taps
 
@@ -183,6 +195,202 @@ class RepairedLoader(unittest.TestCase):
                                capture_output=True, text=True)
             self.assertEqual(r.returncode, 2)
             self.assertIn("did not parse every tap", r.stderr)
+
+
+class CumulativeTapCounter(unittest.TestCase):
+    """`taps=N END` is a RUNNING TOTAL, and reading it per-step refuses real data.
+
+    THE RED THIS CLASS EXISTS FOR. Every case above fingerprints ONE step, where
+    the cumulative count and the per-step count are the same number, so the first
+    version of the tool -- which subtracted nothing -- passed all eleven of them
+    and still exited 2 on every genuine multi-step run. The committed evidence
+    reads `q4fp step=0 taps=437 END q4fp step=1 taps=874 END q4fp step=2
+    taps=1311 END` (`run2-results.txt:12`), and the tool refused it.
+
+    The instrument is the authority for the shape, not this file:
+    `src/vllm/model_executor/models/qwen4_exp_forward.cpp:153` increments
+    `s.taps` per tap and `LayerFpEndStep` prints it without resetting.
+    """
+
+    def _three_steps(self, td, name, bump=0.0):
+        p = pathlib.Path(td) / name
+        fingerprint(p, layers=3, steps=3, sumabs=lambda il, tag: 100.0 + il + bump)
+        return p
+
+    def test_the_evidence_shape_is_cumulative_not_per_step(self):
+        """The fixture reproduces 437/874/1311's ARITHMETIC at 3 layers x 3 steps."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            p = self._three_steps(td, "fp.txt")
+            declared = [ln.split("taps=")[1].split()[0]
+                        for ln in p.read_text(encoding="utf-8").splitlines()
+                        if " taps=" in ln]
+            self.assertEqual(declared, ["3", "6", "9"],
+                             "the instrument declares a running total, not 3,3,3")
+
+    def test_counted_property_accepts_a_real_multi_step_fingerprint(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            p = self._three_steps(td, "fp.txt")
+            rows, _, declared = diff.parse(p)
+            self.assertEqual(len(rows), 9)
+            checks = diff.check_counted_property(str(p), rows, declared)
+            self.assertEqual(checks, [(0, 3, 3, True), (1, 6, 6, True), (2, 9, 9, True)],
+                             "step 1 declares 6 taps SINCE STEP 0, and 6 have been parsed")
+
+    def test_cli_does_not_refuse_a_real_multi_step_fingerprint(self):
+        """THE WHOLE FINDING: the tool exited 2 on every genuine run."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            a = self._three_steps(td, "a.txt")
+            b = self._three_steps(td, "b.txt", bump=0.001)
+            r = subprocess.run([sys.executable, str(TOOL), str(a), str(b), "--top", "0"],
+                               capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertNotIn("did not parse every tap", r.stderr)
+            self.assertIn("TAPS COMPARED                 : 9", r.stdout)
+            self.assertIn("(cumulative; +3 this step)", r.stdout)
+
+    def test_a_short_step_is_still_refused_under_the_cumulative_reading(self):
+        """The repair must not become 'accept anything'. A missing tap still reds."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            a = self._three_steps(td, "a.txt")
+            b = pathlib.Path(td) / "b.txt"
+            # Steps 0 and 2 complete; step 1 prints two of its three taps.
+            lines = []
+            for step, present in ((0, 3), (1, 2), (2, 3)):
+                for il in range(present):
+                    lines.append(tap_line(step, il, "blk", 100.0 + il))
+                lines.append("q4fp step=%d taps=%d END\n" % (step, 3 * (step + 1)))
+            b.write_text("".join(lines), encoding="utf-8")
+            r = subprocess.run([sys.executable, str(TOOL), str(a), str(b)],
+                               capture_output=True, text=True)
+            self.assertEqual(r.returncode, 2)
+            self.assertIn("did not parse every tap", r.stderr)
+            self.assertIn("RUNNING TOTAL", r.stderr)
+
+    def test_taps_past_the_last_END_are_refused_as_a_truncated_capture(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            p = pathlib.Path(td) / "fp.txt"
+            p.write_text(tap_line(0, 0, "blk", 1.0)
+                         + "q4fp step=0 taps=1 END\n"
+                         + tap_line(1, 0, "blk", 1.0), encoding="utf-8")
+            rows, _, declared = diff.parse(p)
+            self.assertEqual(diff.unclosed_steps(rows, declared), [1])
+            r = subprocess.run([sys.executable, str(TOOL), str(p), str(p)],
+                               capture_output=True, text=True)
+            self.assertEqual(r.returncode, 2)
+            self.assertIn("truncated", r.stderr)
+
+
+class MetricSpread(unittest.TestCase):
+    """WHAT A RATIO BETWEEN TWO `rel(sumabs)` NUMBERS IS WORTH.
+
+    The first version of this file's tool quoted ONE seed draw -- "122.7x at
+    sigma 1e-3 and 229.8x at sigma 1e-4" -- to four significant figures. It is a
+    distribution, its median is not those numbers, and its spread is the part
+    that decides whether any ratio in the #2877 reading means anything.
+
+    Hermetic: standard library only, fixed seeds, no artifact and no GPU. It
+    models the perturbation as i.i.d. zero-mean against a Gaussian signal at the
+    committed `L00 moe` scale (`n = 12800`, `sum|x| ~ 390`), which is the premise
+    under which `rel(sumabs)` is being read. It bounds the METRIC's resolution.
+    It is not a significance test on the real tensors.
+    """
+
+    N = 12800
+    SIGMA_A = 0.0382  # sum|a| ~ 390 over n = 12800
+
+    def _draw(self, seed, sigma, aligned=False):
+        import math
+        import random
+        r = random.Random(seed)
+        a = [r.gauss(0.0, self.SIGMA_A) for _ in range(self.N)]
+        if aligned:
+            e = [math.copysign(abs(r.gauss(0.0, sigma)), x) for x in a]
+        else:
+            e = [r.gauss(0.0, sigma) for _ in range(self.N)]
+        sa = sum(abs(x) for x in a)
+        sb = sum(abs(x + y) for x, y in zip(a, e))
+        m = max(sa, sb)
+        # (the committed metric, the honest one)
+        return abs(sa - sb) / m, sum(abs(y) for y in e) / m
+
+    @staticmethod
+    def _pct(values, q):
+        v = sorted(values)
+        return v[min(len(v) - 1, int(q / 100.0 * len(v)))]
+
+    def test_positive_control_a_sign_aligned_perturbation_reads_1x(self):
+        """Where the two measures MUST agree they do, so the gap below is real."""
+        for seed in range(8):
+            rs, rl = self._draw(seed, 1e-3, aligned=True)
+            self.assertAlmostEqual(rl / rs, 1.0, places=6)
+
+    def test_the_under_report_is_a_distribution_and_not_122x(self):
+        draws = [self._draw(s, 1e-3) for s in range(64)]
+        ratios = sorted(rl / rs for rs, rl in draws)
+        median = ratios[len(ratios) // 2]
+        self.assertGreater(median, 20.0, "a zero-mean perturbation is heavily under-read")
+        self.assertLess(median, 400.0)
+        # The point of the case: p05..p95 spans an order of magnitude, so no
+        # single figure -- 122.7x, 229.8x or this median -- is a constant.
+        self.assertGreater(self._pct(ratios, 95) / self._pct(ratios, 5), 10.0)
+
+    def test_at_a_FIXED_true_divergence_the_metric_still_spans_an_order_of_magnitude(self):
+        draws = [self._draw(s, 1e-3) for s in range(64)]
+        rel_sumabs = [rs for rs, _ in draws]
+        true_l1 = [rl for _, rl in draws]
+        self.assertLess(max(true_l1) / min(true_l1), 1.1,
+                        "the TRUE divergence is held fixed across these seeds")
+        self.assertGreater(max(rel_sumabs) / min(rel_sumabs), 20.0,
+                           "the committed metric is not, on the same divergence")
+
+    def test_a_ratio_of_two_readings_below_about_18x_ranks_nothing(self):
+        """The consequence for #2877: 1.80x, 2.02x and 3.15x are NO CHANGE.
+
+        Pairs drawn from readings of the SAME true divergence. If the moves the
+        reading argues over are ordinary values of this ratio, the reading cannot
+        order them -- in either direction.
+        """
+        rel_sumabs = [self._draw(s, 1e-3)[0] for s in range(64)]
+        pairs = []
+        for i in range(len(rel_sumabs)):
+            for j in range(i + 1, len(rel_sumabs)):
+                x, y = rel_sumabs[i], rel_sumabs[j]
+                pairs.append(max(x, y) / min(x, y))
+        pairs.sort()
+        for move in (1.80, 2.02, 3.15):
+            share = sum(1 for r in pairs if r >= move) / len(pairs)
+            self.assertGreater(share, 0.20,
+                               "%.2fx is an ordinary reading of an UNCHANGED "
+                               "divergence (%.0f%% of pairs reach it)"
+                               % (move, 100 * share))
+        self.assertGreater(self._pct(pairs, 95), 8.0,
+                           "two readings of one divergence differ by ~an order of "
+                           "magnitude at p95")
+
+    def test_the_tool_reports_the_spread_and_not_a_single_constant(self):
+        """Every run's stdout must carry what the cases above measured.
+
+        The first version printed `~122x under-report measured at this tap's
+        n=12800` -- one seed draw, presented as the property of the tap.
+        """
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            a = pathlib.Path(td) / "a.txt"
+            b = pathlib.Path(td) / "b.txt"
+            fingerprint(a, layers=2, steps=2)
+            fingerprint(b, layers=2, steps=2)
+            r = subprocess.run([sys.executable, str(TOOL), str(a), str(b)],
+                               capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("DISTRIBUTION, not a constant", r.stdout)
+            self.assertIn("p05..p95", r.stdout)
+            self.assertNotIn("~122x", r.stdout,
+                             "one seed draw must not be printed as the tap's property")
 
 
 class MetricHonesty(unittest.TestCase):

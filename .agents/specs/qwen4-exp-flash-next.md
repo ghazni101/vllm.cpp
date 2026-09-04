@@ -4079,9 +4079,18 @@ the tap emits, and every scalar the tap emits is **sign-insensitive**. `S|x|` is
 norm, so comparing two arms' norms gives a DIFFERENCE OF NORMS: it reads zero on
 two tensors that differ in every element but happen to have equal L1 norm, and it
 cancels a zero-mean perturbation — which is every reassociation and rounding
-difference — at `O(sqrt(n))`. Measured at this tap's `n = 12800`: 122.7x
-under-report at sigma 1e-3, 229.8x at sigma 1e-4, and a **4.64x** span at a
-**fixed** true divergence when only the perturbation's sign structure varies. The
+difference — at `O(sqrt(n))`. **By a factor that is a DISTRIBUTION, not a
+constant**: at this tap's `n = 12800`, over 400 seeds of the hermetic control
+committed as `MetricSpread` in `tests/scripts/test_q4exp_layerfp_diff.py`, the
+under-report has a median of 69.2x at sigma 1e-3 and 125.6x at sigma 1e-4 with a
+p05..p95 of 31..1264, and no sigma dependence in the linear regime (1e-4 and 1e-5
+agree, both approaching `sqrt(2n/pi)/|z| = 90.3/|z|`, median 133.8). This spec
+first quoted the single draws `122.7x` and `229.8x` to four significant figures,
+and a `4.64x` span at a **fixed** true divergence measured over SIX seeds. Over
+400 seeds that span is **18.3x** p05..p95 and 2078x end to end, and the
+consequence is the one that matters: **two readings of the SAME true divergence
+differ by a median 2.1x, 8.9x at p90 and 18.2x at p95**, so a ratio between two
+`rel(sumabs)` numbers below roughly 18x ranks nothing in either direction. The
 tool prints `head_dmax`, an exact elementwise difference over the four `v=` values
 the tap already emits, which cannot cancel — but it samples 4 of 12800 elements,
 so it is a witness and never a magnitude.
@@ -4100,6 +4109,24 @@ the same reason `sumabs` is.
 This is product code, so it needs its own spec, a red-first test, and a fresh
 review. #2877 was diagnosis plus record and instrument repair, and it deliberately
 changed no `src/` file.
+
+### NO INSTRUMENT HAS YET OBSERVED A DISAGREEING STEP ([#2877](https://github.com/mudler/vllm.cpp/issues/2877))
+
+`LayerFp` returns early on `s.step >= s.budget`
+(`src/vllm/model_executor/models/qwen4_exp_forward.cpp:118`), so every
+fingerprint this row has taken covers model forwards **0, 1 and 2** — tokens
+`11751 13 15767`, which the two arms **agree** on. The three ids that disagree are
+emitted at forwards **4, 6 and 7**. Every ratio published for this row therefore
+describes three forwards on which nothing disagrees, and no measurement so far
+bears directly on the ids that do.
+
+**What is owed is a fingerprint budget that reaches forward 7** on both arms,
+which is `VT_Q4EXP_LAYER_FP=8` and needs no code change — the budget is already
+read from the environment. It needs the 68 GB released UD-IQ1_S artifact and a GPU
+for the CUDA arm, so it is a lease, not a desk run. The `sumabs` axis it would
+print is still the one §"needs a DIFFERENCE-NORM axis" above disqualifies for
+ranking, so the two are best spent together: the projection axis first, the wider
+budget on the same run.
 
 ### The ARMTOKENS diffs cannot be re-rendered without a device ([#2877](https://github.com/mudler/vllm.cpp/issues/2877))
 
@@ -4158,28 +4185,47 @@ carries the remaining 3 ids is the undiagnosed MoE residue, which improved
 nothing (`moe` `1.269e-04` -> `2.289e-04` from an input 11.6x closer). A fifth
 wave must not re-derive this either.
 
-**ANNOTATION 2026-09-04 — THE PARENTHETICAL ABOVE IS FALSIFIED; THE RESIDUE DID
-NOT GROW** ([#2877](https://github.com/mudler/vllm.cpp/issues/2877), full
-reasoning and controls in [the ARMTOKENS evidence
+**ANNOTATION 2026-09-04 — THE RATIOS IN THE TWO PARAGRAPHS ABOVE ARE WITHDRAWN,
+IN BOTH DIRECTIONS** ([#2877](https://github.com/mudler/vllm.cpp/issues/2877),
+full reasoning, both framings and the committed control in [the ARMTOKENS evidence
 file](../../docs/bench-evidence/qwen4exp-gdn-chunked-token-ids-20260904.md)). The
-sentence is kept so the shape of the error stays visible. (a) `rel(sumabs)` is a
-difference of NORMS, not a norm of DIFFERENCES: at this tap's `n = 12800` it
-under-reports a zero-mean perturbation by ~122x, and at a **fixed** true
-divergence it spans **4.64x** on sign structure alone, against the 1.80x move
-claimed here at n = 1. (b) The two readings never held the GDN algorithm fixed —
-`1.269e-04` is CPU-sequential vs CUDA-**chunked**, `2.289e-04` is
-CPU-chunked vs CUDA-chunked; among the two algorithm-**matched** pairs the MoE
-input moved **2.02x further**, not closer (2.139e-05 -> 4.324e-05), and the
-residue rose 3.15x with it. (c) `VT_Q4EXP_LAYER_FP=3` covers forwards 0, 1, 2 =
-tokens `11751 13 15767`, which **agree on both arms**; the three disagreeing ids
-are emitted at forwards 4, 6 and 7, outside the window, so nothing measured here
-bears on them at all. The residue's mechanism was already named by
+sentences are kept so the shape of the error stays visible. The replacement claim
+is NOT "the residue did not grow" — that is the same overreach with its sign
+flipped. **(a) THE ONE THAT SURVIVES, AND IT STRENGTHENS THIS SECTION'S OWN
+POSITION.** `LayerFp` returns early on `s.step >= s.budget`
+(`src/vllm/model_executor/models/qwen4_exp_forward.cpp:118`), so
+`VT_Q4EXP_LAYER_FP=3` covers forwards 0, 1, 2 = tokens `11751 13 15767`, which
+**agree on both arms**, while the three disagreeing ids are emitted at forwards 4,
+6 and 7. **No instrument on this row has yet observed a disagreeing step**, so the
+attribution of "the remaining 3 ids" to the MoE residue is not measured here at
+all. Those forwards are causally upstream of forward 4 through the recurrent
+state, so the taps are not irrelevant to the disagreement; they simply never
+observe it. **(b)** `rel(sumabs)` is a difference of NORMS, not a norm of
+DIFFERENCES, and its under-report is a DISTRIBUTION rather than the `~122x` single
+seed draw this line first quoted: over 400 seeds at `n = 12800` the median is
+69.2x (sigma 1e-3) to 125.6x (sigma 1e-4), p05..p95 31..1264, and at a **fixed**
+true divergence two readings differ by a median **2.1x** and **18.2x** at p95 —
+where the earlier `4.64x` was six seeds. **(c) One framing, applied to every
+tap.** `3.525e-04` and `1.269e-04` are the same PREFILLDIV column, so a comparison
+that is mismatched for the MoE row is mismatched for the block row. Read as
+algorithm-**matched** CPU-vs-CUDA pairs, `L00 blk` moved **16.7x FURTHER**
+(1.062e-06 seq/seq -> 1.772e-05 chunked/chunked) where the paragraph above reads
+`3.525e-04` -> `1.772e-05` as a 19.9x improvement, and every other layer-0 tap
+moved further too (`s.attn` 1.71x, `mhc.mix` 2.02x, `moe` 3.15x, `s.mlp` 2.34x,
+`out` 2.29x; `mhc.inj` alone to exactly zero). Against (b), 19.9x and 16.7x sit at
+4.6% and 5.4% of the metric's own no-change distribution and 1.80x through 3.15x
+sit between its 33rd and 59th percentile, so **nothing here is ranked, in either
+direction**. The direction (c) reports is what the chunked decomposition's larger
+reassociation freedom predicts — it lands `2.29e-04` from the exact answer where
+sequential lands `1.15e-08` — and it is not a defect. The residue's mechanism was
+already named by
 [#2552](https://github.com/mudler/vllm.cpp/issues/2552) — the keep-quant grouped
 expert GEMM's reassociation plus a bimodal top-k term at a 32.9% exact-tie rate,
 both floors, both faithful mirrors and neither a defect. **NOT CLOSED:** the
 matched pair's `4.324e-05` lands inside #2552's layer-0 flip bracket
 (2.139e-05 no flip .. 4.999e-04 flip) and `VT_MOE_SEL_FP` was never run on it.
-That run is the next traceable step; it needs the 68 GB artifact and a GPU.
+That run, and a fingerprint budget that reaches forward 7, are the next two
+measurements; both need the 68 GB artifact and a GPU.
 
 **Why this section exists at all.** The *cause* was already recorded (§Wave
 PREFILLDIV, and the evidence file above). The two dead-end *routes* were not, and

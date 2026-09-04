@@ -21,20 +21,45 @@ THREE THINGS IT DOES THAT THE INLINE ONE DID NOT.
    wrong; silently keeping the first is how 1311 taps read as 42.
 
 2. It asserts its own COUNTED PROPERTY. `taps=N END` closes every fingerprinted
-   step, and the rows parsed for that step must equal N. A comparator that parsed
-   nothing prints an empty table, and an empty table reads like two agreeing arms.
+   step, and N is CUMULATIVE -- one counter that `LayerFpEndStep` never resets --
+   so the rows parsed for steps 0..s must equal the N that step s declares. A
+   three-step run of a 437-tap forward prints 437, 874, 1311. A comparator that
+   parsed nothing prints an empty table, and an empty table reads like two
+   agreeing arms. Rows past the last `END` are refused separately: a capture cut
+   off mid-step is short in a way the cumulative count cannot see.
 
 3. It says what `rel(sumabs)` IS WORTH, on every run, in the output.
    `rel(sumabs) = | S|a| - S|b| | / max` is a DIFFERENCE OF NORMS, not a norm of
    differences. Its zero means "the two tensors have equal L1 norm", not "the two
    tensors are equal", and it is not monotone in divergence. `S|x|` is
    sign-INSENSITIVE, so a zero-mean perturbation -- which is every reassociation
-   and rounding difference -- cancels at `O(sqrt(n))`. Measured at this tap's real
-   size (`n = 12800`): a perturbation aligned with `sign(a)` reads 1.00x (the two
-   measures must agree there, and that is the positive control), while a zero-mean
-   one under-reports by 122.7x at sigma 1e-3 and 229.8x at sigma 1e-4. Holding the
-   true divergence FIXED and varying only sign structure over six seeds,
-   `rel(sumabs)` spans 4.64x against the true divergence's 1.009x.
+   and rounding difference -- cancels at `O(sqrt(n))`.
+
+   THE UNDER-REPORT IS A DISTRIBUTION, NOT A CONSTANT. The first version of this
+   file quoted one seed draw ("122.7x at sigma 1e-3, 229.8x at sigma 1e-4") to
+   four significant figures. At this tap's real size (`n = 12800`), over 400
+   seeds of the control in `tests/scripts/test_q4exp_layerfp_diff.py`:
+
+     perturbation             p05    median      p95
+     sign(a)-aligned         1.00      1.00     1.00   <- the positive control
+     zero-mean, sigma 1e-3   31.4      69.2    568.2
+     zero-mean, sigma 1e-4   43.9     125.6   1264.0
+     zero-mean, sigma 1e-5   46.1     130.3   1398.7
+
+   There is no sigma dependence in the linear regime -- 1e-4 and 1e-5 agree, and
+   both approach `sqrt(2n/pi)/|z| = 90.3/|z|` for a standard normal `z`, median
+   133.8. `sqrt(n) = 113` is not "the observed factor"; nothing observed equals it.
+
+   WHAT THIS COSTS A READER IS THE SPREAD, NOT THE MEDIAN. Hold the TRUE
+   divergence FIXED at sigma 1e-3 and vary only the perturbation's sign structure:
+   `rel(sumabs)` spans 18.3x p05..p95 and 2078x end to end, while the true
+   divergence spans 1.03x. Two readings OF THE SAME true divergence differ by a
+   median 2.1x, by 4.0x at p75, 8.9x at p90 and 18.2x at p95. So a ratio between
+   two `rel(sumabs)` numbers is worth what that table says and no more: 1.8x, 2.0x
+   and 3.2x are the 59th, 52nd and 33rd percentile of NO CHANGE AT ALL. This
+   models the perturbation as i.i.d. zero-mean against a Gaussian signal, which is
+   the premise under which the metric is being used; it bounds the metric's
+   resolution and is not a significance test on the real tensors.
 
    So this tool also prints `head_dmax`, the exact elementwise
    `max|v_i(a) - v_i(b)|` over the four `v=` values the tap already emits. That is
@@ -112,13 +137,37 @@ def parse(path):
 
 
 def check_counted_property(path, rows, declared):
-    """`taps=N END` closes each step; the rows parsed for it must equal N."""
+    """`taps=N END` closes each step, and N is a RUNNING TOTAL, not a per-step count.
+
+    `LayerFp` does `++s.taps` on a counter that `LayerFpEndStep` never resets
+    (`src/vllm/model_executor/models/qwen4_exp_forward.cpp:153`), so a real
+    three-step fingerprint of a 437-tap forward prints `taps=437`, `taps=874`,
+    `taps=1311` -- 437 taps EACH, declared cumulatively. Reading N as a per-step
+    count refuses every genuine run at step 1, which is what the first version of
+    this file did: its committed tests all fingerprint ONE step, where cumulative
+    and per-step are the same number, so nothing could fail.
+
+    Returns `(step, declared_cumulative, parsed_cumulative, ok)` per closed step.
+    The single-step case still reads `(0, N, N, True)`.
+    """
     out = []
-    for step, want in sorted(declared.items(), key=lambda kv: int(kv[0])):
-        got = sum(1 for k in rows if k[0] == int(step))
-        ok = got == want
-        out.append((int(step), want, got, ok))
+    seen = 0
+    for step in sorted(declared, key=int):
+        s = int(step)
+        seen += sum(1 for k in rows if k[0] == s)
+        out.append((s, declared[step], seen, seen == declared[step]))
     return out
+
+
+def unclosed_steps(rows, declared):
+    """Steps that printed taps and no `taps=N END`: a truncated capture.
+
+    The cumulative check above can only speak for steps the instrument closed.
+    Rows past the last `END` are invisible to it, and a capture cut off mid-step
+    is exactly the case where an empty or short comparison reads like agreement.
+    """
+    closed = {int(k) for k in declared}
+    return sorted({k[0] for k in rows} - closed)
 
 
 def rel_sumabs(a, b):
@@ -161,20 +210,37 @@ def main(argv=None):
     print("rows: base=%d other=%d   distinct layers: base=%d other=%d"
           % (len(A), len(B), len({k[1] for k in A}), len({k[1] for k in B})))
     for path, rows, decl in ((a.base, A, dA), (a.other, B, dB)):
+        name = path.split("/")[-1]
+        prev = 0
         for step, want, got, ok in check_counted_property(path, rows, decl):
-            print("COUNTED PROPERTY %-28s step=%d taps=%d parsed=%d %s"
-                  % (path.split("/")[-1], step, want, got, "OK" if ok else "MISMATCH"))
+            print("COUNTED PROPERTY %-28s step=%d taps=%d (cumulative; +%d this "
+                  "step) parsed=%d %s"
+                  % (name, step, want, want - prev, got, "OK" if ok else "MISMATCH"))
+            prev = want
             if not ok:
                 print("REFUSED: the comparator did not parse every tap the "
-                      "instrument printed.", file=sys.stderr)
+                      "instrument printed. `taps=` is a RUNNING TOTAL over the "
+                      "process (qwen4_exp_forward.cpp:153 never resets it), so "
+                      "step %d declares %d taps SINCE STEP 0 and %d parsed."
+                      % (step, want, got), file=sys.stderr)
                 return 2
+        open_steps = unclosed_steps(rows, decl)
+        if open_steps:
+            print("REFUSED: %s has taps at step(s) %s that no `taps=N END` "
+                  "closes. The capture is truncated, and a short comparison "
+                  "reads like agreement." % (name, open_steps), file=sys.stderr)
+            return 2
 
     print()
     print("rel_sumabs is a DIFFERENCE OF NORMS: zero means EQUAL L1 NORM, not equal")
-    print("tensors. It cancels a zero-mean perturbation at O(sqrt(n)) -- ~122x under-")
-    print("report measured at this tap's n=12800. head_dmax is an exact elementwise")
-    print("difference over the 4 emitted values: non-zero PROVES the tensors differ,")
-    print("zero proves nothing. A whole-tensor difference norm is OWED (#2877).")
+    print("tensors. It cancels a zero-mean perturbation at O(sqrt(n)), and by a factor")
+    print("that is a DISTRIBUTION, not a constant: at this tap's n=12800 the median")
+    print("under-report is 69x (sigma 1e-3) to 126x (sigma 1e-4), p05..p95 31..1264.")
+    print("READ RATIOS ACCORDINGLY: at a FIXED true divergence two readings differ by a")
+    print("median 2.1x, 8.9x at p90 and 18.2x at p95, so a ratio under ~18x between two")
+    print("of these numbers ranks nothing, in either direction. head_dmax is an exact")
+    print("elementwise difference over the 4 emitted values: non-zero PROVES the tensors")
+    print("differ, zero proves nothing. A whole-tensor difference norm is OWED (#2877).")
     print()
 
     sel = [k for k in order
