@@ -648,7 +648,7 @@ That claim had never been measured. The changed tree's number is beside it in th
 gate evidence below, so the split is argued from a ratio rather than from an
 estimate.
 
-### Slice G evidence — the `orin:gpu0` leg, 2026-09-03: COMPILES, cannot execute
+### Slice G evidence — the `orin:gpu0` leg, 2026-09-03: it COMPILES, and my toolkit choice stopped it executing
 
 Tree `9a1014e0728899342aca1c8c26301d6f6f493434`, `cuda_exl3.cu` sha256
 `1add305e...5068eb3b`, tar asserted before the build. nvcc 13.3, `sm_87`,
@@ -663,12 +663,22 @@ on hold for every new width: `dq_dispatch`'s `static_assert(bits == 3 || 4 || 5 
 6)` and `exl3_gemm_kernel_inner`'s `static_assert(kSmemMax >= ...)`. A width that
 overflowed the staged tiles would have failed HERE, loudly, and none did.
 
-**What it cannot establish, and why.** No numeric result. The box has
-`/dev/nvidia0` and driver 540.4.0 against a CUDA 13.3 runtime, so
-`cudaGetDeviceCount` returns rc=35, "CUDA driver version is insufficient for CUDA
-runtime version". `cuda_backend.cu`'s registrar returns silently on a non-success
-rc, `kCUDA` is never registered, `vt::GetBackend(kCUDA)` throws, and both device
-cases took their no-device skip. The numbers are owed to `thor:gpu0`.
+**What it cannot establish, and why — and the reason is MINE, not the box's.**
+No numeric result came off this leg. `cudaGetDeviceCount` returned rc=35,
+`CUDA_ERROR_INSUFFICIENT_DRIVER`; `cuda_backend.cu`'s registrar returns silently
+on a non-success rc, `kCUDA` is never registered, `vt::GetBackend(kCUDA)` throws,
+and both device cases took their no-device skip.
+
+I first recorded that as "orin compiles CUDA and cannot run it", as though it
+were a property of the board. **It is not, and `origin/main`'s 8b26a395d has the
+correct diagnosis**: `cuInit` and `cuDeviceGetCount` both return 0 with count 1,
+so the driver sees the GPU. The board's driver API is CUDA **12.6** (L4T R36.4.7,
+JetPack 6), a CUDA runtime of version N needs a driver API of at least N, and a
+job had left a **13.3** toolkit at `/usr/local/cuda` which this job's script
+prepends to `PATH`. So the 35 is correct behaviour reporting a packaging mistake.
+Use the board's L4T CUDA 12.6; the DGX `cuda-toolkit-13-*` recipe is wrong for a
+Jetson. The numbers in this spec come from `thor:gpu0`, and a rerun on orin at
+12.6 would be a second architecture rather than a blocked one.
 
 **This leg is also where #2769 was found**, and the shape is worth keeping. The
 run came back `9 test cases | 7 passed | 2 failed`, `assertions: 42 | 40 passed |
@@ -686,51 +696,107 @@ from a file the subshell writes. And the provisioning loop tested
 `/usr/bin/time` was never installed and the compile-time measurement was lost;
 the timing is now a wall clock, which needs no package.
 
-### Slice G evidence — the numeric device gate is PENDING on `thor:gpu0`
+### Slice G evidence — the device gate and the mutation table, `thor:gpu0`, 2026-09-03
 
-**No numeric device result for the widened widths is claimed, and none may be
-quoted from this branch yet.** What exists is above: the arm compiles at every
-instantiated width on `sm_87`, and the pre-change tree is green on `thor:gpu0`
-with its device case skipped. Neither is a parity number.
+Tree `bc841f075`, `cuda_exl3.cu` sha256 `d4800d5e…f8fa66`, tar asserted before the
+build. `NVIDIA Thor`, compute capability 11.0, driver `595.78`, nvcc 13.0,
+`sm_110a`, Release, `-j 4`. One lease, one build directory, the binary rebuilt in
+place between legs.
 
-The leg that produces one is queued, not skipped. `job-gate2.sh` on the shared
-share runs, in one lease against one build directory, with the tree's sha256
-asserted before it builds:
+`cuda_exl3.cu` alone, ccache off, one architecture: **85 s**, max RSS 450696 kB,
+against **67.84 s** for the pre-change tree measured the same way on the same box.
+**+25 % for 4x the MoE kernels** (two instantiations to eight). The per-K
+translation-unit split this spec's `## Owed` says a widening "needs" is therefore
+NOT needed at this size — that entry was an estimate and this is the measurement.
+It stays owed as a scaling answer, not as a precondition.
 
-| Leg | Edit | Must |
-|---|---|---|
-| `GREEN` | none | `rc=0`, `widths_reported=8` |
-| `REDBEFORE` | `Exl3MoeArmInstantiated` narrowed to `bits == 3` — the pre-change arm set exactly | RED |
-| `M1` | bits 4 out of the predicate | RED |
-| `M2` | bits 5 out of the predicate | RED |
-| `M3` | bits 6 out of the predicate | RED |
-| `M4` | the bits-3 entry's `cb` template argument 1 -> 2 | RED |
-| `M5` | the bits-4 entry's `bits` template argument 4 -> 3 | RED |
+#### Parity: the widened arm against the CPU arm
 
-Each leg records the file's sha256 before and after, refuses to proceed if the
-mutation did not apply uniquely, asserts the OBJECT's mtime MOVED (a mutation
-that never compiled reads as a passing test), distinguishes a build failure from
-a red test, and restores the file from a pristine copy whose sha256 is checked
-against the original.
+All eight instantiated combinations, `rel <= 2.0e-2` (the bound the single
+`(3, 1)` arm already carried, not widened for anything):
 
-Reproduce, or read the result, at:
+| bits | intermediate | `MOE_TILESIZE_N` | relative RMS |
+|---|---|---|---|
+| 3 | 128 | 128 | 1.07694e-3 |
+| 3 | 256 | 256 | 1.07600e-3 |
+| 4 | 128 | 128 | 1.24339e-3 |
+| 4 | 256 | 256 | 1.10112e-3 |
+| 5 | 128 | 128 | 1.28998e-3 |
+| 5 | 256 | 256 | 1.03677e-3 |
+| 6 | 128 | 128 | 1.02797e-3 |
+| 6 | 256 | 256 | 1.15218e-3 |
 
-```sh
-rc run --device thor:gpu0 -- bash /workspace/exl3moe-widen/job-gate2.sh
-# results land in /workspace/exl3moe-widen/out-gate-sm110/results.txt
-```
+Worst case 1.28998e-3, **15.5x inside the bound**. `test_exl3_moe` overall:
+`9 test cases | 9 passed`, `assertions: 564 | 564 passed | 0 failed`, rc 0.
 
-**Until that leg lands, the widened widths are gated by compilation and by the
-CPU arm's own tier-4 case only.** The tolerance is not in question — the case
-reuses the `2.0e-2` bound the single `(3, 1)` arm already carried and widens it
-for nothing — but an untaken gate is PENDING and is never a pass.
+#### The mutation table
 
-**M4 is the leg that matters most and the one a shape-checking gate cannot
-replace.** `(3, 1)` and `(3, 2)` are the confusable pair: same width, same `dq8`
-route, same tile shapes. A `cb` threaded wrongly between them does not fail to
-compile and does not change a shape. It decodes with the other codebook's
-multiplier and yields a weight with the right distribution and no correlation to
-the true one.
+| Leg | What it mutated | Expected | Produced | Match |
+|---|---|---|---|---|
+| `GREEN` | nothing | rc 0, 8 widths | **VOID** — aborted on the harness's own mtime guard | n/a, see below |
+| `REDBEFORE` | predicate narrowed to `bits == 3`, the pre-change arm set exactly | RED | rc 1, threw the by-name refusal at **bits 4**, 2 widths reported | ✅ |
+| `M1` | bits 4 out of the predicate | RED | rc 1, threw at **bits 4**, 2 widths | ✅ |
+| `M2` | bits 5 out | RED | rc 1, threw at **bits 5**, 4 widths | ✅ |
+| `M3` | bits 6 out | RED | rc 1, threw at **bits 6**, 6 widths | ✅ |
+| `M4` | the bits-3 entry's `cb` template argument 1 -> 2 | RED | rc 1, 8 widths, **2 failed CHECKs, both at bits 3**, RMS 1.16335 and 1.15791 | ✅ |
+| `M5` | the bits-4 entry's `bits` template argument 4 -> 3 | RED | rc 1, 8 widths, **2 failed CHECKs, both at bits 4**, RMS 1.32880 and 1.38082 | ✅ |
+| `FINAL` | restored | rc 0, 8 widths | rc 0, 8 widths, sha256 == pristine | ✅ |
+
+Every mutation leg's `build-*.log` shows `Building CUDA object … cuda_exl3.cu.o`,
+so none of the six is the "mutation that never compiled reads as a passing test"
+case. Each restored byte-for-byte, checked against the pristine sha256.
+
+#### Reading `TEST_RC=1` with `0 failed` assertions
+
+`REDBEFORE`, `M1`, `M2` and `M3` each report `assertions: N | N passed | 0
+failed` beside `TEST_RC=1`. That is doctest's signature for a THROWN case, and it
+is what a by-name refusal must look like — the exception leaves the `TEST_CASE`,
+so no assertion records a failure while the process still exits non-zero. **The
+count alone cannot say the throw was the intended one**, so the verdicts above
+were taken from the exception text, which names the width in every leg:
+`REDBEFORE`/`M1` at bits 4, `M2` at bits 5, `M3` at bits 6 — each the first width
+its own mutation removed.
+
+`widths_reported` climbing 2 → 2 → 4 → 6 → 8 → 8 is the same fact from the other
+side: the loop completes every width still instantiated and dies at the first one
+removed. Two reported means it finished bits 3 at both N tiles and died at bits 4.
+It is a positional readout of the mutation, not noise.
+
+**`REDBEFORE` and `M1` are observationally identical**, both reporting 2 widths
+and throwing at bits 4, because the loop dies at the first missing width and
+`REDBEFORE` removes 4, 5 and 6 while `M1` removes only 4. `REDBEFORE` still earns
+its place — it reproduces the pre-change arm set exactly, which is the red-before
+this slice owes — but it adds **no discrimination beyond `M1`**, and the table
+should not be read as if it did.
+
+**`M4` is the leg that matters most**, and it fired. `(3, 1)` and `(3, 2)` share a
+width, a decode route and a tile shape, so a `cb` threaded wrongly between them
+compiles, keeps every shape and returns a correctly distributed, completely wrong
+weight. The two bits-3 legs moved from 1.08e-3 to **1.16**, roughly 1080x, while
+the other six legs stayed byte-identical to `FINAL`. `M5` is the same shape for
+width: the two bits-4 legs moved to **1.33 and 1.38**, the other six unmoved. Each
+mutation perturbs exactly and only the entries it touches, which is what makes
+this a per-entry gate rather than a whole-file one.
+
+#### Why the `GREEN` abort does not void the table
+
+`GREEN` passes an empty mutation, so nothing changes, so ninja correctly reports
+`no work to do`, so the object's mtime does not move, so the guard that exists to
+catch an unapplied mutation fires and the leg aborts before running the binary.
+**That guard is right for a mutation leg and wrong for the unmutated one**: a leg
+that changes nothing must not rebuild, and demanding a moved mtime there demands
+that a no-op recompile. It is a defect in the harness's `leg()` function — the
+mtime check should be conditional on a non-empty mutation, exactly as the sha256
+check one line above it already is — and not a finding about the tree.
+
+`GREEN` produced no test result at all, so it contributes neither a pass nor a
+fail. **`FINAL` is the anchor**, and it is a strictly stronger one than `GREEN`
+would have been. It rebuilt from restored source (`build-final.log` shows the
+CUDA object compiling, not `no work to do`), ran the binary to `rc 0` with all
+eight widths, and its `cuda_exl3.cu` sha256 equals the pristine value — so it
+proves the unmutated tree green *after* six mutate-and-restore cycles, which
+additionally establishes that every restore was byte-exact and no mutation
+leaked. The six mutation legs are anchored to that.
 
 ### Mutations required
 
@@ -788,19 +854,30 @@ green is not a device result and is never reported as one.
 
 ## Owed
 
-- **Slice G's numeric device gate is PENDING on `thor:gpu0`**, queued and not
-  skipped; the leg table and the reproduction command are in its evidence
-  section above. What IS taken: the arm compiles at every instantiated width on
-  `sm_87`, and the pre-change tree is green on `thor:gpu0` with its device case
-  skipped. Neither is a parity number and neither is reported as one.
+- **Slice G's numeric device gate is TAKEN on `thor:gpu0`** — all eight
+  combinations against the CPU arm, worst case 1.28998e-3 against a 2.0e-2 bound,
+  with a seven-leg mutation table. Two things in it are NOT clean and are named
+  in the evidence rather than smoothed over: the `GREEN` leg is VOID (it aborted
+  on the harness's own mtime guard, which is wrong for an unmutated leg, so
+  `FINAL` is the anchor), and `REDBEFORE` is observationally identical to `M1`,
+  so it adds no discrimination beyond it.
+- **The harness's `leg()` mtime guard is wrong for a no-op leg.** It must be
+  conditional on a non-empty mutation, as the sha256 guard beside it already is.
+  Fixed in `/workspace/exl3moe-widen/job-gate2.sh`; the run that produced the
+  evidence above predates the fix, which is why `GREEN` is void there.
 - **Slice C is UNVERIFIED ON A DEVICE until a CUDA build runs it.** A CPU-only
   gate cannot compile `cuda_exl3.cu` at all, so a green CPU preflight says
   nothing about the device arm. Named here so it is visible debt rather than an
   assumed pass.
-- **Slice D's fat-build cost.** Each new `(bits, cb)` pair is a full kernel set
-  compiled for every architecture in the fat build. Upstream's own answer is a
-  per-K compilation-unit split (`comp_units/exl3_comp_unit_K_cbX.cu`, 24 TUs of
-  16 instantiations each); this tree has one TU.
+- **Slice D's fat-build cost, now with a number for the MoE half.** Each new
+  `(bits, cb)` pair is a full kernel set compiled for every architecture in the
+  fat build. Upstream's own answer is a per-K compilation-unit split
+  (`comp_units/exl3_comp_unit_K_cbX.cu`, 24 TUs of 16 instantiations each); this
+  tree has one TU. **Measured for slice G on `thor:gpu0` at one architecture:
+  67.84 s before, 85 s after — +25 % for 4x the MoE kernels.** So the split is
+  not a precondition for a widening of this size, which this spec previously
+  asserted it was without measuring. It remains owed as the answer for scaling
+  and for the fat build's ten architectures.
 - **The shape table is gated at ONE of its four shapes, for every arm.** See
   "What the gate does NOT reach" above. `force_shape_idx` already exists, so
   this is a test loop rather than a port, and it is owed by the table.
