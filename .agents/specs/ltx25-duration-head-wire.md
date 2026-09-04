@@ -5,9 +5,20 @@ Upstream pin: `Lightricks/LTX-2 @ fd4ded7f` (`.agents/oracles/ltx-2.md`).
 
 ## Now
 
-`ACTIVE`. The head's math has been ported and gated since phase L5 and nothing
-constructs one, so `duration_head_path` is refused by name and an auto duration
-silently becomes the recipe default. This row supplies the driver.
+`ACTIVE`, fresh review returned PASS WITH REPAIRS and the repairs are applied.
+The gap this row opened against: the head's math had been ported and gated since
+phase L5 with nothing constructing one, so `duration_head_path` was refused by
+name and an auto duration silently became the recipe default. The driver landed,
+and `CheckUnservedExtras` no longer names the key.
+
+The repairs are four. The `None`-predictor polarity is now measured through its
+CONSEQUENCE rather than through a load that succeeds either way (§5 T2, and
+mutation M5 in `## Outcome` is what said the original cases measured nothing).
+Three invented refusals around `MIN <= 0` are gone (§3.4). An `auto_duration` on
+a retake refuses by name instead of being dropped (§3.4). And the product prose
+this row falsified is repaired in the same change, including the user-facing
+`Fail(...)` in `ltx2_t2a.cpp` that sent a caller to `num_frames` when the answer
+is `duration_head_path`.
 
 ## Scope
 
