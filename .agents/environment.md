@@ -67,7 +67,7 @@ The fleet, read from `rc devices` and `rc describe` on 2026-08-17:
 |---|---|---|
 | `dgx:gpu0` | `gpu_model=GB10`, `class=train`, `k8s=true`, driver 580.173.02, `cpus=20`, 128 GB | the house NAS |
 | `thor:gpu0` | `gpu_model=NVIDIA-Thor`, `class=train`, `k8s=true`, driver 595.78, `cpus=14`, 132 GB | the house NAS, the SAME folder as `dgx` |
-| `orin:gpu0` | `gpu_model=AGX-Orin`, `class=train`, `k8s=true`, `cpus=12`, 32 GB (760 GB free on `/tmp`), and NO detected GPU labels because Jetson carries no `nvidia-smi`. **It COMPILES CUDA but cannot RUN it** — see below | the house NAS, the SAME folder as `dgx` and `thor` — measured 2026-09-03, and this cell said LOCAL disk until then |
+| `orin:gpu0` | `gpu_model=AGX-Orin`, `class=train`, `k8s=true`, `cpus=12`, 32 GB, and NO detected GPU labels because Jetson carries no `nvidia-smi` | LOCAL disk, invisible from `dgx` and `thor` |
 
 **Select on `class` or `gpu_model`, never on `vram`.** `rc describe` reports
 `vram=[N/A]M` and `vram_free=[N/A]M` on this fleet. That is a probe reporting
@@ -132,9 +132,7 @@ history and take the toolchain from
   4.0T available, 46% used`, writable from the job, mounted on the dgx host at
   `/usr/local/nas_share/rc` (SMB, NodePort 31516, subfolder `rc/`). It is the
   SAME folder from `dgx` and from `thor`, and it is the one surface both ends
-  can see. **It IS shared with `orin` too** — measured 2026-09-03, a tar written
-  on the devbox was read by an orin job at the same path with a matching sha256.
-  This sentence read "NOT shared with `orin`" until then.
+  can see. It is NOT shared with `orin`.
 
 **The consequence, and it is now narrower than a blocker.** The pinned oracle
 venv lives at `~/venvs/vllm-oracle-pin-555967922` on the dgx HOST, and a leased
@@ -173,46 +171,6 @@ CUDA devel toolchain, or the build placed on `/workspace` by something that
 already has one. This row measured `dgx`'s worker and adds the part that turns
 an open gap into a blocker for the parity gates, which is that the ORACLE VENV
 is also unreachable from a lease.
-
-### `orin:gpu0` compiles CUDA and cannot run it, measured 2026-09-03
-
-The box has a GPU and a toolkit, and they do not match. A leased job there sees:
-
-```
-/dev/nvidia0, /dev/nvidiactl                      present
-/proc/driver/nvidia/version                       540.4.0 (Open Kernel Module, aarch64)
-nvcc                                              13.3
-__nvcc_device_query                               87
-cudaGetDeviceCount                                rc=35 "CUDA driver version is
-                                                  insufficient for CUDA runtime
-                                                  version", count=-1
-```
-
-CUDA 13 wants a 580-series driver; JetPack's is 540.4.0. So **anything that only
-compiles succeeds on `orin:gpu0`, and anything that has to execute a kernel does
-not.** Install a CUDA 12.x toolkit first, or use `thor:gpu0`.
-
-**This fails in a shape that reads like a code defect rather than an environment
-one.** `cuda_backend.cu`'s registrar is `if (cudaGetDeviceCount(&n) != cudaSuccess
-|| n <= 0) return;`, so a `rc=35` leaves `kCUDA` unregistered and silent, exactly
-as it would on a machine with no GPU at all. `vt::GetBackend(kCUDA)` then throws,
-every device test case takes its "no CUDA device" skip, and a suite reports a
-green-looking summary with the device half untaken. Two of those skips were
-themselves asserting a predicate that is true on any CUDA build, so the run came
-back with two red assertions against code that was fine (#2769). Read
-`cudaGetDeviceCount`'s rc before concluding anything about a tree from an orin
-leg.
-
-**`__nvcc_device_query` still answers**, which is why the arch resolved to 87 and
-the build proceeded to completion. It reaches the driver by a different path than
-the CUDA runtime does, so it is a good way to resolve an architecture on a box
-with no `nvidia-smi` and NOT evidence that the runtime works.
-
-**And `/workspace` on `orin` IS the shared NAS.** A tar written to
-`/mnt/nas_share/rc/exl3moe-widen/` on the devbox was read by an orin job at
-`/workspace/exl3moe-widen/` with a matching sha256. The table above said LOCAL
-disk until this measurement, and `rc describe orin:gpu0`'s own usage sheet says
-"Thor, Orin, DGX, and Strix share this folder". Read the usage sheet.
 
 ### Clock pinning does NOT work inside an `rc` lease, measured 2026-08-19
 
@@ -1023,7 +981,7 @@ environment:
     | `nvcc` | **NOT part of the image. Install it.** Both of this lane's jobs happened to find `/usr/local/cuda-13.0` and nvcc 13.0.88 already there, and that was another job's leftover — see below |
     | ABSENT | **`shellcheck`**, **`cuobjdump`**, **`nsys`**, `sudo`, `docker` — and `cuobjdump` stays absent after the `PATH` prepend, which matters below |
     | `nvidia-smi` | plain, no `sudo`, **exit 0 with ZERO bytes on stderr**, reporting `NVIDIA Thor`, driver 595.78, `compute_cap 11.0` |
-    | `/workspace` | `//192.168.68.102/Data`, 7.3 T, CIFS `file_mode=0664 nounix` — the SAME folder `dgx` sees, and `/mnt/nas_share/rc` on the devbox. Shared with `orin` and `strix` as well (measured 2026-09-03; this cell said NOT shared with `orin` until then). `rc` copies nothing for you |
+    | `/workspace` | `//192.168.68.102/Data`, 7.3 T, CIFS `file_mode=0664 nounix` — the SAME folder `dgx` sees, and `/mnt/nas_share/rc` on the devbox. NOT shared with `orin`. `rc` copies nothing for you |
     | `/tmp` | the worker's own overlay, 918 G — but it was **94% used with 58 G free** on 2026-08-22. Read "Disk is shared" below before you build |
     | swap | **30.7 G of `zram`** (`/dev/zram0`, PRIO 100), with `vm.overcommit_memory=1`. Compressed RAM, not a backing store — see the reboot warning below |
     | reuse | **the container is REUSED between jobs**, so `/tmp` carries other jobs' trees and your own from last week |
