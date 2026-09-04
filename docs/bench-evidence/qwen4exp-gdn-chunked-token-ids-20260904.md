@@ -174,6 +174,24 @@ input (`L00 in`, `ahc.mix`, `ahc.inj`) that is bit-identical on all three arms.
 26 of 42 taps differ between the two CPU arms. The chunked CPU arm is therefore
 reached and computing, and explanation (b) of §4 is dead.
 
+> **ANNOTATION 2026-09-04 — `42` IS LAYER-0 COVERAGE, NOT MODEL COVERAGE**
+> ([#2877](https://github.com/mudler/vllm.cpp/issues/2877)). The instrument printed
+> **437 taps per step, 1311 over the three steps**; the differ compared **42**.
+> `run2-job.sh`'s `load()` splits each token on `'='`, but the tap prints the layer
+> as `L%+03lld` — `L+00`, with no `=` — so `f.get('L')` is `None` on **every** row,
+> the key collapses to `(step, None, tag)`, and `if key in rows: continue` keeps
+> only the **first** occurrence. 437 taps/step therefore collapse to 14, the
+> distinct tag count, and 14 x 3 steps = 42. Layers 1..47 were silently discarded.
+> For the same reason **`L00` in the summary is a hardcoded label, not a field read
+> from the row** — it is accidentally correct only because layer 0 prints first.
+>
+> **The conclusion drawn from the count survives; only the count's reach does
+> not.** "The flag routes and layer 0 is where" needs *at least one* tap to have
+> moved, not 42 to be the model, and `L00 blk` moving by `3.702e-04` from a
+> bit-identical input carries that on its own. The same holds for §5.1's inference
+> that `q_dtype == kBF16`. Read `26 of 42` as "26 of the 14 tags x 3 steps that
+> reached the comparator", and read nothing about layers 1..47 into it.
+
 ### 5.1 `q`/`k`/`v` ARE bf16, and run 2 proves it without reading any source
 
 Run 1's summary printed `FLAG ROUTES ON CPU ... NO -- either the flag is read and
@@ -235,6 +253,73 @@ whole-model divergence is made of: `out` improves only 3.189e-03 -> 2.588e-03,
 1.23x, against 20x at the block. **This is why the ids did not move.** The
 largest divergence anywhere is at step 2's `out`: 1.471839e-02 between the two
 CPU arms, 2.320338e-02 between CPU and CUDA.
+
+> **ANNOTATION 2026-09-04 — THE PARAGRAPH ABOVE IS FALSIFIED. THE MoE RESIDUE DID
+> NOT GROW** ([#2877](https://github.com/mudler/vllm.cpp/issues/2877)). The text is
+> kept, not rewritten: a later reader needs the shape of the error. Three separate
+> things are wrong with it.
+>
+> **1. `rel(sumabs)` is a difference of NORMS, not a norm of DIFFERENCES.**
+> `run2-job.sh`'s `rel(a,b)` is evaluated on the tap's scalar `sumabs`, so the
+> published quantity is `| S|a| - S|b| | / max`. Its zero means "the two tensors
+> have equal L1 norm", not "the two tensors are equal", and it is not monotone in
+> divergence. At this tap's real size — `moe` is `o.tensor` `[T,H] = 5 x 2560 =
+> 12800` bf16 — a hermetic control at the committed scale (`sumabs ~ 390`) reads a
+> perturbation aligned with `sign(a)` at **1.00x** (the positive control, where the
+> two measures must agree) and under-reports a **zero-mean** one by **122.7x** at
+> sigma 1e-3 and **229.8x** at sigma 1e-4. Every reassociation and rounding
+> difference is zero-mean, so it cancels at `O(sqrt(n)) = sqrt(12800) ~ 113`, which
+> is the observed factor. Decisively: holding the true divergence **fixed** at sigma
+> 1e-3 and varying only the perturbation's sign structure over six seeds,
+> `rel(sumabs)` spans **4.64x** (1.52e-04 .. 7.06e-04) while the true divergence
+> spans 1.009x. The move reported above is **1.80x** at n = 1 per side. **It is
+> inside the instrument.**
+>
+> **2. The two readings do not hold the GDN algorithm fixed.** PREFILLDIV's
+> `1.269e-04` is CPU-**sequential** vs CUDA-**chunked**; this run's `2.289e-04` is
+> CPU-chunked vs CUDA-chunked. The like-for-like baseline is PREFILLDIV's *other*
+> matched pair, CPU-sequential vs CUDA-sequential, which that file publishes:
+>
+> | pair | GDN algorithms | `mhc.mix` (the MoE input) | `moe` | moe/input |
+> |---|---|---|---|---|
+> | cpu-SEQ vs cuda-CHUNKED (the "before") | **MISMATCHED** | 4.999e-04 | 1.269e-04 | **0.25x** |
+> | cpu-SEQ vs cuda-SEQ | matched (sequential) | 2.139e-05 | 7.269e-05 | 3.40x |
+> | cpu-CHUNKED vs cuda-CHUNKED (this run, the "after") | matched (chunked) | 4.324e-05 | 2.289e-04 | 5.29x |
+>
+> **Among the two algorithm-matched pairs the MoE input moved 2.02x FURTHER, not
+> closer, and the residue rose 3.15x with it.** The only pair that attenuates is the
+> mismatched one — and a large, sign-varied perturbation is exactly the case the
+> metric of (1) compresses hardest, so `1.269e-04` is an under-reading rather than a
+> low divergence. The four signed `L00 moe` values carry no arm structure either:
+> `CPU-CHUNKED 389.936505 < CUDA-SEQ 389.947936 < CPU-SEQ 389.976283 <
+> CUDA-CHUNKED 390.025768` — alternating by device, with the two *chunked* arms at
+> both extremes. Neither "device" nor "GDN algorithm" orders them.
+>
+> **3. "This is why the ids did not move" is not supported by anything measured
+> here, because no tap was taken at a step where the ids disagree.**
+> `VT_Q4EXP_LAYER_FP=3` fingerprints the first **three** model forwards. MOEDIV's
+> committed digests count **48** MoE calls at `T=5` and **336** at `T=1` — 8
+> forwards for 8 tokens — so this window is tokens **0, 1, 2** = `11751 13 15767`,
+> **which agree on both arms**. The three disagreeing ids are at indices **4, 6 and
+> 7**, emitted at forwards 4, 6 and 7, **outside the instrumented window entirely**.
+>
+> **What the residue actually is** was already named by
+> [#2552](https://github.com/mudler/vllm.cpp/issues/2552) and is not superseded:
+> with selections held equal at layer 0 it decomposes onto the **keep-quant grouped
+> expert GEMM** (`exp` 1.421e-04, 6.6x its input; `logit` only 1.1x, so the router
+> GEMM is not the amplifier), above a **bimodal top-k term** at a 32.9%
+> exact-bf16-tie rate. Both are **floors** that do not scale with input distance,
+> which is why the "before" reading sat below the floor. Neither is a defect: #2552
+> read both as faithful mirrors of vLLM and llama.cpp. **This annotation is record
+> and instrument work. It changes no kernel, and the three disagreeing ids remain
+> unexplained by anything measured so far.**
+>
+> **The next traceable step, and the residue is NOT closed.** #2552 brackets the
+> layer-0 expert-flip threshold between `2.139e-05` (no flip) and `4.999e-04`
+> (flip). This run's matched pair sits at `4.324e-05` — **inside that bracket** —
+> and `VT_MOE_SEL_FP` was not run on it, so whether the new reading contains a
+> layer-0 selection flip is **unmeasured**. That single run is the next measurement.
+> It needs the 68 GB released artifact and a GPU for the CUDA arm.
 
 ## 6. What this does NOT establish
 

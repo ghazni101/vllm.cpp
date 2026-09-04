@@ -1,0 +1,214 @@
+#!/usr/bin/env python3
+"""Compare two `VT_Q4EXP_LAYER_FP` fingerprints without collapsing the layer axis.
+
+WHY THIS TOOL EXISTS (#2877). The differ inlined in
+`docs/bench-evidence/qwen4exp-gdn-chunked-token-ids-20260904/run2-job.sh` split
+each token on `'='` to build its key. The tap prints the layer as `L%+03lld` --
+`L+00`, with NO `=` -- so `f.get('L')` was `None` on every row, the key collapsed
+to `(step, None, tag)`, and `if key in rows: continue` kept only the FIRST
+occurrence. The instrument printed 437 taps per step and 1311 over three steps;
+the comparator compared 42, which is the 14 distinct tags times 3 steps. Layers
+1..47 were discarded in silence, and the summary's `L00` label was a hardcoded
+string rather than a field read from the row.
+
+That job script is EVIDENCE and is left byte-for-byte as the record of what ran.
+This is the tool a later wave should use instead.
+
+THREE THINGS IT DOES THAT THE INLINE ONE DID NOT.
+
+1. It PARSES the layer, and it REFUSES a duplicate key rather than deduplicating
+   one. A repeated `(step, layer, tag)` means the format changed or the parse is
+   wrong; silently keeping the first is how 1311 taps read as 42.
+
+2. It asserts its own COUNTED PROPERTY. `taps=N END` closes every fingerprinted
+   step, and the rows parsed for that step must equal N. A comparator that parsed
+   nothing prints an empty table, and an empty table reads like two agreeing arms.
+
+3. It says what `rel(sumabs)` IS WORTH, on every run, in the output.
+   `rel(sumabs) = | S|a| - S|b| | / max` is a DIFFERENCE OF NORMS, not a norm of
+   differences. Its zero means "the two tensors have equal L1 norm", not "the two
+   tensors are equal", and it is not monotone in divergence. `S|x|` is
+   sign-INSENSITIVE, so a zero-mean perturbation -- which is every reassociation
+   and rounding difference -- cancels at `O(sqrt(n))`. Measured at this tap's real
+   size (`n = 12800`): a perturbation aligned with `sign(a)` reads 1.00x (the two
+   measures must agree there, and that is the positive control), while a zero-mean
+   one under-reports by 122.7x at sigma 1e-3 and 229.8x at sigma 1e-4. Holding the
+   true divergence FIXED and varying only sign structure over six seeds,
+   `rel(sumabs)` spans 4.64x against the true divergence's 1.009x.
+
+   So this tool also prints `head_dmax`, the exact elementwise
+   `max|v_i(a) - v_i(b)|` over the four `v=` values the tap already emits. That is
+   a genuine DIFFERENCE norm and it cannot cancel -- but it samples 4 of 12800
+   elements, so it is a floor and a witness, never a magnitude. A non-zero
+   `head_dmax` PROVES the tensors differ; a zero one proves nothing.
+
+   A per-arm axis that estimates `||a-b||` over the WHOLE tensor needs the tap to
+   emit a sign-SENSITIVE aggregate -- fixed-seed random projections `S w_i x_i`,
+   whose difference `S w_i (a_i - b_i)` is a linear functional of the difference
+   itself. That is a change to `LayerFp` in the model forward path, so it needs its
+   own spec, red-first test and fresh review. It is OWED, not done here (#2877).
+"""
+
+from __future__ import annotations
+
+import argparse
+import re
+import sys
+
+# `q4fp step=%lld L%+03lld tag=%-10s dtype=%-4s dev=%d n=%lld nonfinite=%lld
+#  maxabs=%.9g sumabs=%.9g v=%.9g,%.9g,%.9g,%.9g`
+_LAYER = re.compile(r"^L[+-]\d+$")
+
+
+class ParseError(RuntimeError):
+    pass
+
+
+def parse(path):
+    """Return (rows, order, taps_declared). Refuses a collapsed or duplicate key."""
+    rows, order, declared = {}, [], {}
+    layer_seen = 0
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        for lineno, ln in enumerate(fh, 1):
+            if not ln.startswith("q4fp "):
+                continue
+            toks = ln.split()
+            if " taps=" in ln and ln.rstrip().endswith("END"):
+                f = dict(t.split("=", 1) for t in toks if "=" in t)
+                declared[f["step"]] = int(f["taps"])
+                continue
+            f = {}
+            layer = None
+            for t in toks:
+                if _LAYER.match(t):
+                    layer = int(t[1:])
+                    layer_seen += 1
+                elif "=" in t:
+                    k, v = t.split("=", 1)
+                    f[k] = v
+            if "step" not in f or "tag" not in f:
+                continue
+            if layer is None:
+                raise ParseError(
+                    "%s:%d: no L<layer> field on a tap line. The tap prints "
+                    "`L%%+03lld`; a parser that splits on '=' never sees it, and "
+                    "that is the #2877 defect this tool exists to refuse."
+                    % (path, lineno))
+            key = (int(f["step"]), layer, f["tag"])
+            if key in rows:
+                raise ParseError(
+                    "%s:%d: duplicate key %r. A repeated (step, layer, tag) means "
+                    "the format changed or the parse is wrong. Deduplicating it "
+                    "silently is what made 1311 taps read as 42 (#2877)."
+                    % (path, lineno, key))
+            rows[key] = f
+            order.append(key)
+    if not rows:
+        raise ParseError("%s: parsed ZERO tap rows. An empty comparison reads "
+                         "like two agreeing arms; it is not one." % path)
+    if layer_seen != len(rows):
+        raise ParseError("%s: %d rows but %d layer fields." % (path, len(rows), layer_seen))
+    return rows, order, declared
+
+
+def check_counted_property(path, rows, declared):
+    """`taps=N END` closes each step; the rows parsed for it must equal N."""
+    out = []
+    for step, want in sorted(declared.items(), key=lambda kv: int(kv[0])):
+        got = sum(1 for k in rows if k[0] == int(step))
+        ok = got == want
+        out.append((int(step), want, got, ok))
+    return out
+
+
+def rel_sumabs(a, b):
+    """DIFFERENCE OF NORMS. Read the module docstring before using this number."""
+    a, b = float(a), float(b)
+    m = max(abs(a), abs(b))
+    return 0.0 if m == 0.0 else abs(a - b) / m
+
+
+def head_dmax(a, b):
+    """Exact elementwise max|a_i - b_i| over the 4 `v=` values. A witness, not a magnitude."""
+    try:
+        va = [float(x) for x in a["v"].split(",")]
+        vb = [float(x) for x in b["v"].split(",")]
+    except (KeyError, ValueError):
+        return None
+    if len(va) != len(vb):
+        return None
+    return max(abs(x - y) for x, y in zip(va, vb))
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("base")
+    ap.add_argument("other")
+    ap.add_argument("--label", default="BASE vs OTHER")
+    ap.add_argument("--step", type=int, default=None, help="print only this step")
+    ap.add_argument("--tag", default=None, help="print only this tag")
+    ap.add_argument("--top", type=int, default=20, help="rows to print (0 = all)")
+    a = ap.parse_args(argv)
+
+    try:
+        A, order, dA = parse(a.base)
+        B, _, dB = parse(a.other)
+    except ParseError as exc:
+        print("REFUSED: %s" % exc, file=sys.stderr)
+        return 2
+
+    print("=== %s ===" % a.label)
+    print("rows: base=%d other=%d   distinct layers: base=%d other=%d"
+          % (len(A), len(B), len({k[1] for k in A}), len({k[1] for k in B})))
+    for path, rows, decl in ((a.base, A, dA), (a.other, B, dB)):
+        for step, want, got, ok in check_counted_property(path, rows, decl):
+            print("COUNTED PROPERTY %-28s step=%d taps=%d parsed=%d %s"
+                  % (path.split("/")[-1], step, want, got, "OK" if ok else "MISMATCH"))
+            if not ok:
+                print("REFUSED: the comparator did not parse every tap the "
+                      "instrument printed.", file=sys.stderr)
+                return 2
+
+    print()
+    print("rel_sumabs is a DIFFERENCE OF NORMS: zero means EQUAL L1 NORM, not equal")
+    print("tensors. It cancels a zero-mean perturbation at O(sqrt(n)) -- ~122x under-")
+    print("report measured at this tap's n=12800. head_dmax is an exact elementwise")
+    print("difference over the 4 emitted values: non-zero PROVES the tensors differ,")
+    print("zero proves nothing. A whole-tensor difference norm is OWED (#2877).")
+    print()
+
+    sel = [k for k in order
+           if (a.step is None or k[0] == a.step) and (a.tag is None or k[2] == a.tag)]
+    scored, missing = [], 0
+    for k in sel:
+        if k not in B:
+            missing += 1
+            continue
+        scored.append((rel_sumabs(A[k]["sumabs"], B[k]["sumabs"]), k))
+    scored.sort(reverse=True)
+
+    print("%-5s %-5s %-10s %-6s %14s %14s %11s %11s"
+          % ("step", "L", "tag", "dtype", "sumabs_base", "sumabs_other",
+             "rel_sumabs", "head_dmax"))
+    for r, k in (scored if a.top == 0 else scored[:a.top]):
+        hd = head_dmax(A[k], B[k])
+        print("%-5d %-5d %-10s %-6s %14s %14s %11.3e %11s"
+              % (k[0], k[1], k[2], A[k]["dtype"], A[k]["sumabs"], B[k]["sumabs"],
+                 r, ("%.3e" % hd) if hd is not None else "n/a"))
+
+    nz = sum(1 for r, _ in scored if r > 0.0)
+    hz = sum(1 for _, k in scored if (head_dmax(A[k], B[k]) or 0.0) > 0.0)
+    print()
+    print("--- %s SUMMARY ---" % a.label)
+    print("TAPS COMPARED                 : %d  (of %d parsed in base)" % (len(scored), len(A)))
+    print("MISSING IN OTHER              : %d" % missing)
+    print("TAPS WITH rel(sumabs) != 0    : %d" % nz)
+    print("TAPS WITH head_dmax != 0      : %d   <- a DIFFERENCE norm; these PROVE a difference" % hz)
+    if scored:
+        r, k = scored[0]
+        print("LARGEST rel(sumabs)           : %.6e at step=%d L%+03d %s" % (r, k[0], k[1], k[2]))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -4071,6 +4071,64 @@ All six mutations were re-run after this refactor.
 
 ### The CPU-vs-CUDA TOKEN-IDENTITY objective is UNREACHABLE AS WRITTEN (#2831)
 
+### The `VT_Q4EXP_LAYER_FP` tap needs a DIFFERENCE-NORM axis ([#2877](https://github.com/mudler/vllm.cpp/issues/2877))
+
+**Why the differ repair does not close this.** `scripts/q4exp-layerfp-diff.py`
+landed with #2877 and fixes the layer-axis collapse, but it can only compare what
+the tap emits, and every scalar the tap emits is **sign-insensitive**. `S|x|` is a
+norm, so comparing two arms' norms gives a DIFFERENCE OF NORMS: it reads zero on
+two tensors that differ in every element but happen to have equal L1 norm, and it
+cancels a zero-mean perturbation — which is every reassociation and rounding
+difference — at `O(sqrt(n))`. Measured at this tap's `n = 12800`: 122.7x
+under-report at sigma 1e-3, 229.8x at sigma 1e-4, and a **4.64x** span at a
+**fixed** true divergence when only the perturbation's sign structure varies. The
+tool prints `head_dmax`, an exact elementwise difference over the four `v=` values
+the tap already emits, which cannot cancel — but it samples 4 of 12800 elements,
+so it is a witness and never a magnitude.
+
+**The design.** No per-arm scalar reduction can yield `||a-b||` unless it is
+sign-SENSITIVE. Emit a small fixed set of fixed-seed random projections
+`p_j = S_i w_ji x_i` beside `sumabs`. Then `p_j(a) - p_j(b) = S_i w_ji (a_i - b_i)`
+is a linear functional of the DIFFERENCE itself, and a handful of them estimate
+`||a-b||_2` with a known concentration bound, from two independent processes that
+never see each other's tensor. The seed must be a compile-time constant so two
+arms draw the same `w`, and the projections must be accumulated in `double` for
+the same reason `sumabs` is.
+
+**Why it is owed and not done in #2877.** `LayerFp` lives in
+`src/vllm/model_executor/models/qwen4_exp_forward.cpp`, on the model forward path.
+This is product code, so it needs its own spec, a red-first test, and a fresh
+review. #2877 was diagnosis plus record and instrument repair, and it deliberately
+changed no `src/` file.
+
+### The ARMTOKENS diffs cannot be re-rendered without a device ([#2877](https://github.com/mudler/vllm.cpp/issues/2877))
+
+`docs/bench-evidence/qwen4exp-gdn-chunked-token-ids-20260904/` committed the two
+rendered diffs and `run2-results.txt`, but **not the raw `fp.txt` of any arm**. The
+repaired differ therefore has nothing to re-run against: correcting the 42-vs-1311
+coverage in those files needs the three arms measured again, which needs the 68 GB
+released UD-IQ1_S artifact and a GPU for the CUDA arm. The committed files are
+annotated in place instead, and the job script is left byte-for-byte as the record
+of what ran. **A wave that holds a lease for another reason on this row should
+capture `fp.txt` per arm as a matter of course** — it is the input every later
+comparison needs, and omitting it is what made this correction un-re-renderable.
+
+### The MoE residue is NOT closed: the layer-0 flip question is unmeasured ([#2877](https://github.com/mudler/vllm.cpp/issues/2877))
+
+[#2552](https://github.com/mudler/vllm.cpp/issues/2552) brackets the layer-0
+expert-flip threshold between `2.139e-05` (selections agree on all five tokens) and
+`4.999e-04` (layer 0 already flips at token 2). The algorithm-matched pair that
+#2870 measured — CPU-chunked vs CUDA-chunked — has `L00 mhc.mix` at **`4.324e-05`,
+inside that bracket**, and `VT_MOE_SEL_FP` was **not run on it**. So it is unknown
+whether the `2.289e-04` reading contains a layer-0 selection flip at all, which is
+what would separate the bimodal top-k term from the keep-quant expert GEMM's
+reassociation term. **One `VT_MOE_SEL_FP` run on that pair is the next traceable
+step.** It needs the 68 GB artifact and a GPU for the CUDA arm; it was deliberately
+not spent from a contended fleet on a refinement no published headline depends on.
+Nothing here treats the residue as diagnosed: #2552 named both floor terms and
+found both to be faithful mirrors, and **the three disagreeing token ids at indices
+4, 6 and 7 remain unexplained by anything measured on this row.**
+
 **The position.** The standing objective — `qwen4_exp` emits the CPU control
 sequence `11751 13 15767 411 2029 11 1092 369` on a GPU, in the production
 configuration, on the released UD-IQ1_S checkpoint — **cannot be met while the
@@ -4099,6 +4157,29 @@ on an argmax over near-ties — and with the Gated DeltaNet term spent, what
 carries the remaining 3 ids is the undiagnosed MoE residue, which improved
 nothing (`moe` `1.269e-04` -> `2.289e-04` from an input 11.6x closer). A fifth
 wave must not re-derive this either.
+
+**ANNOTATION 2026-09-04 — THE PARENTHETICAL ABOVE IS FALSIFIED; THE RESIDUE DID
+NOT GROW** ([#2877](https://github.com/mudler/vllm.cpp/issues/2877), full
+reasoning and controls in [the ARMTOKENS evidence
+file](../../docs/bench-evidence/qwen4exp-gdn-chunked-token-ids-20260904.md)). The
+sentence is kept so the shape of the error stays visible. (a) `rel(sumabs)` is a
+difference of NORMS, not a norm of DIFFERENCES: at this tap's `n = 12800` it
+under-reports a zero-mean perturbation by ~122x, and at a **fixed** true
+divergence it spans **4.64x** on sign structure alone, against the 1.80x move
+claimed here at n = 1. (b) The two readings never held the GDN algorithm fixed —
+`1.269e-04` is CPU-sequential vs CUDA-**chunked**, `2.289e-04` is
+CPU-chunked vs CUDA-chunked; among the two algorithm-**matched** pairs the MoE
+input moved **2.02x further**, not closer (2.139e-05 -> 4.324e-05), and the
+residue rose 3.15x with it. (c) `VT_Q4EXP_LAYER_FP=3` covers forwards 0, 1, 2 =
+tokens `11751 13 15767`, which **agree on both arms**; the three disagreeing ids
+are emitted at forwards 4, 6 and 7, outside the window, so nothing measured here
+bears on them at all. The residue's mechanism was already named by
+[#2552](https://github.com/mudler/vllm.cpp/issues/2552) — the keep-quant grouped
+expert GEMM's reassociation plus a bimodal top-k term at a 32.9% exact-tie rate,
+both floors, both faithful mirrors and neither a defect. **NOT CLOSED:** the
+matched pair's `4.324e-05` lands inside #2552's layer-0 flip bracket
+(2.139e-05 no flip .. 4.999e-04 flip) and `VT_MOE_SEL_FP` was never run on it.
+That run is the next traceable step; it needs the 68 GB artifact and a GPU.
 
 **Why this section exists at all.** The *cause* was already recorded (§Wave
 PREFILLDIV, and the evidence file above). The two dead-end *routes* were not, and

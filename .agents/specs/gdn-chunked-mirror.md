@@ -970,7 +970,13 @@ Not done, and each is a gate rather than a nicety:
   All three CPU arms agreeing left T4's exact ambiguity — a flag whose two arms
   coincide, or an arm that is not reached — and no log line names the arm. The
   committed `VT_Q4EXP_LAYER_FP` fingerprint settled it: `VT_GDN_CHUNKED` moves
-  `L00 blk` by `3.702e-04` from a bit-identical input, 26 of 42 taps differ, and
+  `L00 blk` by `3.702e-04` from a bit-identical input, 26 of 42 taps differ
+  (**annotation 2026-09-04, [#2877](https://github.com/mudler/vllm.cpp/issues/2877):
+  `42` is LAYER-0 coverage, not model coverage — the instrument printed 1311 taps
+  and the differ's `load()` collapsed them to 14 tags x 3 steps because it splits on
+  `'='` while the tap prints `L%+03lld`; the routing conclusion survives, since it
+  needs one moved tap and not 42, but read nothing about layers 1..47 into it**),
+  and
   the CPU arm lands `1.772e-05` from CUDA where the sequential arm sat
   `3.525e-04` away — **19.9x**, with `s.attn` 24.1x and `mhc.mix` 11.6x. The
   CPU-sequential and CUDA `L00 blk` readings reproduce PREFILLDIV's to the
@@ -981,6 +987,29 @@ Not done, and each is a gate rather than a nicety:
   DeltaNet source closed, that residue is the whole-model divergence. Scope's
   refusal to promise token agreement is vindicated in both directions: agreement
   did not improve, and it did not degrade either.
+
+  **ANNOTATION 2026-09-04 — THE PARENTHETICAL ABOVE IS FALSIFIED; THE RESIDUE DID
+  NOT GROW** ([#2877](https://github.com/mudler/vllm.cpp/issues/2877), full
+  reasoning and controls in [the ARMTOKENS evidence
+  file](../../docs/bench-evidence/qwen4exp-gdn-chunked-token-ids-20260904.md)). The
+  sentence is kept so the shape of the error stays visible. (a) `rel(sumabs)` is a
+  difference of NORMS, not a norm of DIFFERENCES: at this tap's `n = 12800` it
+  under-reports a zero-mean perturbation by ~122x, and at a **fixed** true
+  divergence it spans **4.64x** on sign structure alone, against the 1.80x move
+  claimed here at n = 1. (b) The two readings never held the GDN algorithm fixed —
+  `1.269e-04` is CPU-sequential vs CUDA-**chunked**, `2.289e-04` is
+  CPU-chunked vs CUDA-chunked; among the two algorithm-**matched** pairs the MoE
+  input moved **2.02x further**, not closer (2.139e-05 -> 4.324e-05), and the
+  residue rose 3.15x with it. (c) `VT_Q4EXP_LAYER_FP=3` covers forwards 0, 1, 2 =
+  tokens `11751 13 15767`, which **agree on both arms**; the three disagreeing ids
+  are emitted at forwards 4, 6 and 7, outside the window, so nothing measured here
+  bears on them at all. The residue's mechanism was already named by
+  [#2552](https://github.com/mudler/vllm.cpp/issues/2552) — the keep-quant grouped
+  expert GEMM's reassociation plus a bimodal top-k term at a 32.9% exact-tie rate,
+  both floors, both faithful mirrors and neither a defect. **NOT CLOSED:** the
+  matched pair's `4.324e-05` lands inside #2552's layer-0 flip bracket
+  (2.139e-05 no flip .. 4.999e-04 flip) and `VT_MOE_SEL_FP` was never run on it.
+  That run is the next traceable step; it needs the 68 GB artifact and a GPU.
 
 - **`main` did not compile with CUDA, and that is how this wave found out**
   ([#2861](https://github.com/mudler/vllm.cpp/issues/2861), fixed in the same
