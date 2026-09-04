@@ -286,7 +286,10 @@ void LaunchGdnScanState(hipStream_t s, Tensor& out, const Tensor& q_in,
     return e != nullptr && e[0] == '1' && e[1] == '\0';
   }();
   constexpr int kScanRS = 4;  // blocks per head; requires dv % RS == 0
-  const bool use_split = scan_split && scan_coop && dv % kScanRS == 0;
+  // reg[MAXSEG] (dk/32 ceiling) is a fixed local array: a dk past 32*MAXSEG
+  // would write past it, so dk <= 256 is part of the arm's engage contract.
+  const bool use_split = scan_split && scan_coop && dv % kScanRS == 0 &&
+                         dk <= 32 * 8 /* MAXSEG */;
   const dim3 split_grid(static_cast<unsigned>(hv_n * kScanRS),
                         static_cast<unsigned>(n));
   if (state.dtype == DType::kF16) {

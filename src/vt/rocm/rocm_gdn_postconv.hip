@@ -213,7 +213,12 @@ __global__ void GdnPostConvWarpK(Tqkv* q_out, Tqkv* k_out, Tqkv* v_out,
   const int lane = static_cast<int>(threadIdx.x) & 31;
   const int64_t tok = item / slots;
   const int64_t slot = item % slots;
-  const int64_t row = tok * (key_dim + value_dim);
+  // conv is [T, 2*key_dim + value_dim] (q | k | v along the row) — the same
+  // conv_dim the chunked donor above uses. The original arm dropped the 2*,
+  // so every token past the first based its q/k/v reads key_dim elements too
+  // early: in-bounds, silently wrong (the T10 incident).
+  const int64_t conv_dim = 2 * key_dim + value_dim;
+  const int64_t row = tok * conv_dim;
   if (slot < hk) {
     const int64_t head = slot;
     const Tconv* qin = conv + row + head * dk;
