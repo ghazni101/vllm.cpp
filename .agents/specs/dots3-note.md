@@ -7711,9 +7711,21 @@ which is the same refusal to act, held up by evidence instead of by caution.
 ended `See .agents/specs/dots3-note.md and issue #699.`; `Dots3NoteGgufRefusal`
 ends with the row ID `MODEL-MM-dots3-note-dots3-note-for-causal-lm` and `spec
 .agents/specs/dots3-note.md section 4.19` instead. Measured on this branch:
-`git grep -c 699 -- src/` lists 30 files at the base `3e246b34f` and 29 at this
-head; the one that leaves is `dots3_note_registry.cpp` (1 line), and every other
-count is byte-identical, `dots3_note.h`'s 6 included. This spec still carries 31.
+`git grep -c 699 -- src/` lists 30 files at the base `3e246b34f` and 29 at the
+reviewed head `a7d9c0d1f`; the one that leaves is `dots3_note_registry.cpp`
+(1 line), and every other count is byte-identical, `dots3_note.h`'s 6 included.
+Both trees are named because a count with no tree beside it is the shape #2323
+refuses.
+
+This spec still carries the reference, here and in many other sections, and this
+paragraph deliberately does NOT quote how many. Its first draft did -- it said
+31 -- and that number was already wrong by the time the section was rewritten to
+discuss #699 at length. A count of one file stored as prose in that same file is
+a drift lock, which is the shape AGENTS.md `## Records` names, and it is also the
+"measured at the parent, quoted as if it described the head" trap. The reader who
+wants the number runs `git grep -c 699 -- .agents/specs/dots3-note.md`. What is
+stated here instead is the direction, which is UP, and the one line that left
+`src/`, which is named above.
 
 The reason is NOT the 404, and this section said the opposite until it was
 reviewed. The refusal is product output on a user's stderr: a row ID and a spec
