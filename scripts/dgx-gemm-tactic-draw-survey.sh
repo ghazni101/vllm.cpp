@@ -150,6 +150,7 @@ DRAWS=8
 # with fewer than three legs per draw (INCOMPARABLE), so two would buy a lease
 # and return no verdict.
 SCORE_REPS=3
+CHECK_ART=""
 CONCURRENCY=2
 NUM_PROMPTS=32
 INPUT_LEN=512
@@ -177,6 +178,7 @@ while [ $# -gt 0 ]; do
     --phase)         PHASE=${2:?}; shift 2 ;;
     --tactic-set)    TACTIC_SET=${2:?}; shift 2 ;;
     --score-leg)     SCORE_LEG=${2:?}; shift 2 ;;
+    --check-artefacts) CHECK_ART=${2:?}; shift 2 ;;
     --local-root)    LOCAL_ROOT=${2:?}; shift 2 ;;
     -h|--help)       sed -n '2,120p' "$0"; exit 0 ;;
     *)               die "$E_USAGE" "unknown argument '$1'" ;;
@@ -216,6 +218,31 @@ mirror_in() {   # share -> local, on resume only
   return 0
 }
 phase_done() { [ -f "$PHASEDIR/$1.ok" ]; }
+
+# THE BINARY IS THE ARTEFACT; A SHARED LIBRARY IS OPTIONAL (#2912).
+# The configuration this harness invokes (plain Release, no BUILD_SHARED_LIBS)
+# emits a STATIC libvllm.a and links vllm-bench against it. The first real GB10
+# run therefore built 855/855 with BUILD_RC=0 and then refused its own tree,
+# because this predicate required a shared `libvllm.so.*` that no configuration
+# here produces. Sets ART_BIN (required) and ART_LIB (empty when static).
+resolve_artefacts() {
+  ART_BIN=$(find "$1" -name vllm-bench -type f 2>/dev/null | head -1)
+  ART_LIB=$(find "$1" -name 'libvllm.so.*' -type f 2>/dev/null | head -1)
+  [ -n "$ART_BIN" ]
+}
+
+# `--check-artefacts DIR` is the INTERNAL gate handle: it runs the same
+# predicate the build phase runs, so a test exercises the production code path
+# rather than a transcription of it. The shell tests skip the build phase by
+# writing phase/build.ok, which is why this branch shipped unreached.
+if [ -n "$CHECK_ART" ]; then
+  if resolve_artefacts "$CHECK_ART"; then
+    echo "bin=$ART_BIN"
+    echo "lib=${ART_LIB:-<none: vllm-bench is statically linked>}"
+    exit 0
+  fi
+  die "$E_ARTEFACT" "build artefacts not found under $CHECK_ART: no vllm-bench"
+fi
 mark_phase() { mkdir -p "$PHASEDIR"; date -u +%Y-%m-%dT%H:%M:%SZ > "$PHASEDIR/$1.ok"; mirror_out; }
 
 # ---------------------------------------------------------------------------
@@ -494,12 +521,15 @@ if [ "$PHASE" = all ] || [ "$PHASE" = build ]; then
     tail -15 "$EV_LOCAL/build.log"
     [ "$B" = 0 ] || { mirror_out; die "$E_BUILD" "build failed"; }
 
-    GEN=$(find "$BLD" -name vllm-bench -type f | head -1)
-    LIB=$(find "$BLD" -name 'libvllm.so.*' -type f | head -1)
-    [ -n "$GEN" ] && [ -n "$LIB" ] || { mirror_out; die "$E_ARTEFACT" "build artefacts not found under $BLD"; }
+    resolve_artefacts "$BLD" || { mirror_out; die "$E_ARTEFACT" "build artefacts not found under $BLD: no vllm-bench"; }
+    GEN=$ART_BIN; LIB=$ART_LIB
     cp -f "$GEN" "$BIN"/ && chmod 0755 "$BIN/vllm-bench"
-    cp -f "$LIB" "$BIN"/ && chmod 0755 "$BIN/$(basename "$LIB")"
-    ( cd "$BIN" && SO=$(basename "$LIB"); ln -sf "$SO" libvllm.so.0; ln -sf "$SO" libvllm.so )
+    if [ -n "$LIB" ]; then
+      cp -f "$LIB" "$BIN"/ && chmod 0755 "$BIN/$(basename "$LIB")"
+      ( cd "$BIN" && SO=$(basename "$LIB"); ln -sf "$SO" libvllm.so.0; ln -sf "$SO" libvllm.so )
+    else
+      say "no shared libvllm under $BLD; vllm-bench is statically linked (#2912)"
+    fi
     BINSHA=$(sha256sum "$BIN/vllm-bench" | awk '{print $1}')
     say "ONE BINARY for every draw and every leg: sha256=$BINSHA"
     { echo "binary_sha256=$BINSHA"; echo "cutlass=$CUT"; echo "toolkit=$TKLIB"; } >> "$PROV"
