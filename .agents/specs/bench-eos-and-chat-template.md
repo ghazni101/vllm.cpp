@@ -208,6 +208,50 @@ honest statement is: this change makes the harness able to honour EOS and proves
 the setting arrives; that it then stops a real generation is owed to the first
 checkpoint run, and §8 records it.
 
+## 7a. Evidence: red before, green after, and one mutation nothing catches
+
+Built CPU-only, no device, no lease:
+`cmake -S . -B build-cpu -G Ninja -DCMAKE_BUILD_TYPE=Release -DVLLM_CPP_CUDA=OFF
+-DVLLM_CPP_METAL=OFF -DVLLM_CPP_VULKAN=OFF -DVLLM_CPP_SERVER=ON
+-DVLLM_CPP_BUILD_EXAMPLES=ON -DVLLM_CPP_BUILD_TESTS=ON`, `ninja -j 4`.
+
+| Stage | Result |
+|---|---|
+| RED before, against the unchanged harness | `test_bench_eos_chat_template` exit 1, **9 of 9 cases failed**, 16 of 51 assertions |
+| GREEN after | exit 0, 9 of 9 passed, **73 assertions** |
+| `test_bench` (inert) | exit 0, 11 of 11, 80 assertions |
+| `test_bench_kv_cache_dtype` (inert) | exit 0, 9 of 9, 47 assertions |
+
+Every mutation below was applied to the committed tree, rebuilt, run, and
+reverted; each row was checked for a changed source sha256, a build that
+succeeded (a build failure reads as a passing test), a `vllm-bench` binary whose
+mtime MOVED, and a working tree restored byte-for-byte afterwards. All nine rows
+satisfied all four.
+
+| # | Mutation | Cases failed | Verdict |
+|---|---|---:|---|
+| M1 | `sp.ignore_eos = cfg.ignore_eos` back to `= true` — the pass-through drop | 3 / 9 | **RED** |
+| M2 | delete the `--no-ignore-eos` arm from `ParseArgs` | 3 / 9 | **RED** |
+| M3 | delete the render call site, keeping the resolution and the report line | 1 / 9 | **RED** |
+| M4 | resolved EOS line echoes `cfg.ignore_eos` instead of reading `MakeSampling` back | 0 / 9 | **GREEN — see below** |
+| M5 | delete the "`--chat-template` while skipping" refusal | 1 / 9 | **RED** |
+| M6 | delete the "synthetic engine ships no template" refusal | 1 / 9 | **RED** |
+| M7 | `--chat-template` parses its value and drops it | 4 / 9 | **RED** |
+| M8 | `--no-enable-thinking` parses and leaves the kwargs unset | 1 / 9 | **RED** |
+| M9 | **M1 and M4 together** | 0 / 9 | **GREEN — the flag is dead and the gate is silent** |
+
+**M9 is the honest hole in this gate, and it is structural.** M1 is detectable
+only because the report reads the value back out of `MakeSampling`; M4 removes
+that read-back without changing any value, so it is harmless alone and lethal in
+combination. Closing it needs an observation that the EOS setting CHANGED A
+GENERATION, and §7 records why no such observation exists on the CPU fixture.
+The two candidate fixes are both worse than the hole: pinning the toy model's
+greedy argmax as the fixture's eos id is the "assert against the constant"
+tautology and would redden on any unrelated change to the synthetic weights, and
+a `--synthetic-eos-token-id` knob would be production surface that exists only
+for a test. This is named here rather than closed, and the first checkpoint run
+closes it for real.
+
 ## 8. Owed
 
 - An EOS-terminated `vllm-bench` run on a real checkpoint, which is the first
