@@ -4082,15 +4082,26 @@ cancels a zero-mean perturbation — which is every reassociation and rounding
 difference — at `O(sqrt(n))`. **By a factor that is a DISTRIBUTION, not a
 constant**: at this tap's `n = 12800`, over 400 seeds of the hermetic control
 committed as `MetricSpread` in `tests/scripts/test_q4exp_layerfp_diff.py`, the
-under-report has a median of 69.2x at sigma 1e-3 and 125.6x at sigma 1e-4 with a
-p05..p95 of 31..1264, and no sigma dependence in the linear regime (1e-4 and 1e-5
-agree, both approaching `sqrt(2n/pi)/|z| = 90.3/|z|`, median 133.8). This spec
+under-report has a median of 75x at sigma 1e-3 and 140x at sigma 1e-4 with a
+p05..p95 of 34..1500, and no sigma dependence in the linear regime (1e-4 and 1e-5
+agree, both approaching `sqrt(2n/pi)/|z| = 90.3/|z|`, median 134). This spec
 first quoted the single draws `122.7x` and `229.8x` to four significant figures,
 and a `4.64x` span at a **fixed** true divergence measured over SIX seeds. Over
-400 seeds that span is **18.3x** p05..p95 and 2078x end to end, and the
+400 seeds that span is **21x** p05..p95; its end-to-end span is not a figure at
+all, because one draw sets it and it moves more than 4x between seed blocks. The
 consequence is the one that matters: **two readings of the SAME true divergence
-differ by a median 2.1x, 8.9x at p90 and 18.2x at p95**, so a ratio between two
-`rel(sumabs)` numbers below roughly 18x ranks nothing in either direction. The
+differ by a median 2.1x, 11x at p90 and 24x at p95**, so a ratio in the low tens
+between two `rel(sumabs)` numbers ranks nothing in either direction. **Two
+significant figures is what 400 draws buy.** The three-figure set this spec
+carried until #2879 (`31.4 / 69.2 / 568.2`, `18.3x`, `18.2x`) came from an ad-hoc
+script that was never committed and does not reproduce from the control; it is
+not a different construction — 14 of its 15 figures lie inside the control's own
+bootstrap 95% interval
+([study](../../docs/bench-evidence/qwen4exp-gdn-chunked-token-ids-20260904/metric-spread-precision.py))
+— it was a different SAMPLE quoted to a digit 400 draws do not determine.
+`MetricSpread` now draws every figure the documents quote AND reads those
+documents off disk to compare them against it, this spec included
+(`test_the_PUBLISHER_*`). The
 tool prints `head_dmax`, an exact elementwise difference over the four `v=` values
 the tap already emits, which cannot cancel — but it samples 4 of 12800 elements,
 so it is a witness and never a magnitude.
@@ -4203,8 +4214,8 @@ state, so the taps are not irrelevant to the disagreement; they simply never
 observe it. **(b)** `rel(sumabs)` is a difference of NORMS, not a norm of
 DIFFERENCES, and its under-report is a DISTRIBUTION rather than the `~122x` single
 seed draw this line first quoted: over 400 seeds at `n = 12800` the median is
-69.2x (sigma 1e-3) to 125.6x (sigma 1e-4), p05..p95 31..1264, and at a **fixed**
-true divergence two readings differ by a median **2.1x** and **18.2x** at p95 —
+75x (sigma 1e-3) to 140x (sigma 1e-4), p05..p95 34..1500, and at a **fixed**
+true divergence two readings differ by a median **2.1x** and **24x** at p95 —
 where the `4.64x` span quoted by this annotation's own first version
 (`c51c484db`) was six seeds. **(c) One framing, applied to every
 tap.** `3.525e-04` and `1.269e-04` are the same PREFILLDIV column, so a comparison
@@ -4214,11 +4225,11 @@ algorithm-**matched** CPU-vs-CUDA pairs, `L00 blk` moved **16.7x FURTHER**
 `3.525e-04` -> `1.772e-05` as a 19.9x improvement, and every other layer-0 tap
 moved further too (`s.attn` 1.71x, `mhc.mix` 2.02x, `moe` 3.15x, `s.mlp` 2.34x,
 `out` 2.29x; `mhc.inj` alone to exactly zero). Against (b), 19.9x and 16.7x sit at
-4.6% and 5.4% of the metric's own no-change distribution, and no change at all
-produces 1.80x through 3.15x in **33% to 59%** of draws — this line first called
-that "between its 33rd and 59th percentile", which states the complement and
-inverts the ranking: 3.15x sits at the **67th** percentile of no change, not the
-33rd. So **nothing here is ranked, in either
+6% and 7% of the metric's own no-change distribution, and no change at all
+produces 1.80x, 2.02x, 2.34x and 3.15x in **59%, 52%, 45% and 33%** of draws —
+this line first called that "between its 33rd and 59th percentile", which states
+the complement and inverts the ranking: 3.15x sits at the **67th** percentile of
+no change, not the 33rd. So **nothing here is ranked, in either
 direction**. The direction (c) reports is what the chunked decomposition's larger
 reassociation freedom predicts — it lands `2.29e-04` from the exact answer where
 sequential lands `1.15e-08` — and it is not a defect. The residue's mechanism was

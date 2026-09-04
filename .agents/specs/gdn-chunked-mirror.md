@@ -1007,10 +1007,14 @@ Not done, and each is a gate rather than a nicety:
   irrelevant to the disagreement; they simply never observe it. (b) `rel(sumabs)`
   is a difference of NORMS, not a norm of DIFFERENCES, and its under-report is a
   DISTRIBUTION rather than the `~122x` single seed draw this line first quoted: at
-  `n = 12800` over 400 seeds the median is 69x (sigma 1e-3) to 126x (sigma 1e-4),
-  p05..p95 31..1264, and at a **fixed** true divergence two readings differ by a
-  median **2.1x** and **18.2x** at p95 — 400 seeds, not the six this annotation's
-  own first version (`c51c484db`) read `4.64x` from.
+  `n = 12800` over 400 seeds the median is 75x (sigma 1e-3) to 140x (sigma 1e-4),
+  p05..p95 34..1500, and at a **fixed** true divergence two readings differ by a
+  median **2.1x** and **24x** at p95 — 400 seeds, not the six this annotation's
+  own first version (`c51c484db`) read `4.64x` from. Two significant figures is
+  what 400 draws buy; the three-figure set this line carried until #2879 came from
+  a script that was never committed. `MetricSpread` now READS this spec off disk
+  and compares every figure quoted here to the value it draws
+  (`test_the_PUBLISHER_reproduces_both_specs`), so the two cannot move apart.
   (c) **One framing, applied to every tap.** `3.525e-04` and `1.269e-04` are the
   same PREFILLDIV column, so a comparison that is mismatched for the MoE row is
   mismatched for the block row. Read as algorithm-**matched** CPU-vs-CUDA pairs,
@@ -1020,11 +1024,11 @@ Not done, and each is a gate rather than a nicety:
   2.34x, `out` 2.29x; `mhc.inj` alone to exactly zero). That direction is what the
   chunked decomposition's larger reassociation freedom predicts — it lands
   `2.29e-04` from the exact answer where sequential lands `1.15e-08` — and it is
-  not a defect. Against (b): 19.9x and 16.7x sit at 4.6% and 5.4% of the metric's
+  not a defect. Against (b): 19.9x and 16.7x sit at 6% and 7% of the metric's
   own no-change distribution, and no change at all produces 1.80x, 2.02x, 2.34x
-  and 3.15x in **33% to 59%** of draws — this line first called that "between its
-  33rd and 59th percentile", which states the complement and inverts the ranking:
-  3.15x sits at the **67th** percentile of no change, not the 33rd.
+  and 3.15x in **59%, 52%, 45% and 33%** of draws — this line first called that
+  "between its 33rd and 59th percentile", which states the complement and inverts
+  the ranking: 3.15x sits at the **67th** percentile of no change, not the 33rd.
   **Nothing here is ranked, in either direction.** The
   residue's mechanism was already named by
   [#2552](https://github.com/mudler/vllm.cpp/issues/2552) — the keep-quant grouped

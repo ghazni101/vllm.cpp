@@ -45,7 +45,7 @@ three forwards on which both arms produce the same token.
 cannot rank even the pairs it did observe.** `rel(sumabs)` is a difference of
 NORMS, not a norm of DIFFERENCES. Read as algorithm-**matched** CPU-vs-CUDA
 pairs, the same three measurements say `L00 blk` moved **16.7x FURTHER**; over
-400 seeds of a committed control those two ratios sit at **4.6%** and **5.4%** of
+400 seeds of a committed control those two ratios sit at **6%** and **7%** of
 what no change at all produces. "The residue grew" and "the residue did not grow"
 are equally unsupported, and so is a 19.9x or a 16.7x at the block. §5's two
 ANNOTATION blocks carry both framings in full.
@@ -331,33 +331,76 @@ CPU arms, 2.320338e-02 between CPU and CUDA.
 > | perturbation | p05 | median | p95 |
 > |---|---|---|---|
 > | aligned with `sign(a)` | 1.00 | **1.00** | 1.00 |
-> | zero-mean, sigma 1e-3 | 31.4 | **69.2** | 568.2 |
-> | zero-mean, sigma 1e-4 | 43.9 | **125.6** | 1264.0 |
-> | zero-mean, sigma 1e-5 | 46.1 | **130.3** | 1398.7 |
+> | zero-mean, sigma 1e-3 | 34 | **75** | 770 |
+> | zero-mean, sigma 1e-4 | 48 | **140** | 1500 |
+> | zero-mean, sigma 1e-5 | 48 | **140** | 1300 |
 >
 > The first row is the positive control, where the two measures must agree and
 > do. There is no sigma dependence in the linear regime — 1e-4 and 1e-5 agree, and
 > both approach `sqrt(2n/pi)/|z| = 90.3/|z|` for a standard normal `z`, median
-> **133.8**.
+> **134**.
+>
+> **TWO SIGNIFICANT FIGURES IS WHAT 400 DRAWS BUY, AND THIS TABLE FIRST CARRIED
+> THREE.** The set published here until
+> [#2879](https://github.com/mudler/vllm.cpp/pull/2879) — `31.4 / 69.2 / 568.2`,
+> `43.9 / 125.6 / 1264.0`, `46.1 / 130.3 / 1398.7` — came from a script that was
+> never committed, and it does not reproduce from `MetricSpread` over the 400
+> seeds it names. It is not a different CONSTRUCTION: 14 of its 15 figures lie
+> inside the committed control's own bootstrap 95% interval, and 13 of 15 inside
+> the range six disjoint 400-seed blocks of that control span
+> ([study](qwen4exp-gdn-chunked-token-ids-20260904/metric-spread-precision.py),
+> [output](qwen4exp-gdn-chunked-token-ids-20260904/metric-spread-precision.txt)).
+> Nor is it a short read of the same stream: section 3 of that study sweeps every
+> prefix from 64 to 400 draws, none reproduces the set, and 11 of the 15 figures
+> sit below every prefix. It was a different SAMPLE, quoted to a digit that 400
+> draws do not determine.
+> Every statistical figure in this annotation is now drawn over `range(400)` by
+> `MetricSpread` and asserted there, rounded to two significant figures — and
+> asserted against THIS FILE: `MetricSpread`'s `test_the_PUBLISHER_*` cases read
+> this annotation, `docs/USAGE.md`, the tool's docstring, the tool's runtime
+> stdout and both specs off disk, and compare every figure each of them quotes
+> from the control to the drawn value, rendered by the one rounding function. The
+> counts and six-block spans beside them are the committed precision study's, and
+> it reads the same `metric_draw` by import. Moving a digit here without moving the
+> draw reds a case that names this file and the figure. That publisher is what
+> would have caught #2879, and it did not exist until #2879: the older
+> `test_a_second_seed_block_moves_every_figure_a_third_digit_would_claim`
+> compares the estimator to ITSELF and reads no document, so it measures how
+> imprecise the estimator is and could not have seen a document quoting a sample
+> this control never drew. What it does establish is the ceiling on the digits —
+> the next disjoint 400 seeds give a median of **80** rather than 75 and a p95 of
+> **574** rather than 770.
 >
 > **What this costs a reader is the SPREAD, and that is what settles #2877.** Hold
 > the TRUE divergence fixed at sigma 1e-3 and vary only the perturbation's sign
-> structure: `rel(sumabs)` spans **18.3x** p05..p95 and **2078x** end to end,
-> while the true divergence spans 1.03x. Two readings **of the same true
-> divergence** differ by a median **2.1x**, 4.0x at p75, 8.9x at p90 and **18.2x**
-> at p95. So, as the probability that an UNCHANGED divergence produces a ratio at
-> least this large:
+> structure: `rel(sumabs)` spans **21x** p05..p95 while the true divergence spans
+> 1.06x. Its end-to-end span is not a figure at all — one draw sets it, and it
+> moves by more than 4x between seed blocks, so the **2078x** this line used to
+> carry is withdrawn rather than restated. Two readings **of the same true
+> divergence** differ by a median **2.1x**, 4.2x at p75, 11x at p90 and **24x** at
+> p95. So, as the probability that an UNCHANGED divergence produces a ratio at
+> least this large, in whole percent because that is the last digit 400 draws
+> hold:
 >
 > | ratio | tap it is claimed for | P(no change produces it) |
 > |---|---|---|
-> | 24.1x | `s.attn`, defaults framing | 3.9% |
-> | 19.9x | `blk`, defaults framing | 4.6% |
-> | 16.7x | `blk`, matched framing | 5.4% |
-> | 11.6x | `mhc.mix`, defaults framing | 7.6% |
-> | 3.15x | `moe`, matched framing | **32.8%** |
-> | 2.34x | `s.mlp`, matched framing | **44.9%** |
-> | 2.02x | `mhc.mix`, matched framing | **52.2%** |
-> | 1.80x | `moe`, defaults framing | **58.7%** |
+> | 24.1x | `s.attn`, defaults framing | 5% |
+> | 19.9x | `blk`, defaults framing | 6% |
+> | 16.7x | `blk`, matched framing | 7% |
+> | 11.6x | `mhc.mix`, defaults framing | 9% |
+> | 3.15x | `moe`, matched framing | **33%** |
+> | 2.34x | `s.mlp`, matched framing | **45%** |
+> | 2.02x | `mhc.mix`, matched framing | **52%** |
+> | 1.80x | `moe`, defaults framing | **59%** |
+>
+> The four body rows hold to about a point between seed blocks. The four tail
+> rows move by JUST OVER a factor of two — `P(>= 19.9x)` reads 6% on the committed
+> block and 4% on the next one, and across the six disjoint blocks of the
+> [precision study](qwen4exp-gdn-chunked-token-ids-20260904/metric-spread-precision.txt)
+> `P(>= 24.1x)` spans 2.56% to 5.42%, a 2.12x move — so read them as "a few
+> percent", which is the only claim this row needs from them. This line first said
+> "3% on the next one", truncating 3.7% where every other share on this row is
+> rounded, which understated the move it was quoted to demonstrate.
 >
 > **Every MoE number in this row is an ordinary reading of no change at all.** The
 > control is standard-library, fixed-seed and hermetic, and it is committed as
@@ -368,18 +411,53 @@ CPU arms, 2.320338e-02 between CPU and CUDA.
 > significance test on the real tensors.
 >
 > **AND THAT PREMISE IS THE LOAD-BEARING ONE. THE FRESH RE-REVIEW OF THIS
-> ANNOTATION FOUND THE BOUND IS MODEL-DEPENDENT.** Held at the same sigma, the
-> pair p95 falls from **35.3x** under an i.i.d. dense zero-mean perturbation to
-> **17.1x** under a multiplicative one proportional to `|a|` (rounding-like), and
-> to **5.3x** under a SPARSE one concentrated in 16 large entries (like a top-k
-> flip); `P(no change >= 19.9x)` falls **7.6% -> 4.1% -> 1.3%** with it. Under a
-> sparse structured perturbation the metric ranks fine, and 19.9x WOULD be a real
-> signal. **That case is not hypothetical here:** #2552, cited below, names a
-> dense reassociation term AND a bimodal top-k term at a 32.9% exact-bf16-tie
-> rate, and a top-k flip is exactly the sparse case. This does not restore the
-> ratio — which perturbation the real tensors carry is **unmeasured**, which is
-> why the reading is withdrawn rather than reversed — but it names the assumption
-> the next measurement has to establish.
+> ANNOTATION FOUND THE BOUND IS MODEL-DEPENDENT, AND IT DOES NOT FAIL
+> CONSERVATIVELY.** All three models below hold the same total perturbation
+> energy and are drawn by the same committed control over the same 400 seeds, all
+> three **at sigma 1e-3**:
+>
+> | perturbation, sigma 1e-3 | median under-report | pair p95 | P(no change >= 19.9x) |
+> |---|---|---|---|
+> | i.i.d. dense | 75x | 24x | 6% |
+> | multiplicative, proportional to `a` (rounding-like) | 110x | 41x | 8% |
+> | sparse, 16 elements of 12800 (like a top-k flip) | **2.9x** | 19x | 5% |
+>
+> A sparse perturbation is read almost in FULL — a median 2.9x under-report where
+> the dense model gives 75x — so on a top-k flip the magnitude the metric reports
+> is close to the real one. A multiplicative one is read WORSE than dense on every
+> column **of that table**, because it carries no second-order term to hold the
+> denominator away from zero.
+>
+> **THE SIGMA LABEL IS LOAD-BEARING, BECAUSE THE MAGNITUDE COLUMN REVERSES BELOW
+> IT AND THIS ROW READS BELOW IT.** The multiplicative model is scale-INVARIANT —
+> the control draws the same 110x, 41x and 8% at sigma 1e-3, 1e-4 and 1e-5 — while
+> the dense model loses the second-order term that holds its denominator up as
+> sigma falls, and its median under-report rises from 75x to **140x**. So in the
+> LINEAR regime the DENSE model is the one read worse on magnitude, the opposite
+> of the ordering the table shows. The two SPREAD columns do not reverse:
+> multiplicative stays worse on both at every sigma. And the regime is not
+> academic for this row — the control's median `rel(sumabs)` is **1.9e-05** at
+> sigma 1e-4 and **1.9e-06** at sigma 1e-5, which brackets the `1.772e-05` and
+> `1.062e-06` the framing tables below argue over, where sigma 1e-3 draws
+> **3.5e-04**. "Multiplicative is read worse" is a sigma 1e-3 statement, and the
+> conclusion this paragraph carries — that the bound does not fail conservatively
+> — survives in both regimes, because the multiplicative model is read worse than
+> the dense one on both SPREAD columns at every sigma, and on all three at sigma
+> 1e-3.
+>
+> **The re-review first published this paragraph the other way round**
+> (`35.3x -> 17.1x -> 5.3x` and `7.6% -> 4.1% -> 1.3%`, from the same uncommitted
+> script as the table above, reading the multiplicative model as an improvement);
+> those figures are withdrawn. The pair columns do not separate the three models
+> the way the magnitude column does, and the sparse pair column is confounded
+> anyway: 16 non-zero elements let the TRUE divergence span 3.2x across the same
+> seeds where the dense model holds it to 1.06x, so part of that spread is real
+> variation rather than metric noise. **The case is not hypothetical here:** #2552,
+> cited below, names a dense reassociation term AND a bimodal top-k term at a
+> 32.9% exact-bf16-tie rate, and a top-k flip is exactly the sparse case. This
+> does not restore the ratio — which perturbation the real tensors carry is
+> **unmeasured**, which is why the reading is withdrawn rather than reversed — but
+> it names the assumption the next measurement has to establish.
 >
 > **2. ONE FRAMING, APPLIED TO EVERY TAP.** The first version of this annotation
 > disqualified the MoE reading for mixing arms and then left the *favourable* half
@@ -422,7 +500,7 @@ CPU arms, 2.320338e-02 between CPU and CUDA.
 > **The two framings disagree in DIRECTION on the same three measurements**, and
 > (1) says only the top four ratios are outside the metric at all. So: the port's
 > effect on the block is `19.9x closer` read one way and `16.7x further` read the
-> other, at 4.6% and 5.4% under no change — neither is a result, and quoting only
+> other, at 6% and 7% under no change — neither is a result, and quoting only
 > the first is what this repair exists to remove. The MoE taps move FURTHER under
 > **both** framings and are inside the instrument under both, which is why
 > "the residue grew" and "the residue did not grow" are equally unsupported.
