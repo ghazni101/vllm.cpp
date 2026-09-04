@@ -405,10 +405,16 @@ That is the majority of the parameter count and most of the decode step.
 6. **`dots3_note` config parsing**, including the four defaults of §4 that the
    checkpoint's `config.json` does **not** carry. **LANDED at W1, and NOT in
    `hf_config.cpp` as this item first said — see §4.2 for why.**
-7. **GGUF k-quant arm.** llama.cpp has no `dots3_note` architecture, so the
-   converter is ours to write and there is no quant-matched llama.cpp
-   comparison for this row. Per AGENTS.md the arm is owed, not optional; an
+7. **GGUF k-quant arm.** Per AGENTS.md the arm is owed, not optional; an
    unimplemented arm refuses with a message naming the missing piece.
+   **CORRECTED IN PLACE, 2026-09-04 (W9a, §4.19.2).** This item used to say
+   llama.cpp has no `dots3_note` architecture, so the converter is ours to write
+   and there is no quant-matched llama.cpp comparison for this row. All three
+   claims are false: llama.cpp merged `LLM_ARCH_DOTS3NOTE -> "dots3note"` on
+   2026-08-21, `conversion/dots3.py` registers `Dots3NoteForCausalLM` by name,
+   and published artifacts exist. What is owed is our LOADER arm and a pin
+   advance off `b10451` (W9b/W9c/W9e/W9f), not a converter written from
+   nothing.
 
 ---
 
@@ -7550,6 +7556,372 @@ adds one owes the first case that can reach the tie.
 
 ---
 
+### 4.19 W9a makes the GGUF refusal REACHABLE, and stops it saying something false
+
+**Issue: [#2882](https://github.com/mudler/vllm.cpp/issues/2882). Brick: W9a,
+the refusal half of W9.** This slice ships no arithmetic and lifts no arm. It
+repairs two defects in one place: a refusal a real artifact could never print,
+and a sentence inside it that is not true.
+
+#### 4.19.1 The careful refusal was unreachable, and the message that fired named nothing
+
+`LoadDots3NoteForCausalLM` has refused `ModelSource::Kind::kGguf` by name since
+W1, naming the row, the brick and the spec. **No real `dots3note` file has ever
+reached it.** The entrypoint resolves a GGUF's config BEFORE it builds a
+`ModelSource`: `src/vllm/entrypoints/model_loader.cpp::HfConfigFromGgufDispatch`
+is called first and `src/vllm/entrypoints/model_loader.cpp::FromGguf` second
+(lines 2668 and 3069 at this brick's parent `7b8b480b1`, and they move whenever
+that file does, which is why the citation names the symbols).
+`dots3note` is not in `kGgufArchArms`, so the dispatch fell through to
+its explicit default and the file died with
+
+```
+GGUF architecture 'dots3note' is not supported by this build. GGUF
+architectures supported by this build: deepseek4, muse-glimmer, qwen35, ...
+```
+
+which names neither this model, nor the row, nor the brick, nor what is owed.
+The operator learns that some list does not contain their file, and nothing
+about who owes the arm.
+
+That is the #809 failure one step further out. #809 was a refusal naming the
+WRONG model; this is a refusal naming NO model on a file this project knows by
+name. The in-tree answer already exists and this slice copies it exactly:
+`src/vllm/entrypoints/model_loader.cpp::HfConfigFromGgufDispatch` carries a
+documented block of KNOWN architectures whose GGUF arm is OWED rather than
+absent, and
+`src/vllm/model_executor/models/nemotron_h_registry.cpp::IsNemotronHGguf` /
+`src/vllm/model_executor/models/nemotron_h_registry.cpp::NemotronHGgufRefusal`,
+declared in `src/vllm/model_executor/models/nemotron_h.h::NemotronHGgufRefusal`,
+is its one existing member. W9a adds the second: `IsDots3NoteGguf` /
+`Dots3NoteGgufRefusal`, defined in `dots3_note_registry.cpp` beside the factory
+guard that throws the SAME string, so the refusal has ONE owner and both doors a
+GGUF can arrive at print it.
+
+#### 4.19.2 The refusal said llama.cpp has no such architecture, and llama.cpp merged one
+
+The W1 text asserted, in a comment AND in the message an operator reads, that
+llama.cpp has no `dots3_note` architecture and therefore no converter to reuse.
+**That is false, and it was false before this slice was written.** Verified in a
+local `ggml-org/llama.cpp` clone (`/home/mudler/_git/llama.cpp`, remote `origin`
+= `https://github.com/ggml-org/llama.cpp`) at `origin/master` = `0ef4d560e`,
+2026-09-04:
+
+| Claim | How it was checked | Result |
+|---|---|---|
+| `LLM_ARCH_DOTS3NOTE -> "dots3note"` exists | `git show origin/master:src/llama-arch.cpp \| sed -n '114p'` | `{ LLM_ARCH_DOTS3NOTE, "dots3note" },` |
+| PR #27060 merged | `git log -1 5a32f7b66ef6cfb3e60deea26e3454cc6ad3438c` | `model: add dots3-note (#27060)`, 2026-08-21 19:52:34 +0200 |
+| ...and is on master | `git merge-base --is-ancestor 5a32f7b6… origin/master` | yes |
+| PR #27524 merged | `git log -1 54ee5ee643f29abba6852903ddfdb688c2361b5b` | `mtmd: support dots3-note vision+audio (#27524)`, 2026-08-22 10:35:50 +0200 |
+| ...and is on master | `git merge-base --is-ancestor 54ee5ee6… origin/master` | yes |
+| a converter exists | `git show --stat 5a32f7b6…` | `conversion/dots3.py`, 195 lines, new file |
+| the mtmd half exists | `git show --stat 54ee5ee6…` | `tools/mtmd/models/dots3note.cpp`, 61 lines, new file |
+
+`5a32f7b6…` is 20 files, +1412/-9; `54ee5ee6…` is 15 files, +535/-11. Both are
+squash commits with a single parent, which is why neither reads as a merge.
+
+**The correction has to land in the MESSAGE, not only in the comment.**
+`dots3_note_registry.cpp:124-125` is product output: it is the sentence an
+operator gets on stderr. A record correction that repairs the surrounding
+comment and leaves the false sentence in the throw is not a fix, and this
+repository has the failure on file. So the new text says what is true — the arm
+is owed to W9, llama.cpp DOES define the architecture, and the merge commits are
+named so a reader can check rather than trust.
+
+**What the new text deliberately does NOT say.** It does not claim this build
+can serve such a file, or that the converter is reusable as-is. Whether our
+loader can read llama.cpp's tensor layout is W9b/W9c's question, and #2882
+records one known delta already: llama.cpp splits our fused `kv_b_proj` into
+`attn_k_b` / `attn_v_b`. A refusal that oversells the position is the same class
+of defect as one that undersells it.
+
+#### 4.19.3 What the refusal now says
+
+```
+Model architecture Dots3NoteForCausalLM does not support GGUF weights yet: the
+GGUF k-quant arm is OWED to W9 -- both a loader arm and, for an artifact that
+needs one, a converter. Row MODEL-MM-dots3-note-dots3-note-for-causal-lm, spec
+.agents/specs/dots3-note.md section 4.19. llama.cpp DOES define this
+architecture -- LLM_ARCH_DOTS3NOTE -> "dots3note", ggml-org/llama.cpp
+src/llama-arch.cpp, merged as 5a32f7b66ef6cfb3e60deea26e3454cc6ad3438c
+("model: add dots3-note", 2026-08-21) and 54ee5ee643f29abba6852903ddfdb688c2361b5b
+("mtmd: support dots3-note vision+audio", 2026-08-22) -- and published dots3note
+GGUF artifacts exist, so a file reaching this refusal is a real one. This build
+cannot read it yet.
+```
+
+#### 4.19.4 The gate is REACHABILITY and TEXT, not a number
+
+§6.4 option B, and this slice is the clearest case of it on the row: it adds no
+arithmetic at all, so there is nothing for an oracle to be an oracle OF. **Its
+gate is that the refusal fires on the production path, and that the text it
+prints is true.** Nothing here is a correctness gate in the numeric sense, and
+nothing in this section should be read as one.
+
+The smallest failing test drives a synthetic GGUF whose only content is
+`general.architecture = "dots3note"` through `LoadedEngine::FromModelDir` — the
+entry point every server and CLI `.gguf` argument takes — and asserts the thrown
+message names dots3-note, the row and the brick, and does NOT carry the
+build-level "is not supported by this build" text. It lives beside the #809
+cases in `tests/vllm/test_model_loader_gguf.cpp`, which is where the dispatch's
+other refusals are already held.
+
+#### 4.19.5 What is still owed, BY NAME
+
+Unchanged by this slice, and refused rather than deferred silently:
+
+- **W9b — the GGUF loader arm.** Reading a `dots3note` file's tensors into
+  `Dots3NoteWeights`, including llama.cpp's `attn_k_b`/`attn_v_b` split against
+  our fused `kv_b_proj`.
+- **W9c — the header manifest**, i.e. what `Dots3NoteHfConfigFromGguf` would
+  have to read to build an `HfConfig` this row's parser accepts.
+- **W9e — the mmproj arm** for the vision and audio towers.
+- **W9f — the end-to-end run and the `llama-cpp` oracle pin advance.** The
+  pinned oracle is `b10451` ([oracles/llama-cpp.md](../oracles/llama-cpp.md)),
+  which predates both merges above, so a quant-matched comparison needs a pin
+  advance and that is a row of its own.
+- **The blockwise-FP8 language and audio arms** stay refused, unchanged.
+- **The vision FP8 divergence** is [#2881](https://github.com/mudler/vllm.cpp/issues/2881),
+  which this slice does not touch.
+
+#### 4.19.6 #699 is UNREADABLE, not gone -- and one pointer to it was SUBSTITUTED
+
+`gh api repos/mudler/vllm.cpp/issues/699` returns HTTP 404 while the account
+reads healthy (`gh api user` succeeds, and every other issue this slice cites
+reads fine). This repository has a recorded incident in which API 404s were read
+as deletions and the falsehood was written into `AGENTS.md`, so this slice does
+NOT conclude that #699 is gone.
+
+**It is demonstrably still present, and the READ PATH is what is broken.** The
+first draft of this section said "404, cause unknown", which is weaker than what
+can be measured. Measured 2026-09-04:
+
+| Read | 698 | 699 | 700 | 701 | 702 |
+|---|---|---|---|---|---|
+| `gh api .../issues/<n>` | 404 | 404 | 404 | 404 | 404 |
+| `gh api .../issues/<n>/timeline` | 3 events | 13 events | 3 events | 3 events | 2 events |
+
+699's earliest timeline event is a `referenced` at `2026-08-14T14:54:07Z`. An
+issue that was deleted has no timeline to serve, and a CONTIGUOUS five-number
+block cannot all have been deleted while all five answer on a second endpoint.
+So the finding is "present, unreadable through this endpoint", not "deleted" --
+which is the same refusal to act, held up by evidence instead of by caution.
+
+**One pointer to #699 did leave `src/`, and it is a SUBSTITUTION.** W1's throw
+ended `See .agents/specs/dots3-note.md and issue #699.`; `Dots3NoteGgufRefusal`
+ends with the row ID `MODEL-MM-dots3-note-dots3-note-for-causal-lm` and `spec
+.agents/specs/dots3-note.md section 4.19` instead. Measured on this branch:
+`git grep -c 699 -- src/` lists 30 files at the base `3e246b34f` and 29 at the
+reviewed head `a7d9c0d1f`; the one that leaves is `dots3_note_registry.cpp`
+(1 line), and every other count is byte-identical, `dots3_note.h`'s 6 included.
+Both trees are named because a count with no tree beside it is the shape #2323
+refuses.
+
+This spec still carries the reference, here and in many other sections, and this
+paragraph deliberately does NOT quote how many. Its first draft did -- it said
+31 -- and that number was already wrong by the time the section was rewritten to
+discuss #699 at length. A count of one file stored as prose in that same file is
+a drift lock, which is the shape AGENTS.md `## Records` names, and it is also the
+"measured at the parent, quoted as if it described the head" trap. The reader who
+wants the number runs `git grep -c 699 -- .agents/specs/dots3-note.md`. What is
+stated here instead is the direction, which is UP, and the one line that left
+`src/`, which is named above.
+
+The reason is NOT the 404, and this section said the opposite until it was
+reviewed. The refusal is product output on a user's stderr: a row ID and a spec
+section resolve inside the checkout the user already has, while an issue number
+resolves only through the endpoint that is currently answering 404. Substituting
+the pointer that always resolves for the one that does not is the better refusal.
+Deleting the RECORD would not be, and no record was deleted.
+
+#### 4.19.7 Evidence, measured 2026-09-04
+
+Built in `/dev/shm` with `TMPDIR` inside the build directory, `-j 2`:
+`-DVLLM_CPP_SERVER=ON -DVLLM_CPP_BUILD_TESTS=ON -DVLLM_CPP_CUDA=OFF
+-DCMAKE_BUILD_TYPE=Release`. No GPU, and none is applicable: this slice runs no
+arithmetic.
+
+**Which TREE each number was measured on**, because the first draft of this
+header named only `7b8b480b1` while the table below quoted the merge commit, and
+an evidence table that does not name its tree is the shape #2323 names. The
+RED/GREEN pair and M1/M2 were measured on `7b8b480b1` plus this branch; the fresh
+review re-ran every one of them on the merge commit `a7d9c0d1f` and each number
+holds. §4.19.8's numbers are a THIRD tree, the repair head, and are labelled
+there rather than folded in here.
+
+**RED before, verbatim.** `test_model_loader_gguf` at the test-only commit,
+binary sha256 `736df440c58e3bfe8cfd8c314410aa9c7b4c1f519defcc37a036f23b0a57694c`:
+
+```
+[doctest] test cases: 11 |  9 passed | 2 failed | 0 skipped
+[doctest] assertions: 46 | 37 passed | 9 failed |
+[doctest] Status: FAILURE!
+```
+
+Nine failures, and one of them says WHY rather than merely that:
+
+```
+tests/vllm/test_model_loader_gguf.cpp:272: ERROR:
+  CHECK( message.find("is not supported by this build") == std::string::npos )
+  is NOT correct!
+  values: CHECK( 30 == 18446744073709551615 )
+```
+
+Offset 30 is exactly past `GGUF architecture 'dots3note' `, so the message an
+operator got was the build-level default and nothing else. The other eight are
+`npos` on every claim the case makes about the text.
+
+**GREEN after**, binary sha256
+`edc9e007e60eeb3cc80fa78cfbd23c6a5df6af3b3691434766ce33313f62ad91`:
+
+```
+[doctest] test cases: 11 | 11 passed | 0 failed | 0 skipped
+[doctest] assertions: 46 | 46 passed | 0 failed |
+```
+
+**The mutations.** Each was applied to the GREEN tree, rebuilt, run, and
+restored — and the restore is proved by the binary, not asserted: rebuilding
+after the last restore reproduced `edc9e007…` exactly.
+
+| # | Mutation | Binary sha256 | Result |
+|---|---|---|---|
+| M1 | Delete the whole `if (vllm::IsDots3NoteGguf(gguf))` branch from `src/vllm/entrypoints/model_loader.cpp::HfConfigFromGgufDispatch` — the production call site | `336a2a74…` | **RED** 11 / 9 passed / 2 failed, 46 / 37 / 9 |
+| M2 | `src/vllm/model_executor/models/dots3_note_registry.cpp::IsDots3NoteGguf` returns `false` unconditionally | `e54cefec…` | **RED** 11 / 9 passed / 2 failed, 46 / 37 / 9 |
+| — | restore | `edc9e007…` | **GREEN** 11 / 11, 46 / 46 |
+
+Both build cleanly (`ninja` exit 0), which is what makes their reds a
+measurement rather than the compile failure this row has twice read as a pass.
+M1 is the reachability mutation AGENTS.md's `## Nothing lands dead` asks for:
+with the call site gone, nothing in the tree produces the new string, and the
+suite goes red at the same nine assertions the pre-implementation RED failed on
+— the same count from the opposite direction, because the file falls back to the
+build-level default in both.
+
+**What these mutations do NOT prove.** They prove the dispatch branch is reached
+and that the predicate decides it. They say nothing about whether the SENTENCES
+are true; that is §4.19.2's table, whose evidence is a llama.cpp checkout and
+not this build. The two SHAs asserted in the test are the seam between them: the
+test holds the text stable, and only a reader with the clone can check that the
+text is right. A test cannot verify a claim about another repository, and this
+section does not pretend otherwise.
+
+**One sibling case had to MOVE, and it is the honest half of this slice.**
+`test_dots3_note_scaffold`'s "GGUF k-quants are OWED (W9)" subcase asserted the
+old literal and went red the moment the text moved into one owner. It now
+asserts the new substring AND that the factory guard's bytes equal
+`Dots3NoteGgufRefusal()` exactly; its own comment carried the false llama.cpp
+claim and is corrected with the reason. That is a gate finding, not a bystander:
+a suite that stayed green through a rewritten refusal would have been measuring
+nothing about the text.
+
+**This paragraph used to end "so the two doors cannot drift", and that was one
+door.** The byte-equality above holds the FACTORY guard — the door this very
+section proves a real artifact never reaches. The reachable door, the entrypoint
+dispatch, was held by substrings only, and §4.19.8 measures what that costs. The
+sentence is corrected rather than deleted, because the correction is the finding.
+
+| Suite | Result |
+|---|---|
+| `test_model_loader_gguf` | 11 / 11 cases, 46 / 46 assertions at `a7d9c0d1f`; **13 / 13 and 57 / 57** after §4.19.8 adds two cases |
+| `test_dots3_note_scaffold` | 26 / 26 cases, 110836 / 110836 assertions (110835 before, +1 for the byte-equality assertion) |
+| `test_dots3_note_attn` | 51 / 51 cases, 6888 / 6888 |
+| `test_dots3_note_vision` | 13 / 13 cases, 21343 / 21343 |
+| `test_dots3_note_audio` | 28 / 28 cases, 4206 / 4206 |
+| `test_nemotron_h_scaffold` | 14 / 14 cases, 38311 / 38311 |
+| `test_model_resolver` | 11 / 11 cases, 61 / 61 |
+| `test_gguf` | 36 / 36 cases, 133 / 133 |
+
+`test_nemotron_h_scaffold` is in that list on purpose: this slice adds a second
+member to the block its refusal already occupies, and the way to get that wrong
+is to shadow the first one.
+
+#### 4.19.8 The fresh review found the slice OVERSTATING ITSELF, four times
+
+The refusal's TEXT reviewed clean: every llama.cpp claim and the artifact claim
+were re-derived independently and hold. All four findings were about what this
+slice claimed ABOUT ITSELF — which is the same defect class §4.19 exists to fix,
+one level up. They are recorded here rather than repaired quietly, because a
+correction with no record is how the next reader repeats it.
+
+**F1 — two NEW line anchors were stale at this slice's OWN head.**
+`dots3_note.h` and `tests/vllm/test_model_loader_gguf.cpp` both cited
+`model_loader.cpp:2668` and `:3069`. This slice inserts four lines at `:1289`,
+ABOVE both, so at the merge commit the call sites are 2672 and 3073; 2668 is a
+Qwen4-Exp `VT_LOAD_STATS` comment and 3069 a platform-resolution comment, and a
+reader landed in an unrelated row's prose. That is #1143 committed by the very
+change that converted the OLD anchors to symbol form. Both now cite
+`src/vllm/entrypoints/model_loader.cpp::HfConfigFromGgufDispatch` and
+`src/vllm/entrypoints/model_loader.cpp::FromModelDir`.
+`scripts/check-symbol-anchors.py` staying green was never evidence: its own
+docstring says it does not verify LINE citations, so it structurally could not
+see these.
+
+**F2 — "the two doors cannot drift" was gated on the WRONG door**, and this is
+the finding with teeth. The byte-equality lives in `test_dots3_note_scaffold` and
+compares the FACTORY guard with `Dots3NoteGgufRefusal()` — the door §4.19.1
+proves a real artifact never reaches. The REACHABLE door, the entrypoint
+dispatch, was held by substrings only, and a substring set cannot see a message
+that still contains every substring. `test_model_loader_gguf` now carries
+`RefusalFor(GgufWithArchitecture("dots3note")) == vllm::Dots3NoteGgufRefusal()`.
+
+**F3 — the predicate was proved to FIRE, not proved to fire ONLY for
+`dots3note`.** Gross over-match was already caught (returning `true`
+unconditionally reds the `mamba-unported` case), but nothing fed a NEAR MISS, so
+loosening `==` to a prefix match left both suites green. Two architectures close
+it: `dots3note-moe`, a plausible sibling whose GGUF is not this model's, and
+`dots3_note`, the underscore spelling W1's own text used. Both must reach the
+build-level default, and neither may be claimed by a row that does not owe it.
+
+**F4 — §4.19.6's "does not remove any reference to #699" was FALSE as written**,
+and the diff said so. §4.19.6 now records what actually happened and why the
+substitution is the better refusal, together with the timeline evidence that
+#699 is unreadable rather than gone. `squash_merge_commit_message = PR_BODY`
+would have made the false sentence a permanent commit message.
+
+**Evidence, measured 2026-09-04 on the repair head.** Same recipe as §4.19.7,
+built in `/dev/shm` with `TMPDIR` inside the build directory, `-j 2`,
+`-DVLLM_CPP_SERVER=ON -DVLLM_CPP_BUILD_TESTS=ON -DVLLM_CPP_CUDA=OFF
+-DCMAKE_BUILD_TYPE=Release`. Every `ninja` in the table exited 0, which is what
+makes a red a measurement rather than the compile failure this row has twice
+read as a pass. Mutation A is `+ " (dots3note)"` appended to what
+`src/vllm/entrypoints/model_loader.cpp::HfConfigFromGgufDispatch` throws.
+Mutation B loosens
+`src/vllm/model_executor/models/dots3_note_registry.cpp::IsDots3NoteGguf` from
+`==` to `rfind(kDots3NoteGgufArch, 0) == 0`.
+
+| Tree | `test_model_loader_gguf` sha256 | Result | `test_dots3_note_scaffold` sha256 | Result |
+|---|---|---|---|---|
+| the reviewed head `a7d9c0d1f`, unmodified | `e09fc2c6…` | GREEN 11 / 11, 46 / 46 | `f1ca54d8…` | GREEN 26 / 26, 110836 / 110836 |
+| **+ mutation A, NO new cases** | `0ea9158c…` | **GREEN 11 / 11, 46 / 46** | `b2b95de9…` | **GREEN 26 / 26, 110836 / 110836** |
+| + the two new cases (mutation A reverted) | `c37c544c…` | GREEN 13 / 13, 57 / 57 | `f1ca54d8…` | GREEN 26 / 26, 110836 / 110836 |
+| + mutation A | `c2c2da5e…` | **RED 13 / 12 passed / 1 failed, 57 / 56 / 1** | `b2b95de9…` | GREEN 26 / 26, 110836 / 110836 |
+| + mutation B | `7defeb0e…` | **RED 13 / 12 passed / 1 failed, 57 / 53 / 4** | `adec3c9b…` | GREEN 26 / 26, 110836 / 110836 |
+| restore | `c37c544c…` | GREEN 13 / 13, 57 / 57 | `f1ca54d8…` | GREEN 26 / 26, 110836 / 110836 |
+
+**Row two is the finding, not a control.** With the door a real file arrives at
+printing a DIFFERENT message, the whole gate this slice shipped stayed fully
+green on both suites. Row four is the same mutation against the repaired suite,
+and it reds on exactly one assertion — the byte-equality — while every substring
+above it still matches, which is precisely why a substring set could not do this
+job. Row five's four failures are all in the `dots3note-moe` iteration
+(`logged: arch := dots3note-moe`); the `dots3_note` iteration is unaffected,
+because a prefix match is not the separator-normalising error and that iteration
+is there for a different mutation.
+
+`test_dots3_note_scaffold` is byte-identical (`f1ca54d8…`) at the reviewed head,
+after the repair, and after the restore. The repair adds nothing to it and
+removes nothing from it, and the binary says so rather than the diff. The
+restores are proved the same way: both green shas reproduce exactly.
+
+**What §4.19.8 does NOT claim.** Two doors are now each held byte-exactly against
+one owner, and the predicate is held against one near miss per error class. It is
+still true that no test here can verify a claim about another repository
+(§4.19.7), and it is still true that a third door — one nobody has written — would
+be gated by nothing. The measured statement is "the two doors that exist cannot
+drift", and it is now that sentence rather than the earlier one.
+
+---
+
 ## 5. Gates
 
 **Correctness first, and the gate form is chosen by measurement, not in advance**
@@ -7591,7 +7963,22 @@ now captures a moving implementation.
 |---|---|---|---|
 | `dots3-note-prev` bf16 | ~576 GB | no | no |
 | `dots3-note-prev-fp8` | 298.67 GB (298,673,280,504 B) | no | no |
-| hypothetical ~2 bpw GGUF (ours) | ~75–90 GiB + towers | plausible | plausible |
+| `ggml-org/dots3-note-prev-GGUF` IQ2_XXS (3 shards) | 69.24 GiB | yes | yes |
+| the same repo's IQ2_S (3 shards) | 77.98 GiB | yes | yes |
+| the same repo's `mmproj-dots3-note-prev-Q8_0.gguf` | 7.72 GiB (8,291,026,496 B) | yes | yes |
+
+**The last three rows read "hypothetical (ours)" until W9a, and that was
+falsified**: llama.cpp merged `dots3note` on 2026-08-21 (§4.19.2) and six GGUF
+repos are published, one of them from the ggml org itself. The sizes are #2882's,
+read by RANGE REQUEST off the real 5.94 MB metadata shard rather than downloaded.
+The mmproj row credited a `cdanis` repo until 2026-09-04; `ggml-org/dots3-note-prev-GGUF`
+ships `mmproj-dots3-note-prev-Q8_0.gguf` itself at 8,291,026,496 B (HF `paths-info`,
+2026-09-04), so all three rows now name ONE repo and the table needs one pin, not two.
+They are the only vehicle on this table that fits any host this project reaches,
+which is why W9 is the row's only route to an end-to-end run and to a
+quant-matched llama.cpp denominator on a byte-identical artifact. W9a ships none
+of that: it makes the refusal REACHABLE and TRUE, and W9b/W9c/W9e/W9f still owe
+the arm.
 
 Upstream's own recipe is `--tensor-parallel-size 8` on H100s. Two of our boxes
 together are ~240 GiB and there is no TP-over-LAN path here, so aggregating them
@@ -8141,8 +8528,16 @@ dispatchable in order, under the constraints that answer imposes.
   memory-format obligation it names still binds every brick, and W6a discharged
   its own share of it in §4.11.4.
 - **R6 — no llama.cpp comparison** for the GGUF arm, so the quantized floor has
-  no external reference. Record it as a gap rather than substituting a different
-  model's number.
+  no external reference. **FALSIFIED as written, 2026-09-04 (W9a, §4.19.2).**
+  llama.cpp defines `dots3note` (`LLM_ARCH_DOTS3NOTE`, merged
+  `5a32f7b66ef6cfb3e60deea26e3454cc6ad3438c` and
+  `54ee5ee643f29abba6852903ddfdb688c2361b5b`), ships a converter
+  (`conversion/dots3.py`) and an mtmd arm, and published artifacts exist. An
+  external reference is therefore REACHABLE, and the risk narrows to a
+  schedulable one: the pinned `llama-cpp` oracle is `b10451`, which predates
+  both merges, so the comparison needs a pin advance (W9f). Record the gap
+  rather than substituting a different model's number, and do not record it as
+  a wall.
 - **R7 — Thor's overcommit + zero swap** takes the box down on an oversized run
   (§6.3). Size every run; never stack them.
 
@@ -8729,6 +9124,17 @@ Carried openly under option B (§6.4), not waived:
   twice, which is a property of the ENUMERATOR and not of the checkpoint
   (W5 fresh review F7). A shape-true fixture for this
   config starts at a 1.5 GiB `embed_tokens` and is not buildable in a test.
+
+- **The GGUF k-quant arm itself, split into four owed slices by W9a
+  ([#2882](https://github.com/mudler/vllm.cpp/issues/2882), §4.19.5).** W9a made
+  the refusal reachable and true and shipped nothing else. **W9b** owes the
+  loader arm, including llama.cpp's `attn_k_b`/`attn_v_b` split against our
+  fused `kv_b_proj`. **W9c** owes the header manifest a `dots3note` file's
+  `HfConfig` would be built from. **W9e** owes the mmproj arm for the vision and
+  audio towers. **W9f** owes the end-to-end run and the `llama-cpp` oracle pin
+  advance off `b10451`, which predates both llama.cpp merges. Owner: this row,
+  W9. Tracked here rather than as four issues, per AGENTS.md's "an issue you do
+  not fix in the same flow has to say who owns it".
 
 ## 9. Stop conditions
 
