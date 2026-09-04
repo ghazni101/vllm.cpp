@@ -44,7 +44,7 @@ inline constexpr int kLtx2SnapSeparatingCases = 9;
 struct Ltx2ClampCase {
     double seconds; double frame_rate; int64_t min_frames; int64_t max_frames;
     int64_t expected; int64_t rejected_snap_first; int64_t rejected_no_repair;
-    int64_t rejected_truncate;
+    int64_t rejected_truncate; int64_t rejected_half_away;
 };
 inline constexpr Ltx2ClampCase kLtx2ClampCases[] = {
     {3.0, 24.0, 24, 480, 65, 65, 65, 65, 65},

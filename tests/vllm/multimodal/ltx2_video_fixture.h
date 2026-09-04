@@ -1485,7 +1485,22 @@ inline void WriteReducedDurationHead(const vllm::Ltx2DitParams& dit, const std::
     for (const int64_t d : spec.shape) numel *= d;
     entries.push_back(Entry{spec.name, "F32", spec.shape, Param(spec.name, numel, 0.2), {}});
   }
-  WriteSafetensors(entries, /*metadata_json=*/"", path);
+  // THE HEAD CARRIES ITS OWN CONFIG, as every shipped LTX-2.5 component does.
+  // `DurationHeadConfigurator.from_metadata` reads the four pooler
+  // hyperparameters out of a `duration_head` sub-dict and the two cross-attention
+  // dims out of `transformer` (model_configurator.py:24-35), so a fixture that
+  // wrote tensors and no config would be loadable only by an engine that ignored
+  // the config -- which is the defect this file exists to catch.
+  nlohmann::json config;
+  config["transformer"]["cross_attention_dim"] = cfg.video_cross_attention_dim;
+  config["transformer"]["audio_cross_attention_dim"] = cfg.audio_cross_attention_dim;
+  config["duration_head"]["pooler_hidden_dim"] = cfg.pooler_hidden_dim;
+  config["duration_head"]["num_queries"] = cfg.num_queries;
+  config["duration_head"]["num_pooler_heads"] = cfg.num_pooler_heads;
+  config["duration_head"]["mlp_hidden"] = cfg.mlp_hidden;
+  nlohmann::json metadata;
+  metadata["config"] = config.dump();
+  WriteSafetensors(entries, metadata.dump(), path);
 }
 
 struct Paths {
@@ -1556,7 +1571,16 @@ inline Paths WriteFixture(const std::string& dir, int64_t prompt_tokens = 4) {
       for (const int64_t d : shape) numel *= d;
       entries.push_back(Entry{spec.name, "F32", shape, Param(spec.name, numel, 0.2), {}});
     }
-    WriteSafetensors(entries, /*metadata_json=*/"", p.duration_head_wrong_shape);
+    nlohmann::json config;
+    config["transformer"]["cross_attention_dim"] = cfg.video_cross_attention_dim;
+    config["transformer"]["audio_cross_attention_dim"] = cfg.audio_cross_attention_dim;
+    config["duration_head"]["pooler_hidden_dim"] = cfg.pooler_hidden_dim;
+    config["duration_head"]["num_queries"] = cfg.num_queries;
+    config["duration_head"]["num_pooler_heads"] = cfg.num_pooler_heads;
+    config["duration_head"]["mlp_hidden"] = cfg.mlp_hidden;
+    nlohmann::json metadata;
+    metadata["config"] = config.dump();
+    WriteSafetensors(entries, metadata.dump(), p.duration_head_wrong_shape);
   }
   WritePromptEmbeds(p.video_embeds, "ltx2.embeds.video", prompt_tokens, dit.cross_attention_dim);
   WritePromptEmbeds(p.audio_embeds, "ltx2.embeds.audio", prompt_tokens,

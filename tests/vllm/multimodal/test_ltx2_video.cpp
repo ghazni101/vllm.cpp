@@ -1223,27 +1223,21 @@ TEST_CASE("ltx2 video: an unknown extra is refused, not ignored") {
 // extra", which is a DIFFERENT and wrong claim — the family defines the key and
 // understands what it means; what is missing is the head. Hence the assertion on
 // the missing piece and the alternative, not only on the key.
-TEST_CASE("ltx2 video: duration_head_path is REFUSED by name, not silently ignored") {
+// ROW LTX25-DURATION-HEAD-WIRE (#2900) TURNED THIS CASE OVER. It used to assert
+// that `duration_head_path` was REFUSED by name, which was the right behaviour
+// while nothing constructed a head: accepting the key would have pointed a
+// caller at a file nobody opened and rendered the recipe default instead. The
+// key now has a reader, so what has to be gated is the opposite -- that the file
+// is OPENED and that its head decides the frame count. That assertion lives in
+// the row's own cases at the end of this file; what remains here is the half
+// they cannot see, which is that the key is no longer refused at all.
+TEST_CASE("ltx2 video: duration_head_path is SERVED, not refused") {
   Workspace ws;
   vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
-  // Any path at all: the point is that NOTHING opens it. Naming a file that does
-  // exist keeps a not-found error from standing in for the refusal.
-  mp.extras["duration_head_path"] = ws.paths.dit;
-  try {
-    (void)vllm::multimodal::LoadVideoEngine(mp);
-    FAIL("duration_head_path is served by no code; accepting it substitutes the recipe default");
-  } catch (const std::exception& e) {
-    const std::string msg = e.what();
-    INFO(msg);
-    CHECK(msg.find("duration_head_path") != std::string::npos);
-    // The MISSING PIECE, which is what separates this from "unknown key".
-    CHECK(msg.find("duration head") != std::string::npos);
-    // And what to use instead, so the refusal is actionable.
-    CHECK(msg.find("num_frames") != std::string::npos);
-    // Not the unknown-key message: that one would say the family does not define
-    // it, and this family does.
-    CHECK(msg.find("unknown load extra") == std::string::npos);
-  }
+  mp.extras["duration_head_path"] = ws.paths.duration_head;
+  std::unique_ptr<vllm::multimodal::VideoEngine> engine;
+  REQUIRE_NOTHROW(engine = vllm::multimodal::LoadVideoEngine(mp));
+  REQUIRE(engine != nullptr);
 }
 
 // The INVENTORY, so the defect above cannot come back as a different key. Every
@@ -1285,6 +1279,11 @@ TEST_CASE("ltx2 video: every accepted load extra is READ by something") {
       // arm by name, the request surface refuses positive rounds without it, and
       // the rounds loop calls it once per round.
       vllm::multimodal::kLtx2TemporalUpsamplerPathExtra,
+      // Row LTX25-DURATION-HEAD-WIRE (#2900): the head itself. Three readers --
+      // the load opens the file and builds the predictor, the top-of-call guard
+      // asks whether one exists, and `resolve_num_frames` runs it -- so it is
+      // SERVED, and `refused` below is empty for the first time.
+      "duration_head_path",
       // Row LTX25-LORA-FUSION (#932): the INDEXED IC-LoRA family, upstream's
       // repeatable `--lora` (utils/args.py:600-611). A pattern rather than a
       // key, which is why it is spelled here exactly as the listing prints it —
@@ -1295,8 +1294,15 @@ TEST_CASE("ltx2 video: every accepted load extra is READ by something") {
       "lora_strength_<n> (n >= 2)",
   };
   // The keys the family defines and does NOT serve. Growing this list is a
-  // deliberate act; growing it silently is the defect #611 records.
-  const std::vector<std::string> refused = {"duration_head_path"};
+  // deliberate act; growing it silently is the defect this case exists to catch.
+  //
+  // IT IS NOW EMPTY, and that is the row LTX25-DURATION-HEAD-WIRE (#2900)
+  // result: `duration_head_path` was the last decorative key, and it has a
+  // reader. An empty vector is deliberately kept rather than deleted along with
+  // the machinery around it -- the next key that arrives without a reader has
+  // somewhere to be recorded, and the sweep below still runs over the real
+  // `kKnownLoadExtras` either way.
+  const std::vector<std::string> refused = {};
 
   // THE HANDLE ON THE REAL ARRAY. The unknown-extra refusal builds its listing
   // from `kKnownLoadExtras` itself, so parsing that listing gates the ACTUAL
@@ -1434,6 +1440,10 @@ TEST_CASE("ltx2 video: the recorded reader anchors are the ones in the source") 
       "kLtx2LoraPathExtra",          "kLtx2LoraStrengthExtra",
       "kLtx2NegativePromptEmbedsExtra", "kLtx2NegativeAudioPromptEmbedsExtra",
       "kLtx2CheckpointClassExtra",
+      // Row LTX25-DURATION-HEAD-WIRE (#2900). The FIFTEENTH, and the one this
+      // list was written to exclude: it moved here the moment `Ltx2VideoEngine::
+      // Load` started opening the file it names.
+      "kLtx2DurationHeadPathExtra",
   };
   std::vector<size_t> derived;
   for (const std::string& token : served_tokens) {
@@ -1477,31 +1487,15 @@ TEST_CASE("ltx2 video: the recorded reader anchors are the ones in the source") 
                                          << "]. Paste the actual list into the READER ANCHORS "
                                             "comment; the spec's §2.1 table is dated and stays.");
 
-  // And the UNSERVED key is touched only by the refusal, never by a reader. This
-  // is the half a "has a reader" sweep cannot express.
-  const size_t refuse_line = UniqueLineWith(lines, "void CheckUnservedExtras(");
-  REQUIRE(refuse_line != 0);
-  size_t refuse_end = 0;
-  for (size_t i = refuse_line; i < lines.size(); ++i) {
-    if (lines[i] == "}") {
-      refuse_end = i + 1;
-      break;
-    }
-  }
-  REQUIRE(refuse_end > refuse_line);
-  size_t duration_hits = 0;
-  for (size_t i = array_end; i < lines.size(); ++i) {
-    if (lines[i].find("kLtx2DurationHeadPathExtra") == std::string::npos) continue;
-    ++duration_hits;
-    const size_t at = i + 1;
-    const bool inside_refusal = (at >= refuse_line) && (at <= refuse_end);
-    CHECK_MESSAGE(inside_refusal,
-                  "ltx2_video.cpp:" << at
-                                    << " touches the duration-head extra OUTSIDE "
-                                       "CheckUnservedExtras; if it now has a real reader, move "
-                                       "it to the served list and drop the refusal (#611)");
-  }
-  CHECK(duration_hits > 0);
+  // THE UNSERVED HALF OF THIS CASE IS GONE, AND SO IS WHAT IT GATED. It used to
+  // assert that `kLtx2DurationHeadPathExtra` was touched ONLY inside
+  // `CheckUnservedExtras` -- the half a "has a reader" sweep cannot express --
+  // and it named the exit condition itself: "if it now has a real reader, move
+  // it to the served list and drop the refusal". Row LTX25-DURATION-HEAD-WIRE
+  // (#2900) did exactly that, `CheckUnservedExtras` no longer exists because the
+  // one key it refused was the only one it ever held, and the token is now in
+  // `served_tokens` above where the derived-anchor check covers it like any
+  // other. Re-adding an unserved key means re-adding this half beside it.
 }
 
 // ─── the config the SHAPES cannot see ───────────────────────────────────────
@@ -13496,6 +13490,10 @@ TEST_CASE("ltx2 video: a loaded duration head DECIDES the frame count") {
   Workspace ws;
   vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
   mp.extras["duration_head_path"] = ws.paths.duration_head;
+  // Phase 0 only, for the reason the first e2e case above gives: the recipe's
+  // second phase needs the latent spatial upsampler and running without one is a
+  // refusal. Nothing about the duration head changes with the phase count.
+  mp.extras[vllm::multimodal::kLtx2MaxPhaseExtra] = "0";
   std::unique_ptr<vllm::multimodal::VideoEngine> engine = vllm::multimodal::LoadVideoEngine(mp);
 
   vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/out");
@@ -13504,18 +13502,31 @@ TEST_CASE("ltx2 video: a loaded duration head DECIDES the frame count") {
   vllm::multimodal::VideoResult res;
   REQUIRE_NOTHROW(res = engine->Generate(gen));
 
-  // The recipe default is what this used to silently become. A predicted count
-  // that happened to equal it would make this case pass for the wrong reason, so
-  // the fixture's head is asserted to disagree with it.
+  // THE TRACE IS WHAT MAKES THIS NON-VACUOUS. A frame count alone cannot say
+  // where it came from -- a recipe could have produced the same integer -- so
+  // the assertion is that the HEAD ran and that the render used what it said.
+  const auto* ltx = dynamic_cast<const vllm::multimodal::Ltx2VideoEngine*>(engine.get());
+  REQUIRE(ltx != nullptr);
+  const vllm::multimodal::Ltx2ConditioningTrace trace = ltx->last_conditioning();
+  INFO("predicted " << trace.duration_seconds << "s -> " << trace.duration_frames
+                    << " frames, rendered " << res.frame_count);
+  CHECK(trace.duration_frames > 0);
+  CHECK(trace.duration_seconds > 0.0);
+  CHECK(res.frame_count == trace.duration_frames);
+  // Every count this path emits sits on the causal temporal grid.
+  CHECK((trace.duration_frames - 1) % 8 == 0);
+
+  // AND IT IS NOT THE RECIPE'S. The same request against an engine with no head
+  // renders the recipe default; a predicted count that happened to equal it would
+  // make everything above pass for the wrong reason.
+  vllm::multimodal::VideoModelParams plain_mp = FixtureParams(ws.paths);
+  plain_mp.extras[vllm::multimodal::kLtx2MaxPhaseExtra] = "0";
+  std::unique_ptr<vllm::multimodal::VideoEngine> plain =
+      vllm::multimodal::LoadVideoEngine(plain_mp);
   vllm::multimodal::VideoGenParams recipe_gen = FixtureGen(ws.root + "/out_recipe");
   recipe_gen.num_frames = 0;
-  std::unique_ptr<vllm::multimodal::VideoEngine> plain =
-      vllm::multimodal::LoadVideoEngine(FixtureParams(ws.paths));
-  vllm::multimodal::VideoResult recipe_res = plain->Generate(recipe_gen);
-  INFO("auto=" << res.frame_count << " recipe=" << recipe_res.frame_count);
+  const vllm::multimodal::VideoResult recipe_res = plain->Generate(recipe_gen);
   CHECK(res.frame_count != recipe_res.frame_count);
-  // Every count this port emits sits on the causal temporal grid.
-  CHECK((res.frame_count - 1) % 8 == 0);
 }
 
 // The request surface, mirrored from `--auto-duration MIN_SECONDS MAX_SECONDS`

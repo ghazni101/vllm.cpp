@@ -250,7 +250,7 @@ def cpp_lines(up) -> list[str]:
     add("struct Ltx2ClampCase {")
     add("    double seconds; double frame_rate; int64_t min_frames; int64_t max_frames;")
     add("    int64_t expected; int64_t rejected_snap_first; int64_t rejected_no_repair;")
-    add("    int64_t rejected_truncate;")
+    add("    int64_t rejected_truncate; int64_t rejected_half_away;")
     add("};")
     add("inline constexpr Ltx2ClampCase kLtx2ClampCases[] = {")
 
