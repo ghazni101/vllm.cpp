@@ -226,6 +226,22 @@ present; it asserts all three and refuses rather than rebuilding silently. Its
 verbatim output is committed beside it as `job.log`, the verdict as
 `strict.txt`, and every token dump as `*.json.txt`.
 
+**The committed `gate.sh` is not byte-identical to the copy that ran, on one
+line, and the difference is deliberate.** The committed line is
+
+```sh
+GGUF_SHA="${GGUF_SHA:?the staged sha256, measured on the devbox, must be passed in}"
+```
+
+and the copy that ran carried the measured digest sealed into it by the
+submitting script, which refused to submit at all until it had verified the
+staged bytes itself. The committed form **fails closed** for the next reader:
+re-running it without `GGUF_SHA` set stops rather than scoring an unverified
+artifact. `gen_vehicle.py`, `score_strict.py` and `prompts.txt` are byte-identical
+to the copies that ran, verified by `diff` against
+`/mnt/nas_share/rc/limb3-2884/`. Set `GGUF_SHA` to the digest in the table above
+to reproduce the run exactly.
+
 **The token dumps carry a `.json.txt` suffix rather than `.json` deliberately.**
 `scripts/check-pr-size.py`'s `BENCH_EVIDENCE_RUN` admits
 `txt|log|gz|sh|cu|py|jsonl|rc` inside a per-run directory and not `json`; a
