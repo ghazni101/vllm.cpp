@@ -55,8 +55,12 @@ THREE THINGS IT DOES THAT THE INLINE ONE DID NOT.
    `rel(sumabs)` spans 18.3x p05..p95 and 2078x end to end, while the true
    divergence spans 1.03x. Two readings OF THE SAME true divergence differ by a
    median 2.1x, by 4.0x at p75, 8.9x at p90 and 18.2x at p95. So a ratio between
-   two `rel(sumabs)` numbers is worth what that table says and no more: 1.8x, 2.0x
-   and 3.2x are the 59th, 52nd and 33rd percentile of NO CHANGE AT ALL. This
+   two `rel(sumabs)` numbers is worth what that table says and no more: NO CHANGE
+   AT ALL produces a ratio at least as large as 1.8x, 2.0x and 3.2x in 58.7%,
+   52.2% and 32.8% of draws. This file first called those "the 59th, 52nd and
+   33rd percentile", which states the complement and inverts the ranking: 3.2x
+   sits at the 67th percentile of no change, not the 33rd -- it is the LEAST
+   ordinary of the three, and still an ordinary reading. This
    models the perturbation as i.i.d. zero-mean against a Gaussian signal, which is
    the premise under which the metric is being used; it bounds the metric's
    resolution and is not a significance test on the real tensors.

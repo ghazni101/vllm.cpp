@@ -5,7 +5,7 @@ Wave ARMTOKENS of [`KERNEL-GDN-CHUNKED-MIRROR`](../../.agents/specs/gdn-chunked-
 [#2612](https://github.com/mudler/vllm.cpp/issues/2612).
 
 **The one-line result. Neither sequence moved, and they still agree on five of
-eight — while the layer-0 divergence between them fell 20x.**
+eight. No instrument on this row has yet observed a step where they disagree.**
 
 | arm | token ids | agrees with CPU |
 |---|---|---|
@@ -20,12 +20,35 @@ falsified, and this file is what corrects it.
 
 **That is not because the new arm is inert.** The chunked CPU arm runs, and §5
 measures it: `VT_GDN_CHUNKED` moves decoder layer 0's Gated DeltaNet block output
-by `3.702e-04` on the same binary, and it moves the CPU arm to within
-`1.772e-05` of CUDA where the sequential arm sat `3.525e-04` away — a **19.9x**
-reduction in the divergence #2547 opened. The ids did not follow it, in either
+by `3.702e-04` on the same binary. The ids did not follow it, in either
 direction. This is exactly what the spec's `## Scope` says to expect: agreement
 between two of our arms is an argmax over near-ties and is not a monotone
 function of the distance between them.
+
+**EVERY RATIO IN THIS FILE IS WITHDRAWN — READ §5's ANNOTATIONS BEFORE QUOTING
+ONE** ([#2877](https://github.com/mudler/vllm.cpp/issues/2877)). This paragraph
+first went on to say that the port "moves the CPU arm to within `1.772e-05` of
+CUDA where the sequential arm sat `3.525e-04` away — a **19.9x** reduction in the
+divergence #2547 opened". The sentence is quoted rather than deleted so a later
+reader sees the shape of the error. Two reasons, in the order that matters.
+
+**First, and it survives everything below.** `LayerFp` returns early on
+`s.step >= s.budget`
+(`src/vllm/model_executor/models/qwen4_exp_forward.cpp:118`), so
+`VT_Q4EXP_LAYER_FP=3` fingerprints model forwards **0, 1 and 2** — tokens
+`11751 13 15767`, **which the two arms AGREE on**. The three ids that disagree
+are emitted at forwards **4, 6 and 7**, outside the window. **No instrument on
+this row has yet observed a single disagreeing step.** Every tap in §5 measures
+three forwards on which both arms produce the same token.
+
+**Second, that ratio changes algorithm on one side, and the metric behind it
+cannot rank even the pairs it did observe.** `rel(sumabs)` is a difference of
+NORMS, not a norm of DIFFERENCES. Read as algorithm-**matched** CPU-vs-CUDA
+pairs, the same three measurements say `L00 blk` moved **16.7x FURTHER**; over
+400 seeds of a committed control those two ratios sit at **4.6%** and **5.4%** of
+what no change at all produces. "The residue grew" and "the residue did not grow"
+are equally unsupported, and so is a 19.9x or a 16.7x at the block. §5's two
+ANNOTATION blocks carry both framings in full.
 
 **Nothing here is a token gate, and nothing here is a speed.** No oracle decoded
 this prompt. Each arm is n=1.
@@ -145,9 +168,19 @@ the arm — `--verbose` prints request stages, and neither branch of
 `main`; it reads bytes a kernel already wrote and writes nothing back. Three arms
 on **the same binary by digest**, with `VT_CPU_QUANT_REPACK=0` held on all three
 so `VT_GDN_CHUNKED` is the only difference between the first two. Each printed
-**1314** fingerprint lines and `taps=437` per step on all three steps — the same
-counted property PREFILLDIV read, asserted so that an arm printing nothing and an
-arm whose taps agree cannot look alike.
+**1314** fingerprint lines and closed its three steps at `taps=437`, `taps=874`
+and `taps=1311` — the same counted property PREFILLDIV read, asserted so that an
+arm printing nothing and an arm whose taps agree cannot look alike.
+
+**That counter is CUMULATIVE, and this line first read it as a per-step count**
+([#2877](https://github.com/mudler/vllm.cpp/issues/2877)). `LayerFp` does
+`++s.taps` on one running total that `LayerFpEndStep` never resets
+(`qwen4_exp_forward.cpp:153`), so a 437-tap forward run for three steps prints
+`437`, `874`, `1311` — which is what the committed `run2-results.txt` reads on
+all three arms, not "`taps=437` per step on all three steps" as this file
+originally said. The same misreading made `scripts/q4exp-layerfp-diff.py` refuse
+every genuine multi-step fingerprint; `CumulativeTapCounter` in
+`tests/scripts/test_q4exp_layerfp_diff.py` now pins the cumulative form.
 
 Step 0, `rel = |a-b| / max(|a|,|b|)` on `sum|x|`:
 
@@ -334,6 +367,20 @@ CPU arms, 2.320338e-02 between CPU and CUDA.
 > `rel(sumabs)` is being read here; it bounds the METRIC's resolution and is not a
 > significance test on the real tensors.
 >
+> **AND THAT PREMISE IS THE LOAD-BEARING ONE. THE FRESH RE-REVIEW OF THIS
+> ANNOTATION FOUND THE BOUND IS MODEL-DEPENDENT.** Held at the same sigma, the
+> pair p95 falls from **35.3x** under an i.i.d. dense zero-mean perturbation to
+> **17.1x** under a multiplicative one proportional to `|a|` (rounding-like), and
+> to **5.3x** under a SPARSE one concentrated in 16 large entries (like a top-k
+> flip); `P(no change >= 19.9x)` falls **7.6% -> 4.1% -> 1.3%** with it. Under a
+> sparse structured perturbation the metric ranks fine, and 19.9x WOULD be a real
+> signal. **That case is not hypothetical here:** #2552, cited below, names a
+> dense reassociation term AND a bimodal top-k term at a 32.9% exact-bf16-tie
+> rate, and a top-k flip is exactly the sparse case. This does not restore the
+> ratio — which perturbation the real tensors carry is **unmeasured**, which is
+> why the reading is withdrawn rather than reversed — but it names the assumption
+> the next measurement has to establish.
+>
 > **2. ONE FRAMING, APPLIED TO EVERY TAP.** The first version of this annotation
 > disqualified the MoE reading for mixing arms and then left the *favourable* half
 > of the same three measurements standing. That is not admissible: `3.525e-04` and
@@ -433,20 +480,27 @@ CPU arms, 2.320338e-02 between CPU and CUDA.
   cross-chunk state carry — the half of the algorithm the spec's `## Owed`
   already flags as unmeasured against a real oracle — is not exercised here, and
   it is the half the bf16 state snapshot lives in.
-- **The MoE residue is named, not diagnosed.** §5 shows it is now dominant. It
-  does not say what it is. That is PREFILLDIV's open item and stays open.
+- **The MoE residue is named, not diagnosed.** §5 first read it as "now
+  dominant"; the annotation there withdraws that, because the metric the reading
+  rests on cannot rank these taps in either direction. What the residue IS was
+  named by [#2552](https://github.com/mudler/vllm.cpp/issues/2552) and is not
+  diagnosed here. That is PREFILLDIV's open item and stays open.
 - **The recorded explanation for the 5-of-8 is confirmed, not revisited.** It is
   tempting to read unchanged ids as "the divergence attributed to the algorithm
-  difference did not move when the algorithms were unified". The premise is false
-  here: it moved 19.9x at the block. What did not move is the argmax.
+  difference did not move when the algorithms were unified". The premise is not
+  established here: §5's annotations withdraw every ratio at the block, in both
+  directions. What is measured is that the block output DID move — `3.702e-04`
+  between the two CPU arms on the same binary, from a bit-identical input — and
+  that the argmax did not.
   `.agents/specs/qwen4-exp-flash-next.md` already states the general form — token
   agreement between our two arms "is not monotone in the distance between them,
   because the decode is an argmax over near-ties", and a CPU-vs-CUDA
   token-exactness gate "is not well posed for this architecture at this
   precision". This run is a second, independent instance of exactly that, now in
   the direction that spec had not observed: PREFILLDIV saw a 332x *closer* arm
-  agree on *fewer* ids; ARMTOKENS sees a 20x closer arm agree on the *same* ids.
-  Neither direction is monotone, which is the claim.
+  agree on *fewer* ids; ARMTOKENS sees an arm whose layer-0 block output
+  demonstrably moved agree on the *same* ids. Neither direction is monotone,
+  which is the claim, and it does not need a ratio this file can defend.
 - **Nothing is claimed about the other six published quants**, about
   `num_reqs > 1` (refused by name), or about ROCm, Vulkan and Tenstorrent — two
   of which still have no chunked arm.

@@ -4205,7 +4205,8 @@ DIFFERENCES, and its under-report is a DISTRIBUTION rather than the `~122x` sing
 seed draw this line first quoted: over 400 seeds at `n = 12800` the median is
 69.2x (sigma 1e-3) to 125.6x (sigma 1e-4), p05..p95 31..1264, and at a **fixed**
 true divergence two readings differ by a median **2.1x** and **18.2x** at p95 —
-where the earlier `4.64x` was six seeds. **(c) One framing, applied to every
+where the `4.64x` span quoted by this annotation's own first version
+(`c51c484db`) was six seeds. **(c) One framing, applied to every
 tap.** `3.525e-04` and `1.269e-04` are the same PREFILLDIV column, so a comparison
 that is mismatched for the MoE row is mismatched for the block row. Read as
 algorithm-**matched** CPU-vs-CUDA pairs, `L00 blk` moved **16.7x FURTHER**
@@ -4213,8 +4214,11 @@ algorithm-**matched** CPU-vs-CUDA pairs, `L00 blk` moved **16.7x FURTHER**
 `3.525e-04` -> `1.772e-05` as a 19.9x improvement, and every other layer-0 tap
 moved further too (`s.attn` 1.71x, `mhc.mix` 2.02x, `moe` 3.15x, `s.mlp` 2.34x,
 `out` 2.29x; `mhc.inj` alone to exactly zero). Against (b), 19.9x and 16.7x sit at
-4.6% and 5.4% of the metric's own no-change distribution and 1.80x through 3.15x
-sit between its 33rd and 59th percentile, so **nothing here is ranked, in either
+4.6% and 5.4% of the metric's own no-change distribution, and no change at all
+produces 1.80x through 3.15x in **33% to 59%** of draws — this line first called
+that "between its 33rd and 59th percentile", which states the complement and
+inverts the ranking: 3.15x sits at the **67th** percentile of no change, not the
+33rd. So **nothing here is ranked, in either
 direction**. The direction (c) reports is what the chunked decomposition's larger
 reassociation freedom predicts — it lands `2.29e-04` from the exact answer where
 sequential lands `1.15e-08` — and it is not a defect. The residue's mechanism was

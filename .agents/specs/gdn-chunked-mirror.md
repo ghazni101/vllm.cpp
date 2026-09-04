@@ -1009,7 +1009,8 @@ Not done, and each is a gate rather than a nicety:
   DISTRIBUTION rather than the `~122x` single seed draw this line first quoted: at
   `n = 12800` over 400 seeds the median is 69x (sigma 1e-3) to 126x (sigma 1e-4),
   p05..p95 31..1264, and at a **fixed** true divergence two readings differ by a
-  median **2.1x** and **18.2x** at p95 — 400 seeds, not the six that read 4.64x.
+  median **2.1x** and **18.2x** at p95 — 400 seeds, not the six this annotation's
+  own first version (`c51c484db`) read `4.64x` from.
   (c) **One framing, applied to every tap.** `3.525e-04` and `1.269e-04` are the
   same PREFILLDIV column, so a comparison that is mismatched for the MoE row is
   mismatched for the block row. Read as algorithm-**matched** CPU-vs-CUDA pairs,
@@ -1020,8 +1021,11 @@ Not done, and each is a gate rather than a nicety:
   chunked decomposition's larger reassociation freedom predicts — it lands
   `2.29e-04` from the exact answer where sequential lands `1.15e-08` — and it is
   not a defect. Against (b): 19.9x and 16.7x sit at 4.6% and 5.4% of the metric's
-  own no-change distribution, and 1.80x, 2.02x, 2.34x and 3.15x sit between its
-  33rd and 59th percentile. **Nothing here is ranked, in either direction.** The
+  own no-change distribution, and no change at all produces 1.80x, 2.02x, 2.34x
+  and 3.15x in **33% to 59%** of draws — this line first called that "between its
+  33rd and 59th percentile", which states the complement and inverts the ranking:
+  3.15x sits at the **67th** percentile of no change, not the 33rd.
+  **Nothing here is ranked, in either direction.** The
   residue's mechanism was already named by
   [#2552](https://github.com/mudler/vllm.cpp/issues/2552) — the keep-quant grouped
   expert GEMM's reassociation plus a bimodal top-k term at a 32.9% exact-tie rate,
