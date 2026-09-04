@@ -2429,6 +2429,95 @@ void Exl3GemmKernelCuda(Queue& q, Tensor& c, const Tensor& a, const Tensor& trel
   Check(cudaGetLastError(), "exl3_gemm launch");
 }
 
+// THE INSTANTIATED FUSED-MoE ARMS, which are NOT the GEMM's arms above.
+//
+// Upstream's table is `exl3_moe_kernel_instances[]` (`exl3_moe.cu:22-33`),
+// indexed at `:226` as `[4 * K + 2 * cb_idx + N_off]` with K in 0..8, cb_idx in
+// {0, 1} and N_off in {0, 1}. TWO of upstream's own bounds are load-bearing here
+// and the old refusal message stated neither:
+//
+//   CODEBOOK 0 IS NOT A MoE ARM UPSTREAM EITHER. `exl3_moe.cu:184` is
+//   `TORCH_CHECK(gate_mcg != gate_mul1, "MoE kernel: Only mcg and mul1 codebooks
+//   are supported")` and `:185` derives `cb_idx = gate_mul1 ? 1 : 0`. A 3INST
+//   checkpoint is refused before the table is indexed. So the MoE's reachable
+//   codebook set is at most {1, 2} -- it is NOT the GEMM's {0, 1, 2}, and a
+//   message implying otherwise is wrong about upstream rather than merely terse.
+//
+//   K == 0 IS UPSTREAM'S RUNTIME-WIDTH INSTANCE, for a tower whose gate/up/down
+//   widths differ (`exl3_moe_kernel.cuh:139-149`). This port takes K_gate, K_up
+//   and K_down as kernel arguments and discards them (`(void)K;` in
+//   `exl3_moe_kernel`'s `gemm_band`), so it serves only Kg == Ku == Kd. That is
+//   owed separately from the width set. NOTHING ELSE CATCHES IT: the only width
+//   check above this one is `deepseek_v4.cpp`'s, and it compares each projection
+//   ACROSS EXPERTS (`xe.w1.bits == e0.w1.bits` and its two siblings) rather than
+//   the three projections against each other, so a tower whose gate and down
+//   widths differ passes it. The launcher refuses that below.
+//
+// WIDTHS 3..6 AND CODEBOOK 1, and each half of that has its own reason.
+//
+// The WIDTHS are four and not eight because `dq_dispatch` above static_asserts
+// `bits == 3 || 4 || 5 || 6`, and that bound is arithmetic: the eight-window span
+// `16 + bits*7` leaves the 64-bit funnel once the start shift is added at bits 5.
+// Widths 1, 2, 7 and 8 are a DECODER question this file's GEMM shares, not a MoE
+// question, and widening them is not this arm's slice.
+//
+// The CODEBOOK is one and not two because a cb-2 MoE kernel would be DEAD CODE.
+// `vt::Exl3MoeMlp` has two production callers, both in `Exl3FusedMoePass`
+// (`deepseek_v4.cpp`), and FIVE sites pin the codebook to 1 before the kernel is
+// ever chosen: the loader refuses any marker but `mcg`, three separate
+// `args.codebook = 1` assignments, and `ops.cpp`'s own
+// `VT_CHECK(args.codebook == 1, ...)` in the SHARED seam -- which refuses for
+// every backend, the CPU reference included. Widening here alone would
+// instantiate a kernel nothing can reach.
+// QUANT-EXL3-MUL1 slice G records it as owed, as a LOADER slice that ends in a
+// kernel (#2756).
+//
+// THE WIDTHS, BY CONTRAST, ARE REACHABLE TODAY AND REFUSED. `deepseek_v4.cpp`
+// reads the bit width per projection off the checkpoint (`e0.w1.bits` and its
+// siblings) and assigns it into `Exl3MoeArgs` unchanged; nothing between the
+// loader and this launcher clamps it. Before this arm set, an expert tower
+// quantized at 4, 5 or 6 bits reached here with that width and was REFUSED, with
+// no second path: `MoeBlock` calls `Exl3FusedMoePass` unguarded so the exception
+// leaves the forward, this arm is default-ON, and the `VT_DSV4_EXL3_FUSED_MOE=0`
+// rollback lands on `Exl3ArmInstantiated`, which has no `(4, 1)`, `(5, 1)` or
+// `(6, 1)` either. Such a tower could not run on a CUDA queue by ANY path.
+//
+// SHARED MEMORY ADMITS EVERY ONE OF THEM, and the guard is the one already in
+// `exl3_gemm_kernel_inner` rather than a new check. At the MoE shape
+// (TILESIZE_M 16, TILESIZE_K 32, SH_STAGES 3) its `static_assert` resolves to
+// `kSmemMax >= 3*(2*512 + 2*512*bits) + 4*4096` for MOE_TILESIZE_N 256, which is
+// 28672 bytes at bits 3 and 37888 at bits 6 against a kSmemMax of 92160; the 128
+// form is smaller. A width that did not fit would fail to COMPILE there rather
+// than mis-stage silently.
+constexpr bool Exl3MoeArmInstantiated(int bits, int cb) {
+  return cb == 1 && (bits == 3 || bits == 4 || bits == 5 || bits == 6);
+}
+
+// Upstream's `[4 * K + 2 * cb_idx + N_off]` lookup, written as a switch because
+// this table is sparse where upstream's is dense. A pair the predicate admits
+// and this returns `nullptr` for is a BUG rather than a refusal, and the caller
+// treats it as one: the two can never disagree silently.
+template <int MOE_TILESIZE_N>
+const void* MoeKernelN(int bits, int cb) {
+  if (cb != 1) return nullptr;
+  switch (bits) {
+    case 3:
+      return reinterpret_cast<const void*>(&exl3_moe_kernel<3, MOE_TILESIZE_N, 1>);
+    case 4:
+      return reinterpret_cast<const void*>(&exl3_moe_kernel<4, MOE_TILESIZE_N, 1>);
+    case 5:
+      return reinterpret_cast<const void*>(&exl3_moe_kernel<5, MOE_TILESIZE_N, 1>);
+    case 6:
+      return reinterpret_cast<const void*>(&exl3_moe_kernel<6, MOE_TILESIZE_N, 1>);
+    default:
+      return nullptr;
+  }
+}
+
+const void* MoeKernel(int bits, int cb, bool n256) {
+  return n256 ? MoeKernelN<256>(bits, cb) : MoeKernelN<128>(bits, cb);
+}
+
 // ── the fused MoE launcher (exl3_moe.cu:99-301) ──────────────────────────────
 //
 // Every validation upstream performs lives in `src/vt/ops.cpp`, shared with the
@@ -2437,21 +2526,34 @@ void Exl3GemmKernelCuda(Queue& q, Tensor& c, const Tensor& a, const Tensor& trel
 void Exl3MoeMlpKernelCuda(Queue& q, Tensor& output_state, const Tensor& hidden_state,
                           const Exl3MoeExpertTables& tables, const Exl3MoeRouting& routing,
                           const Exl3MoeTemps& temps, const Exl3MoeArgs& args) {
-  // The FUSED MoE arm stays at (3, mcg): it exists for the DeepSeek-V4 artifact
-  // and no stock EXL3 MoE checkpoint has reached this tree yet. It is a
-  // narrower set than the GEMM/GEMV arms above ON PURPOSE, and the refusal says
-  // which pair it wanted (QUANT-EXL3, #2181).
-  constexpr int kMoeBits = 3;
-  constexpr int kMoeCb = 1;
-  if (args.bits_gate != kMoeBits || args.bits_up != kMoeBits ||
-      args.bits_down != kMoeBits || args.codebook != kMoeCb) {
+  // `exl3_moe.cu:188-189` -- upstream is `int K = 0;` then
+  // `if (K_gate == K_up && K_up == K_down) K = K_gate;`. A tower whose widths
+  // disagree therefore leaves K at 0 and takes the runtime-width instance,
+  // whose per-band `switch (K)` is `exl3_moe_kernel.cuh:139-149`. This port does
+  // not carry that instance, so a disagreeing tower refuses here rather than
+  // decoding one band with another's width.
+  if (args.bits_gate != args.bits_up || args.bits_up != args.bits_down) {
     throw std::runtime_error(
-        "vt cuda exl3: exl3_moe has CUDA instantiations for bits == 3, codebook == 1 (mcg) "
-        "only; got bits (" +
+        "vt cuda exl3: exl3_moe carries ONE width for all three projections; got bits (" +
         std::to_string(args.bits_gate) + ", " + std::to_string(args.bits_up) + ", " +
-        std::to_string(args.bits_down) + ") codebook " + std::to_string(args.codebook) +
-        ". MODEL-DSV4-EXL3 W2 records the other widths as owed; the CPU arm decodes every "
-        "width and can serve them on a CPU queue.");
+        std::to_string(args.bits_down) +
+        "). Upstream's K == 0 instance switches the width at RUN TIME "
+        "(exl3_moe_kernel.cuh:139-149) and is NOT ported; QUANT-EXL3-MUL1 slice G records it "
+        "as owed (#2756). The CPU arm carries a width per projection and serves this on a "
+        "CPU queue.");
+  }
+  if (!Exl3MoeArmInstantiated(args.bits_gate, args.codebook)) {
+    throw std::runtime_error(
+        "vt cuda exl3: exl3_moe is instantiated for bits in {3, 4, 5, 6} at codebook 1 (mcg); "
+        "got bits " +
+        std::to_string(args.bits_gate) + " codebook " + std::to_string(args.codebook) +
+        ". Widths 1, 2, 7 and 8 have no device decode route at all -- `dq_dispatch` "
+        "static_asserts 3..6 for the GEMM too. Codebook 2 (mul1) is an upstream MoE arm "
+        "(exl3_moe.cu:184-185 admits mcg and mul1, and refuses 3INST) that this tree cannot "
+        "REACH: the loader accepts only an `mcg` marker and three call sites pin "
+        "`args.codebook` to 1, so the kernel would be dead code; QUANT-EXL3-MUL1 slice G "
+        "records it as owed (#2756). The CPU arm decodes every width over all three "
+        "codebooks and can serve them on a CPU queue.");
   }
   // NOT const: cudaLaunchCooperativeKernel takes `void**`, so every argument has
   // to be a modifiable lvalue whose address can be taken as `void*`.
@@ -2490,11 +2592,16 @@ void Exl3MoeMlpKernelCuda(Queue& q, Tensor& output_state, const Tensor& hidden_s
 
   // exl3_moe.cu:224-226. The N tile is 256 when both dims allow it.
   const bool n256 = (hidden_dim % 256 == 0) && (intermediate_dim % 256 == 0);
-  const void* kernel =
-      n256 ? reinterpret_cast<const void*>(
-                 &exl3_moe_kernel<kMoeBits, 256, kMoeCb>)
-           : reinterpret_cast<const void*>(
-                 &exl3_moe_kernel<kMoeBits, 128, kMoeCb>);
+  const void* kernel = MoeKernel(args.bits_gate, args.codebook, n256);
+  // A pair `Exl3MoeArmInstantiated` admitted and `MoeKernel` has no entry for is
+  // the two tables disagreeing. That is a defect in this file, not a refusal of
+  // the caller, and it must not reach `cudaLaunchCooperativeKernel` as a null.
+  if (kernel == nullptr)
+    throw std::runtime_error(
+        "vt cuda exl3: exl3_moe arm (bits " + std::to_string(args.bits_gate) + ", codebook " +
+        std::to_string(args.codebook) +
+        ") passed Exl3MoeArmInstantiated but MoeKernel has no entry for it. The two tables "
+        "disagree; this is a bug in cuda_exl3.cu, not a property of the call.");
   EnsureSmemOptIn(device, kernel);
 
   const half* hid = hidden_state.Ptr<half>();
