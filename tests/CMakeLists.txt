@@ -2503,6 +2503,18 @@ if(TARGET vllm-bench OR VLLM_CPP_BUILD_EXAMPLES)
   target_compile_definitions(test_bench_kv_cache_dtype
     PRIVATE VLLM_BENCH_BINARY="$<TARGET_FILE:vllm-bench>")
 endif()
+# #2759: `--ignore-eos` / `--skip-chat-template` / `--chat-template` on
+# `vllm-bench`. Same shape and the same reason as the row above -- it runs the
+# BINARY, because `test_bench` drives `RunBench` from a hand-built `BenchConfig`
+# and stayed green on every day these flags did not exist. Registered
+# UNCONDITIONALLY so that with examples off the suite exits 77 and CTest reports
+# the gate's absence instead of hiding it behind an option.
+vllm_cpp_add_test(test_bench_eos_chat_template
+  examples/test_bench_eos_chat_template.cpp)
+if(TARGET vllm-bench OR VLLM_CPP_BUILD_EXAMPLES)
+  target_compile_definitions(test_bench_eos_chat_template
+    PRIVATE VLLM_BENCH_BINARY="$<TARGET_FILE:vllm-bench>")
+endif()
 
 # C ABI (M3.5 Task 1): the C++ test drives the public C API over a synthetic
 # engine via the internal MakeEngineHandle hook (reached under src/).
