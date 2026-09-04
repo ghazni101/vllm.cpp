@@ -10,13 +10,23 @@ Refs: [#2864](https://github.com/mudler/vllm.cpp/issues/2864),
 
 ## 0. Now
 
-Filled in by §12 when the gate has run. Until then this spec is the design and
-the pin, and no row changes lifecycle state. `STRIX_ARM_SPEED_RATIFIED_BY`
+**The gate has run and the answer is `STRICT_LIMB3 = NO`. Limb 3 is NOT
+satisfied.** The vehicle was found, pinned, fetched, verified and driven, and
+it meets all six conditions #2864 pre-registered; the gate still cannot be
+scored, because **the pinned vLLM is not deterministic on it**. Its eager and
+compiled configurations each reproduce themselves exactly and disagree with
+each other on 2 of 6 prompts. §3.4 named that in advance as a stop condition
+and §7 declared it a result rather than a failure of this spec.
+
+The row stays `PARTIAL` and no matrix row moves. `STRIX_ARM_SPEED_RATIFIED_BY`
 stays unset and
 [`../scripts/rocm-strix-ourarm-staged.sh`](../scripts/rocm-strix-ourarm-staged.sh)
-stays refusing whatever this gate returns, because limb 2's denominator
-question is [#2534](https://github.com/mudler/vllm.cpp/issues/2534)'s and not
-this spec's.
+stays refusing, because limb 2's denominator question is
+[#2534](https://github.com/mudler/vllm.cpp/issues/2534)'s and not this spec's.
+Evidence: [`../../docs/bench-evidence/limb3-vehicle-pin-20260904.md`](../../docs/bench-evidence/limb3-vehicle-pin-20260904.md)
+for the pin and
+[`../../docs/bench-evidence/limb3-strict-gate-20260904.md`](../../docs/bench-evidence/limb3-strict-gate-20260904.md)
+for the gate.
 
 ## 1. Scope
 
@@ -201,4 +211,76 @@ Run by name on this head, each exit code read from the process:
 
 ## 8. Owed
 
-Nothing yet.
+- **A SEVENTH condition on any future limb-3 vehicle, this time on the ORACLE
+  rather than on the artifact.** #2864's six conditions all held here and limb 3
+  still could not be scored, so they are necessary and not sufficient. The
+  missing one is: *the pinned vLLM must be self-consistent on the vehicle -- its
+  eager and compiled configurations must produce identical tokens, and each must
+  reproduce its own one-pass prefill argmax.* It cannot be read from a header,
+  it costs one lease, and it must be measured before a candidate is scored
+  because it can veto a vehicle every cheap check admits. Owned by this row and
+  tracked under [#2884](https://github.com/mudler/vllm.cpp/issues/2884).
+
+- **Whether the divergences are exact ties is NOT ESTABLISHED**, and it is
+  cheap to settle. `gen_vehicle.py` requests `prompt_logprobs=1`, so only the
+  winning entry's logprob was captured and no runner-up margin exists. Raising
+  it to 2 answers it in one lease. Owned by this row.
+
+- **Whether the pinned vLLM can be made self-consistent on `gfx1151` at all**
+  is now the question limb 3 turns on. #2740 measured the same 2-of-6
+  self-inconsistency on the arm's own artifact, so it is a property of this
+  build on this board rather than of any one checkpoint, and no vehicle search
+  can route around it. It is larger than this row and belongs to
+  [#2534](https://github.com/mudler/vllm.cpp/issues/2534)'s owner to schedule.
+
+## Outcome
+
+**What was measured.** One `rc` job on `strix:gpu0`
+(`0d0e57c3-eaad-4b1a-9d13-3cc586814d0c`, worker `rc-worker-lcjhd`,
+2026-09-04T07:50Z to 08:36Z), nothing by `ssh`, `HSA_OVERRIDE_GFX_VERSION`
+unset and no inherited `HSA_*`/`ROCR_*`/`PYTORCH_*`/`HIP_*`/`VT_*`. Six
+pre-registered prompts, `prompts_sha256`
+`c8a5080046c3206a1186b42a320a21e887691eff43d2116364192f58e5776c7e`, 48 tokens
+each, 288 free-running greedy steps, not teacher-forced.
+
+| | |
+|---|---|
+| `EAGER1_EQ_EAGER2` | True |
+| `COMPILED1_EQ_COMPILED2` | True |
+| `EAGER1_EQ_COMPILED1` | **False, 2 of 6** |
+| prefill argmax reproduces own decode | **False**, eager 3 steps, compiled 2 |
+| ours vs vLLM eager | 3/6 token-exact |
+| ours vs vLLM compiled | 3/6 token-exact |
+| **verdict** | **`STRICT_LIMB3 = NO`** |
+
+**What was rejected, and why.** Scoring against whichever oracle configuration
+agrees with us was rejected, and it was rejected in `score_strict.py` rather
+than in prose: the script evaluates the oracle's self-consistency first and
+short-circuits the verdict on it, so a later reader cannot step around it. The
+temptation was real and is visible in the data -- our token matches *compiled*
+at prompt 1 step 8 and *eager* at prompt 3 step 41, so either half could have
+been written up as a better result than the other.
+
+**Why each default has its value.** The vehicle is `Qwen3.6-27B` rather than
+`Qwen3.5-27B` because the histogram decided it, not the name: both files carry
+the `Q4_K_M` label and the Qwen3.5 one routes 96 tensors through `Q8_0`, a
+different kernel from the three k-quant kernels limb 3 exists to exercise. The
+pin is a revision rather than a repo id because #2497 was bitten by bytes moving
+in place under an unchanged name. The prompts are the campaign's existing six
+rather than a fresh set, because a set chosen after seeing which prompts agree
+is not a denominator. Both sides' binaries are reused from the unrebooted
+worker's `/tmp` and asserted by sha256 against digests a different run committed,
+so a rebuild fails the assertion instead of passing silently.
+
+**The most useful thing this run produced is not the verdict.** It is the
+prefill-argmax check in §3.4 condition 4, which no earlier run in this campaign
+had taken. It shows the oracle disagreeing with itself *inside one
+configuration*: at prompt 3 step 41 eager's decode emits `23185`, eager's own
+prefill emits `16134`, and `16134` is what compiled's decode emits. The
+disagreement is not between two engines. That reframes limb 3's blocker from
+"find a better vehicle" to "the denominator on this board is not self-consistent
+yet", which is what §8 now carries.
+
+**The shortfall §4 declared is unchanged and unresolved.** `Qwen3.6-27B` is not
+BIGGER than the arm; no dense `qwen35` checkpoint larger than 27B is published.
+That question never became live, because the run stopped on determinism first.
