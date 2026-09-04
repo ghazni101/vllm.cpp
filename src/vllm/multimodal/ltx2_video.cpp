@@ -475,7 +475,7 @@ constexpr char kLtx2DurationHeadPathExtra[] = "duration_head_path";
 // they are no longer trusted: the list below is derived from this file on every
 // run and compared, and the failure prints the replacement to paste in.
 // READER ANCHORS (derived and gated by test_ltx2_video):
-// 637 639 1271 1367 1463 1479 1614 1618 1776 1859 1977 2019 2061 2063
+// 647 649 1281 1377 1473 1489 1624 1628 1786 1869 1987 2029 2071 2073
 
 const char* const kKnownLoadExtras[] = {
     kLtx2AudioPromptEmbedsExtra, kLtx2PipelineKindExtra,   kLtx2ModelVersionExtra,
@@ -518,9 +518,19 @@ uint64_t DigestF32(const std::vector<float>& values) {
 // THE VALUES IT GETS ARE bf16-ROUNDED, AND THAT IS UPSTREAM'S ANSWER RATHER THAN
 // A LOSS THIS INTRODUCES: upstream constructs the upsampler in the SAME one
 // pipeline dtype (`VideoUpsampler`, distilled.py:138-141), so its own statistics
-// are bf16 there too. What is still divergent is the upsampler's arithmetic
-// around them, which stays f32 and is named under `## Owed` in
-// .agents/specs/ltx25-a24-video-vae-bf16.md.
+// are bf16 there too. THIS BLOCK USED TO ADD THAT THE UPSAMPLER'S ARITHMETIC
+// AROUND THEM STAYS f32 AND IS OWED, AND A24 WAVE 5 FALSIFIED THAT (#2857,
+// #2919): `Load` asks both upsampler checkpoints for `kBF16` at `:1797` and
+// `:1849`, and `ltx2_upsampler.h:109-119` records the two arms. The debt that
+// sentence pointed at is discharged, and the `## Owed` bullet it named no longer
+// lists the upsampler.
+//
+// WHAT THIS FUNCTION DOES STILL STRADDLE is the VIDEO VAE's own two arms
+// (#2853). It follows that bag, so a CPU render hands the upsampler statistics
+// that were rounded to the bf16 grid and a DEVICE render hands it statistics
+// that were not. On the pinned checkpoint the two agree word for word, because
+// all 86 decoder tensors are BF16 and both arms widen the same words; the
+// divergence becomes live on an F32-storage video VAE checkpoint.
 std::vector<float> VaeStatsAsF32(const Ltx2VaeWeights& weights, const std::string& name) {
   if (weights.dtype != vt::DType::kBF16) return weights.Get(name);
   const std::vector<uint16_t>& raw = weights.GetBf16(name);

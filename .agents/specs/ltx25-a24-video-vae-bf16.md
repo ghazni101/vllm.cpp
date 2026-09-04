@@ -656,7 +656,7 @@ this repair buys the render for.
 DECODE'S WIDTH.** `un_normalize` is the decoder's very first arithmetic and its
 statistics narrow to the activation dtype upstream (`ops.py:76-79`, §4.7). This
 tree implements that through the arm's `Round`
-(`ltx2_video_vae.cpp:1541-1566`, the lambda at `:1486-1488`), which is
+(`ltx2_video_vae.cpp:1553-1578`, the lambda at `:1498-1500`), which is
 `BF16ToF32(F32ToBF16(v))` on `kBF16` and the IDENTITY on `kF32`. §4.7 measured the
 f32-statistics hypothesis at **109 of 288 words wrong at C=16 and 1294 of 4096 at
 C=128** against upstream's own bf16 module, and no token gate can see any of it.
@@ -664,7 +664,7 @@ The device arm now takes that path. It is the right answer for upstream's HDR ar
 and the wrong one for its SDR default, which is a second reason #1007 is owed
 rather than optional.
 
-`VaeStatsAsF32` (`ltx2_video.cpp:524-530`) widens the bag's per-channel statistics
+`VaeStatsAsF32` (`ltx2_video.cpp:534-540`) widens the bag's per-channel statistics
 for the still-f32 latent upsampler, and it follows the bag the same way. On THIS
 checkpoint it returns identical values on both arms, because all 86 decoder
 tensors are `BF16` and both arms widen the same words exactly; the divergence
@@ -938,8 +938,14 @@ are both about records a number agreed with and a tree did not.
 * **The video VAE ENCODER** (`ltx2_video_vae_encoder.h:52-57`, `ImageConditioner`
   at `distilled.py:120-122`), reached at `ltx2_video.cpp:3108` and `:3756`.
   §6.6 repairs its header's claim that it lands with this row.
-* **The latent upsampler** (`ltx2_upsampler.h:66-70`, `distilled.py:138-141`) and
-  the **duration head** (`ltx2_duration_head.h:55-58`, `distilled.py:163-165`).
+* **The duration head** (`ltx2_duration_head.h:55-58`, `distilled.py:163-165`),
+  which is still f32 on every arm. **The latent upsampler is NO LONGER owed here**:
+  A24 wave 5 ([#2857](https://github.com/mudler/vllm.cpp/issues/2857), row
+  `LTX25-A24-UPSAMPLER-BF16`) landed it on `main` while this row was in review, and
+  `Ltx2VideoEngine::Load` now asks both upsampler checkpoints for `kBF16`
+  (`ltx2_video.cpp:1797`, `:1849`). This bullet said the opposite until the rebase,
+  which is the merge-falsifies-your-own-prose failure and not a stale note: nothing
+  in this row's diff changed, and the sentence became false anyway.
 * **The CUDA arm of `kLtx2Vae` at bf16** (§5.6). It needs `cuda_conv3d`'s bf16
   storage (#1007) to be reachable at all, and a lease to be measured. It is no
   longer a paper debt: since §5.6.1 the DEVICE render loads the decoder bag at

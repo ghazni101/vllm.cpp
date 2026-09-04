@@ -34,7 +34,7 @@
 // each carried in their own words. `Ltx2VideoEngine::Load` resolves the bag's
 // width from the arm -- `im.on_device ? kF32 : kBF16` -- because the one
 // `Ltx2VideoDecodeStreaming(` call site passes `im.on_device ? &*im.queue :
-// nullptr` and the refusal at `:1480` below is therefore reachable from the
+// nullptr` and the refusal at `:1488-1492` below is therefore reachable from the
 // render. So f32 is BOTH the parity REFERENCE every committed golden is measured
 // against AND what a DEVICE render decodes at; bf16 is what a CPU render decodes
 // at, and it is upstream's SDR default. Upstream decodes this VAE at f32 too, on
@@ -103,10 +103,14 @@
 // the CPU threadpool" and "the decode is BIT-IDENTICAL across thread counts" in
 // tests/vllm/models/test_ltx2_vae.cpp are the two instruments.
 //
-// PHASE L6 OWES THE PRODUCTION ARM — the bf16/NVFP4 decode that inherits the
-// checkpoint dtype the way upstream does. Until it lands, this file is a
-// correctness reference, not the shipping path, and no memory or throughput
-// number should be taken from it.
+// PHASE L6 OWED THE PRODUCTION ARM — the bf16/NVFP4 decode that inherits the
+// checkpoint dtype the way upstream does — and A24 wave 3 (#2786) landed the
+// bf16 half of it. This paragraph used to continue "until it lands, this file is
+// a correctness reference, not the shipping path", which the banner at the top of
+// this file supersedes twice over: the bf16 arm landed, and #2853 then made the
+// f32 arm a SHIPPED width too, on the device. Both arms are the shipping path
+// now, so a memory or throughput number taken from this file must name which arm
+// it was taken on. The NVFP4 half is still owed.
 #include "vllm/model_executor/models/ltx2_video_vae.h"
 #include "vllm/model_executor/models/ltx2_kernels.h"
 #include "vllm/model_executor/models/ltx2_video_vae_kernels.h"
