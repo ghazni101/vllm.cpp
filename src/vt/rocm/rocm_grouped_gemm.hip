@@ -1473,12 +1473,6 @@ bool QuantWmmaEnabled() {
   }();
   return on;
 }
-
-// T4a dispatch-route counters. Incremented on the decode hot path; read by
-// the focused test's byte-equality gate through the quant scratch hook.
-std::atomic<long long> g_mmvq_route_baseline{0};
-std::atomic<long long> g_mmvq_route_gemv{0};
-std::atomic<long long> g_mmvq_route_fused{0};
 // VT_ROCM_Q6K_SMALL_PRIVATE=1 — the A/B arm for
 // [#2511](https://github.com/mudler/vllm.cpp/issues/2511). Every failing leg on
 // `gfx1151` ended inside `KQuantGemmK<OutT, 2>`, the Q6_K arm, with all three of
@@ -1512,6 +1506,15 @@ struct MmvqRouteCounts {
   long long gemv_mmvq;   // non-fused MMVQ GEMV dispatches (standalone quant)
   long long gemv_fused;  // fused-fold sub-branch dispatches
 };
+
+// T4a dispatch-route counters. Incremented on the decode hot path; read by
+// the focused test's byte-equality gate through the quant scratch hook.
+// (Restored: the gamma-gate commit's diff context swallowed the definitions
+// that T21's point carried — the reset/read helpers and the decode-path
+// increments below reference them.)
+std::atomic<long long> g_mmvq_route_baseline{0};
+std::atomic<long long> g_mmvq_route_gemv{0};
+std::atomic<long long> g_mmvq_route_fused{0};
 
 void MmvqResetRouteCountsForTesting() {
   g_mmvq_route_baseline.store(0, std::memory_order_relaxed);
