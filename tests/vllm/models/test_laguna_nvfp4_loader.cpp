@@ -208,13 +208,23 @@ uint16_t Bf16Bits(float v) {
   std::memcpy(&bits, &v, 4);
   return static_cast<uint16_t>(bits >> 16);  // truncate f32 -> bf16 (finite in, finite out)
 }
-// BF16 tensor with small deterministic values in [-0.08, 0.07].
+// BF16 tensor with small deterministic values in [-0.06, 0.06].
+//
+// #2834: the period of this sequence MUST NOT divide the row stride of the
+// tensors it fills. It was 16, and `model.embed_tokens.weight` and
+// `lm_head.weight` are both `[V,H] = [8,32]`, so a row advanced the sequence by
+// `32*7 = 224 == 0 (mod 16)` and every row came out byte-identical to every
+// other row. The forward then returned one constant for all 24 logits, and no
+// gate on this fixture could see a token id, a position, a causal mask or an
+// embedding gather. 13 is coprime with 7 and with the strides here: a row
+// advances the phase by `224 == 3 (mod 13)`, so the eight vocabulary rows take
+// eight distinct phases. The case at the foot of this file holds that.
 Fx Bf16Finite(const std::string& n, std::vector<int64_t> shape, int seed) {
   int64_t ne = 1;
   for (int64_t d : shape) ne *= d;
   std::string s(static_cast<size_t>(ne) * 2, '\0');
   for (int64_t i = 0; i < ne; ++i) {
-    const float v = static_cast<float>(((i * 7 + seed) % 16) - 8) * 0.01F;
+    const float v = static_cast<float>(((i * 7 + seed) % 13) - 6) * 0.01F;
     const uint16_t bf = Bf16Bits(v);
     std::memcpy(&s[static_cast<size_t>(i) * 2], &bf, 2);
   }
@@ -578,4 +588,80 @@ TEST_CASE("laguna registry forward: routed experts reach the registry step") {
   for (size_t i = 0; i < base.host.size(); ++i)
     if (base.host[i] != zeroed.host[i]) { differs = true; break; }
   CHECK(differs);
+}
+
+// (4) #2834 — THE FIXTURE ITSELF MUST DISCRIMINATE.
+//
+// (1) to (3) above, and the two direct-entry cases before them, all run on
+// `BuildFiniteTensors()`. None of them can fail while that fixture returns one
+// constant for every logit, which is what it did until this case existed:
+// `Bf16Finite` had period 16 and the `[V,H] = [8,32]` row stride advanced it by
+// `32*7 = 224 == 0 (mod 16)`, so every row of `model.embed_tokens.weight` and of
+// `lm_head.weight` was byte-identical to every other row. A constant output is
+// finite, is deterministic, and is byte-identical to itself across two entry
+// points, so the finite/deterministic run-gate and the registry byte-identity
+// case both held trivially. `MODEL-LAGUNA-REGISTRY-FORWARD-2618`'s M5 mutation
+// (zeroing `positions`) SURVIVED for exactly this reason.
+//
+// This case asserts the three properties those gates need and could not have:
+// the logits move with the TOKEN ID, they move with the POSITION, and they are
+// not all the same number. It enters through `ModelRegistry::Forward`, so it
+// measures the production path rather than the fixture in isolation.
+TEST_CASE("laguna registry forward: the fixture discriminates token, position and row") {
+  TempFile f(BuildSt(BuildFiniteTensors()));
+  std::vector<SafetensorsFile> shards;
+  shards.push_back(SafetensorsFile::Open(f.path()));
+  std::unique_ptr<vllm::LoadedModel> model = LoadThroughRegistry(shards);
+  REQUIRE(model != nullptr);
+
+  auto run = [&](const std::vector<int32_t>& ids,
+                 const std::vector<int32_t>& pos) {
+    RegistryStep step(ids, {0, 1, 2});
+    step.positions = pos;
+    const vllm::ForwardLogits out = vllm::ModelRegistry::Forward(*model, step.Get());
+    REQUIRE(out.host.size() == static_cast<size_t>(3 * V));
+    return out.host;
+  };
+  auto maxdiff = [](const std::vector<float>& a, const std::vector<float>& b) {
+    REQUIRE(a.size() == b.size());
+    float m = 0.0F;
+    for (size_t i = 0; i < a.size(); ++i) m = std::max(m, std::fabs(a[i] - b[i]));
+    return m;
+  };
+
+  const std::vector<float> base = run({1, 3, 2}, {0, 1, 2});
+
+  // T1 — the TOKEN ID reaches the logits. A fixture whose embedding rows are all
+  // equal cannot fail this by any amount, so it is the embedding gather's gate.
+  const float tok_diff = maxdiff(base, run({5, 5, 5}, {0, 1, 2}));
+  MESSAGE("laguna fixture: maxdiff tokens {1,3,2} vs {5,5,5} = " << tok_diff);
+  CHECK(tok_diff > 0.0F);
+
+  // T2 — the POSITION reaches the logits, which is RoPE plus the position
+  // plumbing. {0,0,0} leaves RoPE at the identity for every row.
+  const float pos_diff = maxdiff(base, run({1, 3, 2}, {0, 0, 0}));
+  MESSAGE("laguna fixture: maxdiff positions {0,1,2} vs {0,0,0} = " << pos_diff);
+  CHECK(pos_diff > 0.0F);
+
+  const float far_diff = maxdiff(base, run({1, 3, 2}, {0, 2000, 4000}));
+  MESSAGE("laguna fixture: maxdiff positions {0,1,2} vs {0,2000,4000} = " << far_diff);
+  CHECK(far_diff > 0.0F);
+
+  // T3 — the output is not one repeated number. Two ways it could be: every row
+  // equal to every other row (the causal mask and the row plumbing), and every
+  // vocabulary entry within a row equal (the `lm_head` rows).
+  float row_spread = 0.0F;
+  for (int v = 0; v < V; ++v)
+    row_spread = std::max(row_spread, std::fabs(base[static_cast<size_t>(v)] -
+                                                base[static_cast<size_t>(V + v)]));
+  MESSAGE("laguna fixture: maxdiff row0 vs row1 = " << row_spread);
+  CHECK(row_spread > 0.0F);
+
+  float lo = base[0], hi = base[0];
+  for (int v = 0; v < V; ++v) {
+    lo = std::min(lo, base[static_cast<size_t>(v)]);
+    hi = std::max(hi, base[static_cast<size_t>(v)]);
+  }
+  MESSAGE("laguna fixture: row0 logit min " << lo << " max " << hi);
+  CHECK(hi > lo);
 }
