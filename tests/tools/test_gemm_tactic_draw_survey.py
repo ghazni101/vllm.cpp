@@ -1704,5 +1704,59 @@ class ShellDriverTest(unittest.TestCase):
             self.assertFalse((share / "phase" / "reduce.ok").is_file())
 
 
+
+class ArtefactResolutionTest(unittest.TestCase):
+    """#2912: the build phase must accept a STATICALLY linked vllm-bench.
+
+    The configuration this harness invokes emits `libvllm.a` and links
+    `vllm-bench` against it, so requiring a shared `libvllm.so.*` refuses a
+    tree that built green. The first real GB10 run died exactly there, after
+    855/855 with BUILD_RC=0 and zero compile errors.
+
+    These drive `--check-artefacts`, which calls the SAME `resolve_artefacts`
+    the build phase calls, so this gates the production predicate rather than a
+    transcription of it. The other shell tests write `phase/build.ok` to skip
+    the build phase, which is why this branch shipped unreached.
+    """
+
+    SCRIPT = pathlib.Path(__file__).resolve().parents[2] / "scripts/dgx-gemm-tactic-draw-survey.sh"
+
+    def _run(self, build_dir):
+        return subprocess.run(
+            ["bash", str(self.SCRIPT), "--evidence", "/unused", "--model",
+             "/unused", "--check-artefacts", str(build_dir)],
+            capture_output=True, text=True, timeout=120,
+        )
+
+    def _tree(self, name, *files):
+        root = pathlib.Path(tempfile.mkdtemp()) / name
+        (root / "examples").mkdir(parents=True)
+        for f in files:
+            (root / f).parent.mkdir(parents=True, exist_ok=True)
+            (root / f).write_text("", encoding="utf-8")
+        return root
+
+    def test_a_static_build_is_accepted_and_reports_no_shared_library(self):
+        # The shape the GB10 run actually produced.
+        tree = self._tree("static", "examples/vllm-bench", "libvllm.a")
+        done = self._run(tree)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("vllm-bench", done.stdout)
+        self.assertIn("statically linked", done.stdout)
+
+    def test_a_shared_build_is_accepted_and_names_the_library(self):
+        tree = self._tree("shared", "examples/vllm-bench", "libvllm.so.0.1")
+        done = self._run(tree)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("libvllm.so.0.1", done.stdout)
+
+    def test_a_tree_without_the_binary_still_refuses_with_E_ARTEFACT(self):
+        # The refusal that IS real: no binary means nothing can be measured.
+        tree = self._tree("empty", "libvllm.a")
+        done = self._run(tree)
+        self.assertEqual(done.returncode, 35, done.stdout)
+        self.assertIn("no vllm-bench", done.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()
