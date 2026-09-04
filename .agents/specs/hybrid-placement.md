@@ -836,6 +836,28 @@ merged, and was reviewed, because no reviewer could execute the branch. The
 mutation `reachability.md` asks for is now runnable here: hardcode `kBF16` back
 into the seam's six sites and this suite reds.
 
+**Mutation evidence.** 5 cases / 28 assertions green on `d023e3357`. Every
+claimed guarantee was mutated in the seam header, and **each mutant compiled at
+`rc=0` before its result was believed** — a mutant that fails to build reads as a
+passing test, and this tree has been fooled by that before.
+
+| Mutation | Result | The assertion that caught it |
+|---|---|---|
+| `dt = kBF16` instead of `dh.dtype` (the #2383 defect verbatim) | 2 cases / 3 assertions RED | `copies[0]`: `32 == 64` — half the bytes |
+| `placed_on = engine_device` (never cross; the pre-#2382 state) | 4 cases / 4 assertions RED | `copies.size()`: `1 == 2`, and the round trip throws |
+| `out_dt = dt` instead of the body's output dtype | 1 case / 2 assertions RED | `copies[1]`: `64 == 32` — twice the bytes out |
+| `if (false && ... !placeable)` (drop the fp4 refusal) | 1 case / 2 assertions RED | `CHECK_THROWS_AS ... did NOT throw at all` |
+
+The header was restored byte-for-byte after each (`git status` clean, sha256
+`bee99638a9c6`), rebuilt, and re-run green.
+
+**The second mutation exposed a structural property worth keeping.** With the
+crossing removed, the round-trip case does not merely disagree — it THROWS, with
+`no kernel for op Matmul on device xpu`. The loopback backend deliberately
+carries transfers and allocation but no kernels, so a version of this test that
+silently fell back into the short circuit cannot quietly pass. The failure mode
+this file exists to prevent is structurally unavailable to it.
+
 `tests/vllm/model_executor/test_placed_moe_roundtrip.cpp` restores the name
 `6416aab85` deleted, on the mechanism the old one lacked. The old file forced the
 round trip by passing `kCPU` as an explicit placement argument to
@@ -884,8 +906,9 @@ renumbers `## Work breakdown` so the hardware-independent waves come first. The
 pull request shape for this row is **separate spec and implementation**
 (developer, 2026-08-26, recorded at row claim).
 
-Next action is W1, the `placement` config surface under `vllm_cpp`. It needs no
-GPU and no checkpoint.
+Next action was W1 when this was written; W1 through W4 have since landed, and
+W3i closed the last gate that did not need hardware. What remains needs a
+discrete GPU, as the paragraph below says.
 
 **Two waves are hard-blocked and neither is waived.** W5 (the speed floor against
 `-ncmoe`) and W0 (the bandwidth and round-trip measurements) both need a

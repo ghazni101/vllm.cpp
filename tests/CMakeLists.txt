@@ -1850,6 +1850,15 @@ vllm_cpp_add_test(test_placement_dump_dtype
   vllm/model_executor/test_placement_dump_dtype.cpp)
 target_include_directories(test_placement_dump_dtype PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
+# ENG-HYBRID-PLACEMENT W3i (#2714): the placement round trip, executed rather
+# than reasoned about. ITS OWN BINARY, and for the same reason its siblings above
+# are -- it registers a loopback backend and platform in the process-global kXPU
+# slot to give the seam an engine that is not the CPU, and that registration must
+# not leak into a suite whose subject is a different device.
+vllm_cpp_add_test(test_placed_moe_roundtrip
+  vllm/model_executor/test_placed_moe_roundtrip.cpp)
+target_include_directories(test_placed_moe_roundtrip PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
 vllm_cpp_add_test(test_act_dump
   vllm/model_executor/test_act_dump.cpp)
 target_include_directories(test_act_dump PRIVATE ${CMAKE_SOURCE_DIR}/src)
