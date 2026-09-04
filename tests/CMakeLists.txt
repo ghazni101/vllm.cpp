@@ -1405,6 +1405,10 @@ target_include_directories(test_nemotron_h_paged_forward PRIVATE
 vllm_cpp_add_test(test_kimi_linear_forward vllm/models/test_kimi_linear_forward.cpp)
 vllm_cpp_add_test(test_kimi_linear_paged vllm/models/test_kimi_linear_paged.cpp)
 vllm_cpp_add_test(test_kimi_linear_fold_gate vllm/models/test_kimi_linear_fold_gate.cpp)
+# #2840: the committed K=3 oracle capture is what LICENSES the strict bar, and
+# the checkpoint-free case that reads it needs to find the goldens tree.
+target_compile_definitions(test_kimi_linear_fold_gate PRIVATE
+  PARITY_GOLDENS_DIR="${CMAKE_SOURCE_DIR}/tests/parity/goldens")
 
 # KDA (Kimi Delta Attention) net-new gated-linear-attention primitives — host
 # reference + unit gate (KERNEL-KDA-DELTA). Shared unblocker for Kimi-Linear-48B
