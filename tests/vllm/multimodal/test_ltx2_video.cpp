@@ -13453,15 +13453,28 @@ TEST_CASE("ltx2 video: a duration head tensor at the WRONG SHAPE refuses by name
 // checkpoint with no head fails fast instead of paying for work whose result is
 // discarded.
 //
-// HOW THE ORDER IS OBSERVED WITHOUT AN INSTRUMENT: the request is ALSO invalid
-// in a way that refuses LATER. A width of 33 is not a multiple of the resolution
-// divisor, and `Ltx2AssertResolution` runs after prompt encoding and after the
-// connector. If the auto-duration guard sits where upstream puts it, this
-// request hears about the duration; if it slid down to the resolution point or
-// past it, this request hears about the width instead. Both refusals are
-// correct in isolation, so only their ORDER distinguishes the two ports -- which
-// is exactly what a message-only assertion cannot see.
-TEST_CASE("ltx2 video: an auto duration with no head refuses at the TOP, before any work") {
+// HOW THE ORDER IS OBSERVED. Two legs, because the first one alone measures
+// less than it appears to and a mutation proved it.
+//
+// LEG 1 -- THE PHASE TABLE, which is the leg that actually says "before any
+// work". The engine names every stage it enters, so after the refusal the render
+// must have opened `generate.setup` and NOTHING downstream of it: no
+// `conditioning.*`, no `denoise*`, no `decode*`. This is a statement about work
+// PERFORMED rather than about which of two refusals won a race, and it is what
+// upstream's "before prompt encoding or any other work" means.
+//
+// LEG 2 -- A SECOND REFUSAL THAT WOULD FIRE LATER. The width is 33, which
+// `Ltx2AssertResolution` refuses further down. Both refusals are correct in
+// isolation, so hearing about the DURATION rather than the WIDTH pins their
+// order.
+//
+// WHY BOTH. Leg 2 was the whole case at first, and moving the guard down to just
+// above the frame resolution -- below prompt encoding and below the connector,
+// which is the defect this case exists to catch -- left it GREEN, because
+// `Ltx2AssertResolution` is further down still. Leg 2 gates "the guard precedes
+// the resolution check" and reads like it gates "the guard precedes everything".
+// Leg 1 is the one that does.
+TEST_CASE("ltx2 video: an auto duration with no head refuses at the TOP before any work") {
   Workspace ws;
   vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
   std::unique_ptr<vllm::multimodal::VideoEngine> engine = vllm::multimodal::LoadVideoEngine(mp);
@@ -13469,16 +13482,61 @@ TEST_CASE("ltx2 video: an auto duration with no head refuses at the TOP, before 
   gen.num_frames = 0;  // no explicit count
   gen.width = 33;      // and a width that refuses LATER
   gen.extras["auto_duration"] = "1,20";
+
+  const size_t before = vllm::multimodal::phase::PhaseLog::Instance().Records().size();
   try {
     (void)engine->Generate(gen);
     FAIL("an auto duration with no duration head must refuse");
   } catch (const std::exception& e) {
     const std::string msg = e.what();
     INFO(msg);
-    CHECK(msg.find("duration") != std::string::npos);
-    // THE ORDERING ASSERTION. The later refusal must NOT be the one that fired.
+    CHECK(msg.find("DurationHead") != std::string::npos);
+    // LEG 2: the later refusal must NOT be the one that fired.
     CHECK(msg.find("not divisible") == std::string::npos);
   }
+
+  // LEG 1: nothing downstream of the setup phase was ever entered.
+  const std::vector<vllm::multimodal::phase::Record> records =
+      vllm::multimodal::phase::PhaseLog::Instance().Records();
+  REQUIRE(records.size() >= before);
+  std::vector<std::string> after_refusal;
+  for (size_t i = before; i < records.size(); ++i) after_refusal.push_back(records[i].name);
+  // `generate` and `generate.setup` are expected -- the guard runs INSIDE the
+  // setup phase, which is what "the top of __call__" means here. Everything the
+  // engine names after those is work this request must not have paid for.
+  for (const std::string& name : after_refusal) {
+    INFO("phase entered after the auto-duration request: " << name);
+    CHECK(name != "generate.conditioning");
+    CHECK(name != "generate.geometry");
+    CHECK(name != "generate.guiders");
+    CHECK(name.rfind("conditioning.", 0) != 0);
+    CHECK(name.rfind("denoise", 0) != 0);
+    CHECK(name.rfind("decode", 0) != 0);
+    CHECK(name.rfind("artifacts", 0) != 0);
+  }
+  // THE CONTROL, so the check above is not vacuous through an empty table. The
+  // same request WITHOUT the auto duration runs, and the phases this asserts the
+  // absence of are the ones it produces -- if the engine stopped naming them,
+  // this case would go quiet rather than red.
+  vllm::multimodal::VideoModelParams ok_mp = FixtureParams(ws.paths);
+  ok_mp.extras[vllm::multimodal::kLtx2MaxPhaseExtra] = "0";
+  std::unique_ptr<vllm::multimodal::VideoEngine> ok = vllm::multimodal::LoadVideoEngine(ok_mp);
+  const size_t control_before =
+      vllm::multimodal::phase::PhaseLog::Instance().Records().size();
+  (void)ok->Generate(FixtureGen(ws.root + "/out_control"));
+  const std::vector<vllm::multimodal::phase::Record> control =
+      vllm::multimodal::phase::PhaseLog::Instance().Records();
+  bool saw_geometry = false, saw_denoise = false;
+  for (size_t i = control_before; i < control.size(); ++i) {
+    if (control[i].name == "generate.geometry") saw_geometry = true;
+    if (control[i].name.rfind("denoise", 0) == 0) saw_denoise = true;
+  }
+  // `generate.geometry` is the FIRST phase after setup, and it is where a guard
+  // that slid down would most plausibly land -- which is exactly the mutation
+  // that left the width leg green. Asserting the control produces it is what
+  // makes its absence above mean something.
+  CHECK(saw_geometry);
+  CHECK(saw_denoise);
 }
 
 // THE CAPABILITY, REACHED. A head named at load is opened, and the frame count
