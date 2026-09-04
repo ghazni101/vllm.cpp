@@ -51,7 +51,9 @@ A rebuild would fail those assertions rather than pass silently.
 `prompts_sha256` `c8a5080046c3206a1186b42a320a21e887691eff43d2116364192f58e5776c7e`,
 six prompts, 48 tokens each, 288 decode steps. **They are not chosen by this
 run.** They are the set this campaign has scored since 2026-08-23 and their
-hash is committed in three evidence documents that predate it, so no selection
+hash is committed in FOUR evidence documents that predate it (counted at
+`a1ada1471`: the two `20260902` token gates, `oracle-vllm-gfx1151-20260903.md`
+and `q4km-neartie-vllm-oracle-20260903.md`), so no selection
 after seeing which prompts agree is possible. `gate.sh` hashes the file and
 refuses on a mismatch before it scores anything, and `score_strict.py` refuses
 again independently.

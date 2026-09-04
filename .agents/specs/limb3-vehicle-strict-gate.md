@@ -127,7 +127,7 @@ Not teacher-forced, and no near-tie band: a rank-2 token is a divergence here.
 not chosen by this spec. They are the six the declared Q4_K_M gate has scored
 since 2026-08-23, `prompts_sha256`
 `c8a5080046c3206a1186b42a320a21e887691eff43d2116364192f58e5776c7e`, a value
-committed in three evidence documents that predate this run. `gate.sh` hashes
+committed in four evidence documents that predate this run. `gate.sh` hashes
 the file and refuses on a mismatch before it scores anything, and
 `score_strict.py` refuses again independently.
 
