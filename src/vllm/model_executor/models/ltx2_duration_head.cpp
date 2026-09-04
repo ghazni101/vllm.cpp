@@ -321,9 +321,14 @@ int64_t Ltx2SecondsToClampedNumFrames(double seconds, double frame_rate, int64_t
   //    the other direction. That `min` is why a `min_frames == max_frames == 5`
   //    request legitimately returns 5, which is NOT on the 8k+1 grid: upstream
   //    honours the window over the grid when the two cannot both hold.
+  //  * A `min_frames < 1` IS NOT REFUSED, because upstream does not refuse it.
+  //    `seconds_to_clamped_num_frames(3.0, frame_rate=25.0, min_frames=0,
+  //    max_frames=500)` returns 73 at the pin. What upstream DOES raise on is a
+  //    clamped count of zero — `(0.005, 25.0, min_frames=0, max_frames=500)`
+  //    gives `ValueError: frames must be >= 1, got 0` — and that raise comes out
+  //    of `snap_frames_to_grid` below, not out of a bound check here. Refusing
+  //    the bound instead moved the refusal to a request upstream serves.
   Require(frame_rate > 0.0, "ltx2 duration: the frame rate must be positive");
-  Require(min_frames >= 1,
-          "ltx2 duration: min_frames must be >= 1, got " + std::to_string(min_frames));
   Require(max_frames >= min_frames,
           "ltx2 duration: max_frames (" + std::to_string(max_frames) +
               ") must be >= min_frames (" + std::to_string(min_frames) + ")");
@@ -331,6 +336,11 @@ int64_t Ltx2SecondsToClampedNumFrames(double seconds, double frame_rate, int64_t
   if (raw < min_frames) raw = min_frames;
   if (raw > max_frames) raw = max_frames;
   int64_t frames = Ltx2SnapFramesToGrid(raw, time_scale);
+  // The repair branch needs `min_frames >= 2` to fire at all, since the snap
+  // returns at least 1. That is what keeps the ceiling division below correct:
+  // `(a + b - 1) / b` is `ceil` only for a non-negative `a`, and `min_frames - 1`
+  // is `>= 1` wherever this runs. Upstream's `-(-x // ts)` floors on the way in
+  // and needs no such argument.
   if (frames < min_frames) {
     const int64_t up = ((min_frames - 1 + time_scale - 1) / time_scale) * time_scale + 1;
     frames = up < max_frames ? up : max_frames;
@@ -351,7 +361,10 @@ int64_t Ltx2DurationPredictFrames(const Ltx2DurationHeadConfig& config,
   // for the shape upstream would reject. The refusal it replaces exists because
   // `.item()` on a multi-row prediction throws a shape error deep in torch; here
   // there is no such row to have.
-  Require(min_seconds > 0.0, "ltx2 duration: min_seconds must be positive");
+  // `min_seconds <= 0` is upstream's to serve, not this port's to refuse:
+  // `AutoDuration(min_seconds=0.0, max_seconds=20.0)` constructs at the pin
+  // (utils/args.py:117-122 checks only `min > max`). The retained bound is that
+  // same `min > max`, which IS upstream's.
   Require(max_seconds >= min_seconds,
           "ltx2 duration: max_seconds must be >= min_seconds");
   const std::vector<float> seconds_pred =
@@ -366,8 +379,13 @@ int64_t Ltx2DurationPredictFrames(const Ltx2DurationHeadConfig& config,
   // is clamping.
   const int64_t min_frames = RoundHalfToEven(min_seconds * frame_rate);
   const int64_t max_frames = RoundHalfToEven(max_seconds * frame_rate);
-  return Ltx2SecondsToClampedNumFrames(seconds, frame_rate, min_frames < 1 ? 1 : min_frames,
-                                       max_frames, time_scale);
+  // NO `min_frames < 1 ? 1 : min_frames` FLOOR. Upstream passes the rounded bound
+  // through untouched (blocks.py:872-875), so a `min_frames` of 0 with a
+  // prediction that rounds to 0 frames RAISES — `seconds_to_clamped_num_frames
+  // (0.005, frame_rate=25.0, min_frames=0, max_frames=500)` is `ValueError:
+  // frames must be >= 1, got 0` at the pin. Flooring the bound to 1 turned that
+  // raise into a silent single frame.
+  return Ltx2SecondsToClampedNumFrames(seconds, frame_rate, min_frames, max_frames, time_scale);
 }
 
 void Ltx2RequireNumFramesSource(bool auto_requested, bool has_predictor) {

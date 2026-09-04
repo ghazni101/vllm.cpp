@@ -452,9 +452,11 @@ std::string LoraIndexedListing() {
          "_<n> (n >= 2)";
 }
 
-// The one key this family DEFINES and does not SERVE. `Ltx2DurationPredict` is
-// ported and gated as a brick (`ltx2_duration_head.h`), but nothing here
-// constructs one, so a supplied path names a file the engine never opens.
+// The head's checkpoint. SERVED since row LTX25-DURATION-HEAD-WIRE (#2900):
+// the load opens the file, builds a predictor when it carries a whole head, and
+// the frame count a render uses comes from that predictor. It was the one key
+// this family defined and did not serve, which is why the paragraph below still
+// explains the distinction the list exists to keep.
 constexpr char kLtx2DurationHeadPathExtra[] = "duration_head_path";
 // Row LTX25-DURATION-HEAD-WIRE (#2900): upstream's `--auto-duration MIN MAX`
 // (utils/args.py:108), as a per-generation extra so no ABI change is needed.
@@ -465,21 +467,22 @@ constexpr char kLtx2AutoDurationExtra[] = "auto_duration";
 // (minimax_h3_video.cpp): a mistyped knob that is silently dropped renders the
 // DEFAULT and looks like the feature not working.
 //
-// DEFINED IS NOT THE SAME AS SERVED, and conflating the two was #611: nine of
-// these ten reach a reader, and `duration_head_path` reached none, so supplying a
-// duration head substituted the recipe default in silence — the failure mode this
-// very list exists to prevent, one level in. It stays in the list because the
-// family DOES define the key and DOES know what it means; `CheckUnservedExtras`
-// refuses it by name instead, which is a different and truer message than
-// "unknown load extra". The full audit is in
-// .agents/specs/ltx25-retire-dead-arms.md §2.1.
+// DEFINED IS NOT THE SAME AS SERVED, and conflating the two is the failure this
+// list exists to prevent one level in: a key the family accepts, and no code
+// reads, substitutes a default in silence. `duration_head_path` was the tree's
+// own example of it and is no longer — row LTX25-DURATION-HEAD-WIRE (#2900)
+// gave it a reader, and `CheckUnservedExtras` no longer names it. Every key in
+// the array below now reaches one. The audit that found the class is in
+// .agents/specs/ltx25-retire-dead-arms.md §2.1; the issue it was filed under is
+// one of the three numbers that 404, tracked by
+// https://github.com/mudler/vllm.cpp/issues/2899.
 //
 // The first hand-written set of these anchors named nine lines that were readers
 // of NOTHING, in this very file, and a later merge moved the real ones again. So
 // they are no longer trusted: the list below is derived from this file on every
 // run and compared, and the failure prints the replacement to paste in.
 // READER ANCHORS (derived and gated by test_ltx2_video):
-// 664 666 1308 1404 1500 1516 1651 1655 1788 1824 1974 2092 2134 2176 2178
+// 670 672 1314 1410 1506 1522 1657 1661 1794 1830 1980 2098 2140 2182 2184
 
 const char* const kKnownLoadExtras[] = {
     kLtx2AudioPromptEmbedsExtra, kLtx2PipelineKindExtra,   kLtx2ModelVersionExtra,
@@ -628,10 +631,13 @@ Ltx2AutoDuration ParseAutoDuration(const std::map<std::string, std::string>& ext
     Fail("the '" + std::string(key) + "' extra is '" + text +
          "', whose two halves must each parse as a number of seconds");
   }
-  if (!(out.min_seconds > 0.0)) {
-    Fail("the '" + std::string(key) + "' extra names a MIN of " +
-         std::to_string(out.min_seconds) + " seconds, and a duration must be positive");
-  }
+  // UPSTREAM REFUSES EXACTLY ONE THING HERE, and a `MIN <= 0` refusal was not
+  // it. `AutoDurationAction` (utils/args.py:117-122) checks `min_seconds >
+  // max_seconds` and nothing else, and `AutoDuration(min_seconds=0.0,
+  // max_seconds=20.0)` constructs at the pin, after which
+  // `seconds_to_clamped_num_frames(3.0, frame_rate=25.0, min_frames=0,
+  // max_frames=500)` returns 73. So `--auto-duration 0 20` is a request upstream
+  // serves, and refusing it by name made this port reject a working one.
   if (out.min_seconds > out.max_seconds) {
     Fail("the '" + std::string(key) + "' extra names MIN " + std::to_string(out.min_seconds) +
          " > MAX " + std::to_string(out.max_seconds) +
@@ -2611,6 +2617,24 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
          "argument that is either a count or an `AutoDuration` (utils/types.py:116), so "
          "there is no request that is both; refusing rather than letting one silently win");
   }
+  // A RETAKE HAS NO PREDICTOR TO ASK, and this refuses rather than ignoring the
+  // request. `retake.py` takes its frame count from the SOURCE clip's metadata
+  // (`get_videostream_metadata`, :220) and never constructs a `DurationPredictor`
+  // at all, so there is no upstream behaviour for an auto duration here to
+  // mirror -- the source clip already fixes the length. Ignoring the extra would
+  // be the same silent win this call refuses two statements up for an explicit
+  // count, so it refuses by name for the same reason. The IMPLICIT auto request
+  // -- no count, a head loaded -- is NOT refused: it asked for nothing, and the
+  // retake's own geometry is what an omitted count resolves to.
+  const bool retake_requested = !VideoExtra(gen.extras, kLtx2RetakeStartTimeExtra).empty() ||
+                                 !VideoExtra(gen.extras, kLtx2RetakeEndTimeExtra).empty();
+  if (auto_duration.requested && retake_requested) {
+    Fail("this request carries both '" + std::string(kLtx2AutoDurationExtra) +
+         "' and a retake window. A retake's length is the SOURCE clip's "
+         "(retake.py:220 reads it from the file, and that pipeline constructs no "
+         "DurationPredictor), so an auto duration here would be dropped; refusing rather "
+         "than letting the retake silently win");
+  }
   const bool wants_auto_duration =
       auto_duration.requested || (!has_explicit_frames && im.has_duration_head);
   Ltx2RequireNumFramesSource(wants_auto_duration, im.has_duration_head);
@@ -2622,7 +2646,7 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
     // SERVED by row LTX25-DFR-PIPELINE #986) and `temporal_upsample_rounds`
     // (#986). DEFINED is still not SERVED — the last one is defined so that its
     // own refusal can name the missing loop, exactly as `CheckUnservedExtras`
-    // does on the load side (#611). Everything OUTSIDE the list is refused
+    // does on the load side. Everything OUTSIDE the list is refused
     // rather than ignored, for the reason `CheckKnownExtras` gives for the load
     // side: a mistyped knob that is silently dropped renders the DEFAULT and
     // looks like the feature not working.
@@ -2795,8 +2819,11 @@ VideoResult Ltx2VideoEngine::Generate(const VideoGenParams& gen) {
   // statement (:211-212) and its CLI refuses the source geometry before the
   // pipeline is even constructed (:340-353) — both before any model work is
   // paid for.
-  const bool wants_retake = !VideoExtra(gen.extras, kLtx2RetakeStartTimeExtra).empty() ||
-                            !VideoExtra(gen.extras, kLtx2RetakeEndTimeExtra).empty();
+  // Resolved at the TOP of this call, where the auto-duration guard needs it;
+  // named again here so the retake block below reads as one thing. One
+  // expression, so the two cannot drift apart into disagreeing about what a
+  // retake request is.
+  const bool wants_retake = retake_requested;
   double retake_start = 0.0, retake_end = 0.0, retake_fps = 0.0;
   bool regenerate_video = true, regenerate_audio = true;
   Ltx2RetakeSourceGeometry retake_source;

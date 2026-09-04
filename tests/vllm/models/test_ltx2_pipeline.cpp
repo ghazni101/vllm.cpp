@@ -5567,6 +5567,38 @@ TEST_CASE("ltx2 duration driver: the frame grid, the clamp order and the head, v
     CHECK(sep_half_away > 0);
   }
 
+  SUBCASE("a min_frames below 1 is upstream's to serve, and its zero is upstream's to RAISE") {
+    // EXECUTED AT THE PIN, not read off `helpers.py`. `AutoDurationAction`
+    // (utils/args.py:117-122) refuses `min > max` and NOTHING else, so
+    // `AutoDuration(min_seconds=0.0, max_seconds=20.0)` constructs, and
+    //
+    //   seconds_to_clamped_num_frames(3.0, frame_rate=25.0,
+    //                                 min_frames=0, max_frames=500) == 73
+    //
+    // is what upstream returns for it. This port refused that request by name,
+    // which made `--auto-duration 0 20` -- a working upstream invocation -- an
+    // error here.
+    CHECK(vllm::Ltx2SecondsToClampedNumFrames(3.0, 25.0, 0, 500, 8) == 73);
+    CHECK(vllm::Ltx2SecondsToClampedNumFrames(1.0, 25.0, 0, 500, 8) == 25);
+    CHECK(vllm::Ltx2SecondsToClampedNumFrames(30.0, 25.0, 0, 500, 8) == 497);
+    // And the raise is upstream's too, from `snap_frames_to_grid` rather than
+    // from a bound check: at the pin,
+    //
+    //   seconds_to_clamped_num_frames(0.005, frame_rate=25.0,
+    //                                 min_frames=0, max_frames=500)
+    //     -> ValueError: frames must be >= 1, got 0
+    //
+    // A port that floors `min_frames` to 1 returns 1 instead, which is a
+    // one-frame render where upstream refuses. THAT is the direction this pair
+    // gates: the acceptance above and the refusal below have to move together,
+    // because accepting the bound without honouring the raise is the silent half.
+    CHECK_THROWS(
+        (void)vllm::Ltx2SecondsToClampedNumFrames(0.005, 25.0, 0, 500, 8));
+    // The same seconds WITH upstream's default bound is 1 rather than a raise,
+    // so the case above cannot pass by refusing everything.
+    CHECK(vllm::Ltx2SecondsToClampedNumFrames(0.005, 25.0, 1, 500, 8) == 1);
+  }
+
   SUBCASE("the window is honoured over the grid when both cannot hold") {
     // min == max == 5 returns 5, which is NOT on the 8k+1 grid. That is upstream
     // (helpers.py:581-584 takes `min` with `max_frames` after ceiling back onto

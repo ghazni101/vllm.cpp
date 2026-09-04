@@ -13412,6 +13412,39 @@ TEST_CASE("ltx2 video: a duration_head_path with no head weights LOADS, as upstr
   REQUIRE(engine != nullptr);
 }
 
+// AND `None` IS OBSERVED HERE, not above. A load that succeeds is what BOTH
+// polarities look like: whether the file yielded a predictor or yielded none,
+// `LoadVideoEngine` returns an engine either way, so `REQUIRE_NOTHROW` plus a
+// non-null pointer cannot tell the two apart. Mutation M5 proved that — making
+// the bare-prefix fallback report a predictor for a headless file left the whole
+// suite green, and the caller then paid for the entire prompt encode before
+// dying in the VAE on a parameter the file never had, which is precisely what
+// upstream's `any(param.is_meta)` check exists to prevent (blocks.py:838-846).
+//
+// The observable difference is the CONSEQUENCE: with no predictor, an auto
+// duration is unsatisfiable and `require_num_frames_source` says so by name. The
+// positive arm of this pair is "a loaded duration head DECIDES the frame count"
+// below, where the same request against the WHOLE head renders instead.
+TEST_CASE("ltx2 video: a headless duration_head_path yields NO predictor, and the auto request says so") {
+  Workspace ws;
+  vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+  mp.extras["duration_head_path"] = ws.paths.dit;
+  std::unique_ptr<vllm::multimodal::VideoEngine> engine = vllm::multimodal::LoadVideoEngine(mp);
+  REQUIRE(engine != nullptr);
+
+  vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/out");
+  gen.num_frames = 0;
+  gen.extras["auto_duration"] = "1,20";
+  try {
+    (void)engine->Generate(gen);
+    FAIL("a headless duration_head_path must leave the auto duration unsatisfiable");
+  } catch (const std::exception& e) {
+    const std::string msg = e.what();
+    INFO(msg);
+    CHECK(msg.find("no DurationHead weights") != std::string::npos);
+  }
+}
+
 // THE PARTIAL HEAD IS `None` TOO, and that is the half a complete-or-absent
 // fixture cannot see. Upstream builds with `strict=False` and then asks whether
 // ANY parameter is still on the meta device (blocks.py:838-844), so a file
@@ -13424,6 +13457,31 @@ TEST_CASE("ltx2 video: a PARTIAL duration head is upstream's None, not a refusal
   std::unique_ptr<vllm::multimodal::VideoEngine> engine;
   REQUIRE_NOTHROW(engine = vllm::multimodal::LoadVideoEngine(mp));
   REQUIRE(engine != nullptr);
+}
+
+// THE PARTIAL FILE'S `None`, OBSERVED. Same argument as the headless pair above,
+// and this is the half that matters most: a partial head is the file that WOULD
+// bind fourteen of fifteen tensors, so a loader that reported a predictor here
+// would run a module with a hole in it. The refusal is what says it reported
+// none.
+TEST_CASE("ltx2 video: a PARTIAL duration head yields NO predictor, and the auto request says so") {
+  Workspace ws;
+  vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+  mp.extras["duration_head_path"] = ws.paths.duration_head_partial;
+  std::unique_ptr<vllm::multimodal::VideoEngine> engine = vllm::multimodal::LoadVideoEngine(mp);
+  REQUIRE(engine != nullptr);
+
+  vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/out");
+  gen.num_frames = 0;
+  gen.extras["auto_duration"] = "1,20";
+  try {
+    (void)engine->Generate(gen);
+    FAIL("a partial duration head must leave the auto duration unsatisfiable");
+  } catch (const std::exception& e) {
+    const std::string msg = e.what();
+    INFO(msg);
+    CHECK(msg.find("no DurationHead weights") != std::string::npos);
+  }
 }
 
 // A PRESENT TENSOR AT THE WRONG SHAPE IS THE ONE CASE THAT REFUSES. It is not
@@ -13585,6 +13643,57 @@ TEST_CASE("ltx2 video: a loaded duration head DECIDES the frame count") {
   recipe_gen.num_frames = 0;
   const vllm::multimodal::VideoResult recipe_res = plain->Generate(recipe_gen);
   CHECK(res.frame_count != recipe_res.frame_count);
+}
+
+// A RETAKE HAS NO PREDICTOR, AND THIS ROW REFUSED TO LET ONE SILENTLY WIN
+// TWO STATEMENTS EARLIER. `retake.py` reads its frame count off the source
+// clip's metadata (`:220`) and constructs no `DurationPredictor`, so an
+// `auto_duration` on a retake would be dropped -- exactly the shape the
+// explicit-count refusal above exists to prevent. Refusing an explicit
+// combination and then quietly ignoring this one is the inconsistency this case
+// closes.
+//
+// THE CONTROL IS THE SECOND SUBCASE, and without it the first proves nothing:
+// the retake path refuses several OTHER things, so "it threw" is not the same as
+// "it threw for this reason". The second leg drops `auto_duration` and keeps the
+// same retake request, and asserts the refusal that arrives is a DIFFERENT one.
+TEST_CASE("ltx2 video: auto_duration on a retake refuses by name rather than being dropped") {
+  Workspace ws;
+  vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+  mp.extras["duration_head_path"] = ws.paths.duration_head;
+  std::unique_ptr<vllm::multimodal::VideoEngine> engine = vllm::multimodal::LoadVideoEngine(mp);
+
+  SUBCASE("auto_duration plus a retake window") {
+    vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/out_retake_auto");
+    gen.num_frames = 0;
+    gen.extras["auto_duration"] = "1,20";
+    gen.extras[vllm::multimodal::kLtx2RetakeStartTimeExtra] = "0.0";
+    gen.extras[vllm::multimodal::kLtx2RetakeEndTimeExtra] = "1.0";
+    try {
+      (void)engine->Generate(gen);
+      FAIL("auto_duration on a retake must refuse, not be silently dropped");
+    } catch (const std::exception& e) {
+      const std::string msg = e.what();
+      INFO(msg);
+      CHECK(msg.find("auto_duration") != std::string::npos);
+      CHECK(msg.find("retake") != std::string::npos);
+    }
+  }
+  SUBCASE("the same retake WITHOUT auto_duration refuses something else") {
+    vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/out_retake_plain");
+    gen.num_frames = 0;
+    gen.extras[vllm::multimodal::kLtx2RetakeStartTimeExtra] = "0.0";
+    gen.extras[vllm::multimodal::kLtx2RetakeEndTimeExtra] = "1.0";
+    try {
+      (void)engine->Generate(gen);
+      // A clean run is also a pass for this leg: it says the retake request is
+      // not what the first leg refused.
+    } catch (const std::exception& e) {
+      const std::string msg = e.what();
+      INFO(msg);
+      CHECK(msg.find("auto_duration") == std::string::npos);
+    }
+  }
 }
 
 // The request surface, mirrored from `--auto-duration MIN_SECONDS MAX_SECONDS`
