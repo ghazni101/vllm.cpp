@@ -405,10 +405,16 @@ That is the majority of the parameter count and most of the decode step.
 6. **`dots3_note` config parsing**, including the four defaults of §4 that the
    checkpoint's `config.json` does **not** carry. **LANDED at W1, and NOT in
    `hf_config.cpp` as this item first said — see §4.2 for why.**
-7. **GGUF k-quant arm.** llama.cpp has no `dots3_note` architecture, so the
-   converter is ours to write and there is no quant-matched llama.cpp
-   comparison for this row. Per AGENTS.md the arm is owed, not optional; an
+7. **GGUF k-quant arm.** Per AGENTS.md the arm is owed, not optional; an
    unimplemented arm refuses with a message naming the missing piece.
+   **CORRECTED IN PLACE, 2026-09-04 (W9a, §4.19.2).** This item used to say
+   llama.cpp has no `dots3_note` architecture, so the converter is ours to write
+   and there is no quant-matched llama.cpp comparison for this row. All three
+   halves are false: llama.cpp merged `LLM_ARCH_DOTS3NOTE -> "dots3note"` on
+   2026-08-21, `conversion/dots3.py` registers `Dots3NoteForCausalLM` by name,
+   and published artifacts exist. What is owed is our LOADER arm and a pin
+   advance off `b10451` (W9b/W9c/W9e/W9f), not a converter written from
+   nothing.
 
 ---
 
@@ -7687,6 +7693,93 @@ as deletions and the falsehood was written into `AGENTS.md`, so this slice does
 NOT conclude that #699 is gone and does not remove any reference to it. Nothing
 in W9a depends on reading it: the row is named directly, and this spec is the
 record the refusal points at.
+
+#### 4.19.7 Evidence, measured 2026-09-04
+
+Built in `/dev/shm` with `TMPDIR` inside the build directory, `-j 2`, on
+`7b8b480b1` plus this branch: `-DVLLM_CPP_SERVER=ON -DVLLM_CPP_BUILD_TESTS=ON
+-DVLLM_CPP_CUDA=OFF -DCMAKE_BUILD_TYPE=Release`. No GPU, and none is applicable:
+this slice runs no arithmetic.
+
+**RED before, verbatim.** `test_model_loader_gguf` at the test-only commit,
+binary sha256 `736df440c58e3bfe8cfd8c314410aa9c7b4c1f519defcc37a036f23b0a57694c`:
+
+```
+[doctest] test cases: 11 |  9 passed | 2 failed | 0 skipped
+[doctest] assertions: 46 | 37 passed | 9 failed |
+[doctest] Status: FAILURE!
+```
+
+Nine failures, and one of them says WHY rather than merely that:
+
+```
+tests/vllm/test_model_loader_gguf.cpp:272: ERROR:
+  CHECK( message.find("is not supported by this build") == std::string::npos )
+  is NOT correct!
+  values: CHECK( 30 == 18446744073709551615 )
+```
+
+Offset 30 is exactly past `GGUF architecture 'dots3note' `, so the message an
+operator got was the build-level default and nothing else. The other eight are
+`npos` on every claim the case makes about the text.
+
+**GREEN after**, binary sha256
+`edc9e007e60eeb3cc80fa78cfbd23c6a5df6af3b3691434766ce33313f62ad91`:
+
+```
+[doctest] test cases: 11 | 11 passed | 0 failed | 0 skipped
+[doctest] assertions: 46 | 46 passed | 0 failed |
+```
+
+**The mutations.** Each was applied to the GREEN tree, rebuilt, run, and
+restored — and the restore is proved by the binary, not asserted: rebuilding
+after the last restore reproduced `edc9e007…` exactly.
+
+| # | Mutation | Binary sha256 | Result |
+|---|---|---|---|
+| M1 | Delete the whole `if (vllm::IsDots3NoteGguf(gguf))` branch from `src/vllm/entrypoints/model_loader.cpp::HfConfigFromGgufDispatch` — the production call site | `336a2a74…` | **RED** 11 / 9 passed / 2 failed, 46 / 37 / 9 |
+| M2 | `src/vllm/model_executor/models/dots3_note_registry.cpp::IsDots3NoteGguf` returns `false` unconditionally | `e54cefec…` | **RED** 11 / 9 passed / 2 failed, 46 / 37 / 9 |
+| — | restore | `edc9e007…` | **GREEN** 11 / 11, 46 / 46 |
+
+Both build cleanly (`ninja` exit 0), which is what makes their reds a
+measurement rather than the compile failure this row has twice read as a pass.
+M1 is the reachability mutation AGENTS.md's `## Nothing lands dead` asks for:
+with the call site gone, nothing in the tree produces the new string, and the
+suite goes red at the same nine assertions the pre-implementation RED failed on
+— the same count from the opposite direction, because the file falls back to the
+build-level default in both.
+
+**What these mutations do NOT prove.** They prove the dispatch branch is reached
+and that the predicate decides it. They say nothing about whether the SENTENCES
+are true; that is §4.19.2's table, whose evidence is a llama.cpp checkout and
+not this build. The two SHAs asserted in the test are the seam between them: the
+test holds the text stable, and only a reader with the clone can check that the
+text is right. A test cannot verify a claim about another repository, and this
+section does not pretend otherwise.
+
+**One sibling case had to MOVE, and it is the honest half of this slice.**
+`test_dots3_note_scaffold`'s "GGUF k-quants are OWED (W9)" subcase asserted the
+old literal and went red the moment the text moved into one owner. It now
+asserts the new substring AND that the factory guard's bytes equal
+`Dots3NoteGgufRefusal()` exactly, so the two doors cannot drift; its own comment
+carried the false llama.cpp claim and is corrected with the reason. That is a
+gate finding, not a bystander: a suite that stayed green through a rewritten
+refusal would have been measuring nothing about the text.
+
+| Suite | Result |
+|---|---|
+| `test_model_loader_gguf` | 11 / 11 cases, 46 / 46 assertions |
+| `test_dots3_note_scaffold` | 26 / 26 cases, 110836 / 110836 assertions (110835 before, +1 for the byte-equality assertion) |
+| `test_dots3_note_attn` | 51 / 51 cases, 6888 / 6888 |
+| `test_dots3_note_vision` | 13 / 13 cases, 21343 / 21343 |
+| `test_dots3_note_audio` | 28 / 28 cases, 4206 / 4206 |
+| `test_nemotron_h_scaffold` | 14 / 14 cases, 38311 / 38311 |
+| `test_model_resolver` | 11 / 11 cases, 61 / 61 |
+| `test_gguf` | 36 / 36 cases, 133 / 133 |
+
+`test_nemotron_h_scaffold` is in that list on purpose: this slice adds a second
+member to the block its refusal already occupies, and the way to get that wrong
+is to shadow the first one.
 
 ---
 
