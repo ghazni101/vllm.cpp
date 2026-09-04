@@ -13389,3 +13389,167 @@ TEST_CASE("ltx2 checkpoint class: the declaration is a CLAIM, and the engine say
   // the assertion: it is one file and the two loads disagree about what it is.
   CHECK(as_full.dit_path == as_distilled.dit_path);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ROW LTX25-DURATION-HEAD-WIRE (#2900) — the head gets a driver.
+//
+// `Ltx2DurationPredict` has been a gated brick since phase L5 and no production
+// path constructed one, so `duration_head_path` was refused by name and an auto
+// duration silently became the recipe default. These cases reach the head the
+// only way that proves anything: through `LoadVideoEngine` and `Generate`, the
+// two entry points a caller arrives at. A case that built an
+// `Ltx2DurationHeadConfig` by hand would prove the class works, which was never
+// in doubt and was never the defect.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// UPSTREAM'S `None`, WHICH IS NOT AN ERROR. `DurationPredictor.from_checkpoint`
+// (blocks.py:816-848) returns `None` when the file carries no head, because
+// every checkpoint predating LTX-2.5 / gemma4 is that file. Refusing the load
+// would make this port reject checkpoints upstream runs happily.
+//
+// `paths.dit` is a real, openable safetensors file with no `duration_head.*`
+// tensors in it, so this separates "no head in the file" from "no file".
+TEST_CASE("ltx2 video: a duration_head_path with no head weights LOADS, as upstream's None") {
+  Workspace ws;
+  vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+  mp.extras["duration_head_path"] = ws.paths.dit;
+  std::unique_ptr<vllm::multimodal::VideoEngine> engine;
+  REQUIRE_NOTHROW(engine = vllm::multimodal::LoadVideoEngine(mp));
+  REQUIRE(engine != nullptr);
+}
+
+// THE PARTIAL HEAD IS `None` TOO, and that is the half a complete-or-absent
+// fixture cannot see. Upstream builds with `strict=False` and then asks whether
+// ANY parameter is still on the meta device (blocks.py:838-844), so a file
+// holding fourteen of fifteen tensors yields no predictor rather than a
+// predictor that would fault in the forward.
+TEST_CASE("ltx2 video: a PARTIAL duration head is upstream's None, not a refusal") {
+  Workspace ws;
+  vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+  mp.extras["duration_head_path"] = ws.paths.duration_head_partial;
+  std::unique_ptr<vllm::multimodal::VideoEngine> engine;
+  REQUIRE_NOTHROW(engine = vllm::multimodal::LoadVideoEngine(mp));
+  REQUIRE(engine != nullptr);
+}
+
+// A PRESENT TENSOR AT THE WRONG SHAPE IS THE ONE CASE THAT REFUSES. It is not
+// the `None` path: nothing is missing, so `any(param.is_meta)` is False upstream
+// and the Builder would have had to bind it. Binding a differently-shaped tensor
+// runs the head as a silently different module, which is the failure this
+// distinction exists to prevent.
+TEST_CASE("ltx2 video: a duration head tensor at the WRONG SHAPE refuses by name") {
+  Workspace ws;
+  vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+  mp.extras["duration_head_path"] = ws.paths.duration_head_wrong_shape;
+  try {
+    (void)vllm::multimodal::LoadVideoEngine(mp);
+    FAIL("a wrong-shaped head tensor must refuse, not bind a different module");
+  } catch (const std::exception& e) {
+    const std::string msg = e.what();
+    INFO(msg);
+    CHECK(msg.find("mlp_out.weight") != std::string::npos);
+    // NOT the None path's silence, and not the unknown-key message.
+    CHECK(msg.find("unknown load extra") == std::string::npos);
+  }
+}
+
+// THE POSITION IS THE BEHAVIOUR, and this case gates the position rather than
+// the message. `require_num_frames_source` runs at the very top of upstream's
+// `__call__`, before prompt encoding or any other work (blocks.py:896-899), so a
+// checkpoint with no head fails fast instead of paying for work whose result is
+// discarded.
+//
+// HOW THE ORDER IS OBSERVED WITHOUT AN INSTRUMENT: the request is ALSO invalid
+// in a way that refuses LATER. A width of 33 is not a multiple of the resolution
+// divisor, and `Ltx2AssertResolution` runs after prompt encoding and after the
+// connector. If the auto-duration guard sits where upstream puts it, this
+// request hears about the duration; if it slid down to the resolution point or
+// past it, this request hears about the width instead. Both refusals are
+// correct in isolation, so only their ORDER distinguishes the two ports -- which
+// is exactly what a message-only assertion cannot see.
+TEST_CASE("ltx2 video: an auto duration with no head refuses at the TOP, before any work") {
+  Workspace ws;
+  vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+  std::unique_ptr<vllm::multimodal::VideoEngine> engine = vllm::multimodal::LoadVideoEngine(mp);
+  vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/out");
+  gen.num_frames = 0;  // no explicit count
+  gen.width = 33;      // and a width that refuses LATER
+  gen.extras["auto_duration"] = "1,20";
+  try {
+    (void)engine->Generate(gen);
+    FAIL("an auto duration with no duration head must refuse");
+  } catch (const std::exception& e) {
+    const std::string msg = e.what();
+    INFO(msg);
+    CHECK(msg.find("duration") != std::string::npos);
+    // THE ORDERING ASSERTION. The later refusal must NOT be the one that fired.
+    CHECK(msg.find("not divisible") == std::string::npos);
+  }
+}
+
+// THE CAPABILITY, REACHED. A head named at load is opened, and the frame count
+// the render uses comes from it rather than from the recipe. The assertion is
+// that the count is the head's and NOT the recipe's, because a wiring that
+// loaded the head and then ignored it passes any check that only asks whether
+// the render succeeded.
+TEST_CASE("ltx2 video: a loaded duration head DECIDES the frame count") {
+  Workspace ws;
+  vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+  mp.extras["duration_head_path"] = ws.paths.duration_head;
+  std::unique_ptr<vllm::multimodal::VideoEngine> engine = vllm::multimodal::LoadVideoEngine(mp);
+
+  vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/out");
+  gen.num_frames = 0;
+  gen.extras["auto_duration"] = "1,20";
+  vllm::multimodal::VideoResult res;
+  REQUIRE_NOTHROW(res = engine->Generate(gen));
+
+  // The recipe default is what this used to silently become. A predicted count
+  // that happened to equal it would make this case pass for the wrong reason, so
+  // the fixture's head is asserted to disagree with it.
+  vllm::multimodal::VideoGenParams recipe_gen = FixtureGen(ws.root + "/out_recipe");
+  recipe_gen.num_frames = 0;
+  std::unique_ptr<vllm::multimodal::VideoEngine> plain =
+      vllm::multimodal::LoadVideoEngine(FixtureParams(ws.paths));
+  vllm::multimodal::VideoResult recipe_res = plain->Generate(recipe_gen);
+  INFO("auto=" << res.frame_count << " recipe=" << recipe_res.frame_count);
+  CHECK(res.frame_count != recipe_res.frame_count);
+  // Every count this port emits sits on the causal temporal grid.
+  CHECK((res.frame_count - 1) % 8 == 0);
+}
+
+// The request surface, mirrored from `--auto-duration MIN_SECONDS MAX_SECONDS`
+// (utils/args.py:108-122) including its own MIN > MAX refusal.
+TEST_CASE("ltx2 video: auto_duration refuses MIN > MAX and refuses doubling an explicit count") {
+  Workspace ws;
+  vllm::multimodal::VideoModelParams mp = FixtureParams(ws.paths);
+  mp.extras["duration_head_path"] = ws.paths.duration_head;
+  std::unique_ptr<vllm::multimodal::VideoEngine> engine = vllm::multimodal::LoadVideoEngine(mp);
+
+  SUBCASE("MIN > MAX") {
+    vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/out_a");
+    gen.num_frames = 0;
+    gen.extras["auto_duration"] = "9,2";
+    try {
+      (void)engine->Generate(gen);
+      FAIL("auto_duration with MIN > MAX must refuse");
+    } catch (const std::exception& e) {
+      const std::string msg = e.what();
+      INFO(msg);
+      CHECK(msg.find("auto_duration") != std::string::npos);
+    }
+  }
+  SUBCASE("two frame sources") {
+    vllm::multimodal::VideoGenParams gen = FixtureGen(ws.root + "/out_b");
+    gen.num_frames = 9;  // explicit AND auto
+    gen.extras["auto_duration"] = "1,20";
+    try {
+      (void)engine->Generate(gen);
+      FAIL("an explicit count and auto_duration together must refuse, not pick one");
+    } catch (const std::exception& e) {
+      const std::string msg = e.what();
+      INFO(msg);
+      CHECK(msg.find("auto_duration") != std::string::npos);
+    }
+  }
+}

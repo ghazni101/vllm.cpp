@@ -37,6 +37,11 @@ THE THREE RULES THIS EXISTS TO SEPARATE, each of which type-checks both ways:
    upstream returns 9.
 3. `round`, NOT TRUNCATION (helpers.py:578). `round(seconds * frame_rate)` and
    a C++ cast-to-int agree on about half of all inputs.
+4. THAT `round` IS BANKER'S ROUNDING, NOT `std::llround`. Python rounds a half
+   to EVEN and `llround` rounds it away from zero, and the difference is not a
+   measure-zero curiosity: 0.34 s at 25 fps is exactly 8.5, where upstream takes
+   8 and returns frame 1 while `llround` takes 9 and returns frame 9. The
+   obvious C++ spelling is wrong by eight frames on that request.
 
 DETERMINISM (#2855). The head runs under `torch.no_grad` on a single thread
 pinned by `torch.set_num_threads(1)`, and the synthetic weights are a closed
@@ -143,6 +148,25 @@ def rejected_no_undershoot_repair(seconds, frame_rate, min_frames, max_frames, t
     return ((raw - 1) // time_scale) * time_scale + 1
 
 
+def rejected_half_away(seconds, frame_rate, min_frames, max_frames, time_scale):
+    """Rule 4's alternative: round half AWAY FROM ZERO, which is `std::llround`.
+
+    Python's `round` is BANKER'S rounding -- half to EVEN -- and C++'s `llround`
+    is half away from zero. They differ only when `seconds * frame_rate` lands
+    exactly on a half-integer, which sounds like a measure-zero curiosity and is
+    not: 0.34 s at 25 fps is exactly 8.5, where upstream floors to 8 and lands on
+    frame 1, and `llround` takes 9 and lands on frame 9. A port that reached for
+    the obvious C++ spelling would be wrong by eight frames on that request.
+    """
+    product = seconds * frame_rate
+    raw = math.floor(product + 0.5) if product >= 0 else math.ceil(product - 0.5)
+    raw = max(min_frames, min(int(raw), max_frames))
+    frames = ((raw - 1) // time_scale) * time_scale + 1
+    if frames < min_frames:
+        frames = min(-(-(min_frames - 1) // time_scale) * time_scale + 1, max_frames)
+    return frames
+
+
 def rejected_truncate(seconds, frame_rate, min_frames, max_frames, time_scale):
     """Rule 3's alternative: truncate toward zero where upstream rounds."""
     raw = int(seconds * frame_rate)
@@ -246,8 +270,14 @@ def cpp_lines(up) -> list[str]:
         (7.0, 30.0, 30, 240),      # 210 -> floors to 209
         (13.7, 24.0, 24, 240),     # 328.8 -> clamped to 240 -> 233
         (4.0, 8.0, 8, 64),         # frame_rate == time_scale
+        # EXACT HALF-INTEGERS, where banker's rounding and `llround` part. These
+        # are the cases a port that reached for the obvious C++ spelling fails.
+        (0.34, 25.0, 1, 1024),     # 8.5 -> upstream 8 (even), llround 9
+        (0.5, 49.0, 1, 1024),      # 24.5 -> upstream 24 (even), llround 25
+        (0.5, 25.0, 1, 1024),      # 12.5 -> upstream 12 (even), llround 13
+        (1.7, 25.0, 1, 1024),      # 42.5 -> upstream 42 (even), llround 43
     ]
-    sep_snap_first = sep_no_repair = sep_truncate = 0
+    sep_snap_first = sep_no_repair = sep_truncate = sep_half_away = 0
     for seconds, fps, lo, hi in cases:
         got = up.seconds_to_clamped_num_frames(
             seconds, frame_rate=fps, min_frames=lo, max_frames=hi
@@ -255,19 +285,23 @@ def cpp_lines(up) -> list[str]:
         r1 = rejected_snap_then_clamp(seconds, fps, lo, hi, TIME_SCALE)
         r2 = rejected_no_undershoot_repair(seconds, fps, lo, hi, TIME_SCALE)
         r3 = rejected_truncate(seconds, fps, lo, hi, TIME_SCALE)
+        r4 = rejected_half_away(seconds, fps, lo, hi, TIME_SCALE)
         sep_snap_first += got != r1
         sep_no_repair += got != r2
         sep_truncate += got != r3
-        add(f"    {{{seconds!r}, {fps!r}, {lo}, {hi}, {got}, {r1}, {r2}, {r3}}},")
+        sep_half_away += got != r4
+        add(f"    {{{seconds!r}, {fps!r}, {lo}, {hi}, {got}, {r1}, {r2}, {r3}, {r4}}},")
     add("};")
     add(f"inline constexpr int kLtx2ClampSeparatingSnapFirst = {sep_snap_first};")
     add(f"inline constexpr int kLtx2ClampSeparatingNoRepair = {sep_no_repair};")
     add(f"inline constexpr int kLtx2ClampSeparatingTruncate = {sep_truncate};")
+    add(f"inline constexpr int kLtx2ClampSeparatingHalfAway = {sep_half_away};")
     add("")
     for label, count in (
         ("clamp-before-snap", sep_snap_first),
         ("the undershoot repair", sep_no_repair),
         ("round-not-truncate", sep_truncate),
+        ("banker's rounding from llround's half-away-from-zero", sep_half_away),
     ):
         if count == 0:
             raise SystemExit(f"REFUSING TO EMIT: no case separates {label} from upstream")
@@ -363,8 +397,10 @@ def main() -> None:
         "#pragma once",
         "#include <cstdint>",
         "",
+        "namespace vllm_test {",
+        "",
     ]
-    args.out.write_text("\n".join(header + body) + "\n")
+    args.out.write_text("\n".join(header + body + ["", "}  // namespace vllm_test"]) + "\n")
     print(f"wrote {args.out} ({len(body)} lines of goldens)")
 
 
