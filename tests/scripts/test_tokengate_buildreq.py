@@ -37,10 +37,16 @@ own wiring cannot be audited.
    normalises to the same name, and a tree whose `requires` cannot be read.
    The absent case is the mutation that matters: a checker that cannot go red
    over a missing build requirement measures nothing.
-3. Two things the repair MUST NOT have moved: the ten staged-input `assert_sha`
-   calls, and the exit-code map in which DRIFT is 7 and every instrument failure
-   is something else. A drift that shares a code with a broken instrument is the
-   one outcome this job exists to tell apart.
+3. Three things the repair MUST NOT have moved: the ten staged-input
+   `assert_sha` calls, the compute-capability guard that refuses any device but
+   the GB10 the committed golden was captured on, and the exit-code map in which
+   DRIFT is 7 and every instrument failure is something else. A drift that
+   shares a code with a broken instrument is the one outcome this job exists to
+   tell apart.
+4. The four SHELL lines that turn the checker's red into a refusal. Case 2 above
+   executes the checker and pins what it RETURNS; nothing there reaches the
+   `BUILDREQ_RC=$?` / `-ne 0` / `exit 3` wiring that stops the job, and a
+   checker whose red the build ignores is a log line, not a gate.
 
 Nothing here needs a GPU, a lease, a network or a vLLM checkout: `bash`, the
 standard library, and scratch directories, in well under a second.
@@ -226,6 +232,23 @@ class BuildRequiresAreInstalledFromTheTree(unittest.TestCase):
             "missing file is the one shape that could pass silently",
         )
         self.assertLess(guard, self.install_index())
+        # ...and it has to REFUSE, not merely branch. Existence and order were
+        # pinned here from the start; the exit was not, and `exit 3 -> exit 0`
+        # on this branch survived the suite green.
+        closed = -1
+        for i in range(guard + 1, len(lines)):
+            if re.match(r"^\s*fi\s*$", lines[i]):
+                closed = i
+                break
+        self.assertGreater(closed, guard, "the missing-file guard's `if` never closes")
+        body = "\n".join(lines[guard + 1 : closed])
+        self.assertRegex(
+            body,
+            re.compile(r"^\s*exit 3\s*$", re.MULTILINE),
+            "the missing-file branch no longer exits 3, so a clone without "
+            "requirements/build/cuda.txt falls through into the "
+            "--no-build-isolation build with the venv it happened to have",
+        )
 
     def test_the_install_precedes_the_no_build_isolation_build(self) -> None:
         lines = script_lines()
@@ -322,6 +345,62 @@ class TheRepairMovedNothingItMustNotMove(unittest.TestCase):
                 f"the assertion for {name} carries no sha256 to compare against",
             )
 
+    def test_the_compute_capability_guard_survives(self) -> None:
+        """The device assertion is the reason this job is pinned to `dgx:gpu0`.
+
+        The committed golden was captured on GB10. A candidate capture on any
+        other silicon moves revision AND device at once and cannot attribute a
+        difference, which is the whole argument for holding the box fixed.
+
+        BOTH halves are pinned, because reading the capability and refusing on
+        it are separate lines: delete the read alone and the guard compares an
+        unset `CAP`; delete the guard alone and the read becomes a log line.
+        """
+        lines = script_lines()
+        read_at = first_match(
+            lines, r'^\s*CAP="\$\(\s*nvidia-smi\b.*\bcompute_cap\b.*\)"\s*$'
+        )
+        self.assertGreaterEqual(
+            read_at,
+            0,
+            "nothing reads the device's compute capability out of nvidia-smi "
+            "any more, so the guard below it compares an unset CAP and the job "
+            "captures on whatever silicon the lease handed it",
+        )
+        guard_at = first_match(lines, r'^\s*if \[ "\$CAP" != "12\.1" \]; then\s*$')
+        self.assertGreaterEqual(
+            guard_at,
+            0,
+            "the compute-capability guard is gone; a capture on anything but "
+            "GB10 (12.1) is not the measurement this job was asked for, and "
+            "without the refusal it would carry the right label anyway",
+        )
+        self.assertLess(
+            read_at, guard_at, "CAP is compared before anything reads it"
+        )
+        closed_at = -1
+        for i in range(guard_at + 1, len(lines)):
+            if re.match(r"^\s*fi\s*$", lines[i]):
+                closed_at = i
+                break
+        self.assertGreater(closed_at, guard_at, "the device guard's `if` never closes")
+        body = "\n".join(lines[guard_at + 1 : closed_at])
+        self.assertRegex(
+            body,
+            re.compile(r"^\s*exit 2\s*$", re.MULTILINE),
+            "the wrong-device branch no longer exits 2, the map's `wrong "
+            "device: nothing was measured`; a guard that prints and continues "
+            "produces the number it exists to prevent",
+        )
+        stage_at = first_match(lines, r'^\s*if \[ "\$STAGE" = "build" \]')
+        self.assertGreaterEqual(stage_at, 0, "the build stage vanished")
+        self.assertLess(
+            closed_at,
+            stage_at,
+            "the device is checked after the build stage has started, so the "
+            "refusal no longer means that nothing was measured",
+        )
+
     def test_drift_keeps_an_exit_code_no_instrument_failure_uses(self) -> None:
         text = SCRIPT.read_text(encoding="utf-8")
         tail = text[text.rindex('case "${DIFF_RC:-0}" in') :]
@@ -346,6 +425,108 @@ class TheRepairMovedNothingItMustNotMove(unittest.TestCase):
         self.assertTrue(
             instrument,
             "no refusal path exits non-zero any more",
+        )
+
+
+class TheShellRefusesWhenTheEmbeddedAssertionReds(unittest.TestCase):
+    """A checker that goes red and a script that builds anyway is not a gate.
+
+    `TheEmbeddedAssertionDetectsAMissingRequirement` runs the checker and pins
+    what it RETURNS. Nothing there reaches the shell that reads that return
+    value, and the two layers fail independently: the checker can name every
+    absent distribution correctly while `$?` is never read, the branch is never
+    taken, or the refusal exits 0 into the build it was supposed to stop. Those
+    lines are therefore pinned here, statically, over the committed script.
+    """
+
+    def assertion_block(self) -> list[str]:
+        lines = script_lines()
+        begin = first_index(lines, ASSERT_BEGIN)
+        end = first_index(lines, ASSERT_END)
+        self.assertGreaterEqual(begin, 0, "the assertion block's begin sentinel is gone")
+        self.assertGreater(end, begin, "the assertion block's end sentinel is gone")
+        return lines[begin : end + 1]
+
+    def test_the_checker_is_handed_the_cloned_tree_not_a_snapshot(self) -> None:
+        at = first_match(
+            self.assertion_block(),
+            r"""^\s*"\$WORK/venv/bin/python" - "\$WORK/vllm/pyproject\.toml" <<'PY'\s*$""",
+        )
+        self.assertGreaterEqual(
+            at,
+            0,
+            "the checker is no longer handed $WORK/vllm/pyproject.toml -- the "
+            "tree `git checkout $TARGET_SHA` produced -- read by the BUILD "
+            "venv's own interpreter. Reading the requires from a snapshot "
+            "instead of the clone is the drift this repair exists to remove, "
+            "and resolving them in any interpreter but the one the build runs "
+            "in answers a question nobody asked",
+        )
+
+    def test_the_status_the_refusal_tests_is_the_checkers_own(self) -> None:
+        block = self.assertion_block()
+        close_at = -1
+        for i, line in enumerate(block):
+            if line == "PY":
+                close_at = i
+                break
+        else:
+            self.fail("the checker heredoc is never closed by a bare `PY`")
+        after = [ln for ln in block[close_at + 1 :] if ln.strip()]
+        self.assertTrue(after, "nothing at all follows the checker")
+        self.assertRegex(
+            after[0].strip(),
+            r"^BUILDREQ_RC=\$\?$",
+            "the first statement after the checker is not `BUILDREQ_RC=$?`, so "
+            "the value the refusal tests is not the checker's status: `$?` "
+            "reads whatever ran last, and a literal makes the refusal below "
+            "unreachable while leaving it in the file to read as a guard",
+        )
+
+    def test_a_red_checker_stops_the_job_with_the_prerequisites_code(self) -> None:
+        block = self.assertion_block()
+        guard_at = first_match(block, r'^\s*if \[ "\$BUILDREQ_RC" -ne 0 \]; then\s*$')
+        self.assertGreaterEqual(
+            guard_at,
+            0,
+            "nothing branches on BUILDREQ_RC, so a checker that has just named "
+            "three absent build requirements is followed by the "
+            "--no-build-isolation build regardless: the efc30c74 traceback, "
+            "with a warning printed above it",
+        )
+        closed_at = -1
+        for i in range(guard_at + 1, len(block)):
+            if re.match(r"^\s*fi\s*$", block[i]):
+                closed_at = i
+                break
+        self.assertGreater(closed_at, guard_at, "the refusal's `if` never closes")
+        body = "\n".join(block[guard_at + 1 : closed_at])
+        self.assertRegex(
+            body,
+            re.compile(r'^\s*sum "BUILDREQ_RC=1', re.MULTILINE),
+            "the refusal no longer prints BUILDREQ_RC=1, which is the field a "
+            "reader of the job log greps the SUM lines for",
+        )
+        self.assertRegex(
+            body,
+            re.compile(r"^\s*exit 3\s*$", re.MULTILINE),
+            "the refusal no longer exits 3, the map's `staging or build "
+            "prerequisites missing`; exit 0 walks into the build it was "
+            "supposed to stop, and any other code reports the wrong class",
+        )
+
+    def test_the_whole_assertion_precedes_the_build_it_guards(self) -> None:
+        self.assertion_block()  # both sentinels exist, so the index below is real
+        lines = script_lines()
+        build_at = first_match(lines, r"pip\"\s+wheel\b[^\n]*--no-build-isolation")
+        self.assertGreaterEqual(build_at, 0, "the wheel build vanished")
+        end_at = first_index(lines, ASSERT_END)
+        self.assertGreaterEqual(end_at, 0, "the assertion block's end sentinel is gone")
+        self.assertLess(
+            end_at,
+            build_at,
+            "the build requirements are asserted AFTER the build that needs "
+            "them, which is the same failure with a longer log",
         )
 
 
