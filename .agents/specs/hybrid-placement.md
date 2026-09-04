@@ -786,9 +786,61 @@ half, in its OWN binary because `VT_PLACEMENT_DUMP_MOE` latches on first use and
 to "unset" and the suite would pass while asserting nothing. Mutation-proven at
 1 case / 4 assertions on a mutant that compiles at rc=0.
 
-**Owed:** the placed branch itself, still untested on CPU. Closing it needs a
-loopback placement target or a GPU-gated test. Named rather than assumed
-covered.
+**Owed — CLOSED by W3i.** This said the placed branch was untested on CPU and
+that closing it needed "a loopback placement target or a GPU-gated test". The
+first half was true; the second was a false dichotomy. The loopback belongs on
+the ENGINE, not on the placement target, and `test_placed_moe_roundtrip.cpp` now
+executes the branch on a CPU-only build. The paragraph above still states the
+reason nothing caught the truncation at the time, which remains accurate history.
+
+### W3i — the placed branch IS reachable on a CPU-only build ([#2714](https://github.com/mudler/vllm.cpp/issues/2714))
+
+Three places in this spec, and issue #2714 itself, record the same conclusion:
+the placed branch needs a GPU or a Vulkan/lavapipe build, because the CPU is the
+only legal placement TARGET and a CPU engine therefore always short-circuits.
+**The conclusion is wrong, and it was wrong when it was written.**
+
+`PlacementQueue` constrains the DESTINATION. It says nothing about the engine,
+and `RunMoePlaced` reads the engine device from `engine.q.device.type` — a field
+on a `vt::Queue` the caller supplies. So the branch fires whenever the engine
+identifies as anything other than the CPU. It does not need the engine to BE a
+GPU; it needs the engine to be a different registered device.
+
+That is a thing this repository already builds, in five files, with a comment in
+`test_device_pool.cpp:476` naming `kXPU` as "the type with no `RegisterPlatform`
+call anywhere in the tree":
+
+    tests/vllm/entrypoints/test_device_selection.cpp:72
+    tests/vllm/entrypoints/test_gguf_device_fit_reach.cpp:150
+    tests/vllm/model_executor/test_expert_stream_device_slot.cpp:141
+    tests/vllm/model_executor/test_resident_weight_f32_copy_retires.cpp:152
+    tests/vllm/model_executor/test_resident_weight_host_addressable.cpp:142
+
+So the engine is a **loopback backend** registered on `kXPU`: a distinct device
+identity whose `Alloc`, `Copy`, `Memset` and `Synchronize` delegate to the real
+CPU backend. Placement stays `kCPU`. `placed_on != engine_device`, and every line
+of the round trip executes — the down copy sized by `dh.dtype`, the block on the
+placement queue, the up copy sized by the OUTPUT dtype, the dump hook, and the
+hand-back into an engine-pool `DBuf`.
+
+**What this proves and what it does not.** Because both sides are host memory,
+the two arms are comparable BYTE-FOR-BYTE rather than within a tolerance, which
+is the right bar: placement is a scheduling decision and must never change a
+value. It does not prove that a real PCIe or NVLink transfer works — the W3h GB10
+run at NMSE 5.239e-06 is that evidence, and the two are complements. What it adds
+is the half W3h cannot give: a gate that runs on every merge, on every CI tier,
+with no GPU and no checkpoint.
+
+**Why it matters more than a restored test.** W3g's f32 truncation shipped, was
+merged, and was reviewed, because no reviewer could execute the branch. The
+mutation `reachability.md` asks for is now runnable here: hardcode `kBF16` back
+into the seam's six sites and this suite reds.
+
+`tests/vllm/model_executor/test_placed_moe_roundtrip.cpp` restores the name
+`6416aab85` deleted, on the mechanism the old one lacked. The old file forced the
+round trip by passing `kCPU` as an explicit placement argument to
+`RunMoeBlockPlaced`, a parameter the shared seam does not have; this one crosses
+a real device boundary instead of asking for one.
 
 ## Risks and decisions
 
@@ -939,20 +991,20 @@ nothing moved. The gate now refuses that case by name.
   which was calling a symbol that no longer existed and had stopped `main`
   building.
 
-  **So there is no byte-for-byte gate on the placement round trip at all**, and
-  the reason it cannot simply be rewritten is structural rather than
-  circumstantial. `RunMoePlaced` short-circuits when the placement device equals
-  the engine device -- `if (placed_on == engine_device) return body(engine, dh);`,
-  no copy and no allocation -- so the transfer is reachable ONLY cross-device.
-  The deleted test had reached it by passing `kCPU` as the placement device
-  explicitly, which the seam no longer accepts. The gate is recorded under
-  `## Owed` in [expert-stream-device-slots.md](expert-stream-device-slots.md).
+  **CLOSED by W3i (#2714).** Both halves above are history and stay as written.
+  What followed them was an error worth keeping visible: this bullet concluded
+  the gate "cannot simply be rewritten" for a "structural" reason, and the
+  structure it named is real but does not have that consequence. The seam does
+  short-circuit when the placement device equals the engine device, and the
+  transfer IS reachable only cross-device -- so the fix is to move the ENGINE,
+  which needs no GPU. `test_placed_moe_roundtrip.cpp` does that with a loopback
+  backend on `kXPU`, and the round trip is byte-for-byte gated again on every CI
+  tier.
 
-  The `RunMoeLayer` branch that SELECTS the placement cannot be entered by any
-  test here either, for the same reason: it needs the engine device and the
-  placement device to differ. That is the Vulkan gate this row owes -- a Vulkan
-  engine with the routed experts on the CPU, token-exact against the same model
-  run wholly on the CPU -- and it now covers the transfer as well as the branch.
+  The selection branch is entered by the same test, for the same reason: it
+  needed the engine device and the placement device to differ, and a loopback
+  engine makes them differ. The Vulkan gate this row used to owe was never the
+  only way to get there.
 - ~~**W3a's `MoePlacementPlan` lands UNREACHED**~~ — CLOSED by W3b, which reads
   the plan in `RunMoeLayer`.
 - **W3a's `MoePlacementPlan` lands UNREACHED**, declared here as
