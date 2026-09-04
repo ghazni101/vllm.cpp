@@ -14,6 +14,11 @@
 
 #include "gguf_builder.h"
 #include "vllm/entrypoints/model_loader.h"
+// dots3_note.h is a MODEL-PRIVATE header under src/ (W1 ships nothing on the
+// public ABI). It is here for ONE symbol: `Dots3NoteGgufRefusal`, so the
+// REACHABLE door can be compared to its owner byte-for-byte rather than by
+// substring. Same arrangement test_dots3_note_scaffold uses.
+#include "vllm/model_executor/models/dots3_note.h"
 
 using gguf_test::TempFile;
 using vllm::entrypoints::EngineParams;
@@ -247,8 +252,9 @@ TEST_CASE("FromModelDir rejects an unknown dense architecture before loading") {
 
 // MODEL-MM-dots3-note W9a (#2882). The dots3-note GGUF refusal was CAREFUL and
 // UNREACHABLE: `LoadDots3NoteForCausalLM` refused `Kind::kGguf` by name, naming
-// the row and the brick, but `HfConfigFromGgufDispatch` (model_loader.cpp:2668)
-// runs long before `ModelSource::FromGguf` (:3069), so a real `dots3note` file
+// the row and the brick, but
+// `src/vllm/entrypoints/model_loader.cpp::HfConfigFromGgufDispatch` runs long
+// before the same function's `ModelSource::FromGguf`, so a real `dots3note` file
 // died at the build-level default naming neither the model, the row, the brick,
 // nor what is owed. These cases drive `LoadedEngine::FromModelDir` — the entry
 // point every server and CLI `.gguf` argument takes — exactly as the #809 cases
@@ -298,4 +304,52 @@ TEST_CASE("the dots3note GGUF refusal tells the truth about llama.cpp") {
   // And it does NOT oversell the position: this build still cannot read one.
   // W9b/W9c/W9e/W9f own that (spec §4.19.5).
   CHECK(message.find("cannot read it yet") != std::string::npos);
+}
+
+// The fresh review of #2882 measured this hole and it is the reason this case
+// exists. `test_dots3_note_scaffold` asserts that the FACTORY guard's bytes
+// equal `Dots3NoteGgufRefusal()` -- but the factory guard is the door THIS SLICE
+// PROVES UNREACHABLE, so that assertion holds the one door a real file never
+// arrives at. Measured on the reviewed head: appending `" (dots3note)"` to the
+// string `HfConfigFromGgufDispatch` throws left BOTH suites fully green. "The
+// two doors cannot drift" was a claim about one door.
+//
+// This case holds the OTHER one, and it is the only byte-exact assertion on
+// what a user actually reads: FromModelDir's thrown message, whole, against the
+// single owner both doors are supposed to borrow from. A substring set cannot
+// do this -- every substring above still matched while the mutated build
+// printed a different message.
+TEST_CASE("the REACHABLE dots3note refusal is byte-identical to its ONE owner") {
+  CHECK(RefusalFor(GgufWithArchitecture("dots3note")) ==
+        vllm::Dots3NoteGgufRefusal());
+}
+
+// `IsDots3NoteGguf` was proved to FIRE (delete the dispatch branch, or return
+// `false`, and the cases above go red) and proved not to fire for EVERYTHING
+// (return `true` unconditionally and the `mamba-unported` case above goes red).
+// The narrow half was open: nothing fed it a NEAR MISS, so loosening its `==`
+// to a prefix match left both suites green. That is the "right reason" half of
+// the gate, and these two architectures close it.
+//
+// `dots3note-moe` is the prefix case -- a plausible future sibling whose GGUF is
+// NOT this model's. `dots3_note` is the underscore spelling W1's own refusal
+// text used, which is the separator-normalising variant of the same error. A
+// file carrying either is not a dots3-note file, so both must reach the
+// build-level default that names the file's own architecture, and neither may
+// be claimed by a row that does not owe it.
+TEST_CASE("a NEAR-MISS GGUF architecture is NOT claimed by dots3-note") {
+  for (const char* arch_c : {"dots3note-moe", "dots3_note"}) {
+    const std::string arch(arch_c);
+    CAPTURE(arch);
+    const std::string message = RefusalFor(GgufWithArchitecture(arch));
+    REQUIRE_FALSE(message.empty());
+
+    // The build-level default, naming the file's OWN architecture...
+    CHECK(message.find("is not supported by this build") != std::string::npos);
+    CHECK(message.find(arch) != std::string::npos);
+    // ...and NOT dots3-note's refusal, in either the substring or the byte form.
+    CHECK(message.find("MODEL-MM-dots3-note-dots3-note-for-causal-lm") ==
+          std::string::npos);
+    CHECK(message != vllm::Dots3NoteGgufRefusal());
+  }
 }

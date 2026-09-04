@@ -112,6 +112,11 @@ target_include_directories(test_qwen36_weights PRIVATE
 vllm_cpp_add_test(test_gguf_qwen36_loader vllm/test_gguf_qwen36_loader.cpp)
 vllm_cpp_add_test(test_gguf_keep_quant vllm/test_gguf_keep_quant.cpp)
 vllm_cpp_add_test(test_model_loader_gguf vllm/test_model_loader_gguf.cpp)
+# The dots3-note cases compare FromModelDir's thrown bytes with
+# `vllm::Dots3NoteGgufRefusal()`, declared in the MODEL-PRIVATE header
+# src/vllm/model_executor/models/dots3_note.h (#2882 W9a). Same arrangement
+# test_dots3_note_scaffold uses.
+target_include_directories(test_model_loader_gguf PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_model_registry vllm/models/test_model_registry.cpp)
 vllm_cpp_add_test(test_vocoder1d vllm/models/test_vocoder1d.cpp)
 # For src/vt/cpu/cpu_conv1d_block.h: the multi-block case asserts the geometry
