@@ -225,11 +225,19 @@ refused. Asking for an auto duration when no predictor is available fails
 immediately, at the top of the call, before any prompt encoding or diffusion
 work is paid for.
 
-The head runs in f32 here where upstream builds it in bfloat16. That arm is
-owed ([#2900](https://github.com/mudler/vllm.cpp/issues/2900)).
+**The WINDOW is ABI-only.** `--duration-head` is a command-line flag and
+omitting `--frames` is how the command line asks for an auto duration, so the
+capability itself is reachable from the CLI on its defaults. Overriding the
+window is not: `auto_duration` has no flag of its own and is set only through
+the C ABI's per-generation extras (`vllm_video_params`). A command-line render
+against a loaded head therefore uses upstream's own defaults, 1 s and 20 s.
 
-`/v1/videos` does not carry `auto_duration`: that endpoint forwards no
+`/v1/videos` does not carry `auto_duration` either: that endpoint forwards no
 per-generation extra to any engine yet (#928).
+
+The head runs in f32 here where upstream builds it in bfloat16. That arm is
+owed under `## Owed` in `.agents/specs/ltx25-duration-head-wire.md`, as the
+eighth component of gap A24.
 
 ## Dynamic frame-rate temporal rounds
 

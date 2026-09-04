@@ -96,9 +96,12 @@ carries the rendered geometry.
 
 ### 3.1 `Ltx2LoadDurationHeadWeights` — upstream's `None`, not an error
 
-New in `ltx2_loader.{h,cpp}`, shaped on `Ltx2LoadConnectorWeights`
+New in `ltx2_duration_head.{h,cpp}`, shaped on `Ltx2LoadConnectorWeights`
 (`ltx2_loader.cpp:1534`) because it solves the same problem against the same
-`Ltx2VaeWeights` bag:
+`Ltx2VaeWeights` bag. **This section first said `ltx2_loader.{h,cpp}` and the
+loader is not where it went**: the head's file is a plain safetensors bag with no
+quantization plan and no shards, so it reads directly rather than through the
+DiT planner, and it sits beside the forward it feeds:
 
 ```
 bool Ltx2LoadDurationHeadWeights(const SafetensorsFile& file,
@@ -131,8 +134,17 @@ int64_t Ltx2DurationPredictFrames(const Ltx2DurationHeadConfig& config,
                                   const Ltx2VaeWeights& weights,
                                   const float* video_tokens, int64_t video_token_count,
                                   const float* audio_tokens, int64_t audio_token_count,
-                                  double frame_rate, double min_seconds, double max_seconds);
+                                  double frame_rate, double min_seconds, double max_seconds,
+                                  int64_t time_scale, float* predicted_seconds);
 ```
+
+The last two parameters were not in this section's first draft and both are
+load-bearing. `time_scale` is the VAE's causal temporal factor, passed in rather
+than assumed so the auto-duration snap and the latent shapes cannot disagree
+about it. `predicted_seconds` returns the RAW prediction beside the frame count,
+which is what lets a mismatch say whether the forward or the snapping moved
+instead of arriving as one wrong integer; `Ltx2ConditioningTrace` carries it, and
+T7 asserts against it.
 
 **Three rules here fail silently and each is gated separately** (§5):
 
@@ -145,8 +157,15 @@ int64_t Ltx2DurationPredictFrames(const Ltx2DurationHeadConfig& config,
    recovers with a ceiling division back onto the grid, then takes `min` with
    `max_frames`. Dropping that `min` breaks the window in the other direction on
    a degenerate range.
-3. **`round`, not truncation** (`:578`). `round(seconds * frame_rate)` and
-   `(int)(seconds * frame_rate)` agree on roughly half of all inputs.
+3. **`round` AS PYTHON DEFINES IT — half-to-EVEN — and not truncation**
+   (`:578`). Two rules are wrong here, not one. `(int)(seconds * frame_rate)`
+   truncates and disagrees with `round` on roughly half of all inputs; and
+   `std::llround`, which is the obvious repair, rounds a half AWAY FROM ZERO
+   where Python takes the even neighbour. 0.34 s at 25 fps is exactly 8.5:
+   upstream takes 8 and snaps to frame 1, `llround` takes 9 and snaps to frame 9.
+   Eight frames, on a request a user can type. The goldens carry that case and
+   0.5 s at 49 fps beside it, with `llround`'s answer in a
+   `rejected_half_away` column.
 
 The batch refusal (`blocks.py:857-861`) is mirrored: this port takes `batch` out
 of the signature entirely and always predicts one item, which is the same
@@ -186,7 +205,30 @@ refusal. This port has a recipe where upstream has a required argument, and the
 recipe is what stands in for the caller's explicit count.
 
 `auto_duration` and an explicit `num_frames`/`duration` together refuse by name
-rather than one silently winning.
+rather than one silently winning. **So does `auto_duration` with a retake
+window**, and the alternative is why: `retake.py` takes its length from the
+source clip's metadata (`:220`) and constructs no `DurationPredictor` at all, so
+there is nothing upstream to mirror and the extra would simply be dropped — the
+same silent win the explicit-count case refuses. The IMPLICIT auto request — no
+count, a head loaded — is NOT refused there, because it asked for nothing and the
+retake's own geometry is what an omitted count resolves to. The asymmetry is
+recorded here rather than left for a reader to find.
+
+**ONE REFUSAL THIS SECTION FIRST INVENTED, now removed.** `ParseAutoDuration`
+refused `MIN <= 0`. `AutoDurationAction` (`args.py:117-122`) refuses `MIN > MAX`
+and nothing else, and at the pin `AutoDuration(min_seconds=0.0,
+max_seconds=20.0)` constructs while `seconds_to_clamped_num_frames(3.0,
+frame_rate=25.0, min_frames=0, max_frames=500)` returns 73 — so
+`--auto-duration 0 20` is a working upstream request this port refused by name.
+The same polarity appeared twice more: `Ltx2SecondsToClampedNumFrames` required
+`min_frames >= 1`, and `Ltx2DurationPredictFrames` floored the rounded bound to
+1. Upstream does neither. What it does instead is RAISE where the clamped count
+reaches zero — `seconds_to_clamped_num_frames(0.005, frame_rate=25.0,
+min_frames=0, max_frames=500)` is `ValueError: frames must be >= 1, got 0`, out
+of `snap_frames_to_grid` rather than out of a bound check — and the floor turned
+that raise into a silent one-frame render. All three are gone, and
+`test_ltx2_pipeline` gates both directions: the accepted bound AND the raise,
+because accepting the bound without honouring the raise is the silent half.
 
 ### 3.5 The two resolution sites
 
@@ -225,7 +267,7 @@ refuses to write when the two are not separated.
 | ID | Claim | Shape |
 |---|---|---|
 | T1 | `Ltx2SnapFramesToGrid` floors to `8k + 1` and refuses `frames < 1` | value golden + refusal |
-| T2 | the loader returns upstream's `None` for an absent **and** a partial head, and refuses a shape mismatch by name | synthetic safetensors, three files |
+| T2 | the loader returns upstream's `None` for an absent **and** a partial head, and refuses a shape mismatch by name | synthetic safetensors, four files: the headless DiT, a whole head, a partial head, a wrong-shaped head |
 | T3 | `Ltx2SecondsToClampedNumFrames` clamps **before** snapping | golden + the snap-first answer, `separating > 0` |
 | T4 | the undershoot repair snaps **up** and is capped by `max_frames` | golden + the un-repaired answer |
 | T5 | `Ltx2DurationPredictFrames` reproduces upstream's frame count end to end | golden over the executed chain |
@@ -284,6 +326,10 @@ production-call-site deletion, and the gate log lines rather than an exit code.
   `.agents/specs/ltx25-completion-scope.md` §A.7. Tracked by #2900 until A24's
   wave for it opens a row. `Ltx2LoadDurationHeadWeights` already takes the
   `compute_dtype` the arm needs, so the arm is a call-site change.
+  **This listing IS the ownership record.** #2900 closes when this row lands, so
+  it cannot also be the tracker; `.agents/specs/ltx25-a24-leaves-bf16.md` and
+  `.agents/specs/ltx25-a24-upsampler-bf16.md` name the same arm under their own
+  `## Owed`, and this entry is what a reader of A24's wave chain arrives at.
 - **`Ltx2VaeWeights::bf16` is unpopulated for this component**, for the same
   reason.
 - **Upstream's four-tuple return** (`ti2vid_two_stages.py:312`) is not mirrored;
