@@ -141,13 +141,22 @@ generator's `fill_from_stream` casts every upstream parameter to f32, so the
 oracle itself runs f32 and a dtype comparison against it is vacuous by
 construction.
 
-**Exactly ONE production route reaches the decoder, it goes through the tiled
-path, and it passes NO queue.** `Ltx2VideoEngine`'s render calls
-`Ltx2VideoDecodeStreaming` once, inside the `decode.video.chunk` phase scope, with
-no `queue` argument. So the conv video VAE decode runs on the CPU queue on every
-build of this project, and the CPU kernel arm is the only arm production reaches.
-`Ltx2VideoDecode` and `Ltx2ConvVideoDecode` have no caller outside the header,
-this file's own definitions and `ltx2_video_vae_tiled.cpp:123`.
+**Exactly ONE production route reaches the decoder and it goes through the tiled
+path.** `Ltx2VideoEngine`'s render calls `Ltx2VideoDecodeStreaming` once, inside
+the `decode.video.chunk` phase scope. `Ltx2VideoDecode` and `Ltx2ConvVideoDecode`
+have no caller outside the header, this file's own definitions and
+`ltx2_video_vae_tiled.cpp:123`.
+
+**THIS PARAGRAPH ALSO SAID THAT CALL PASSES NO QUEUE, AND THAT WAS FALSE
+([#2853](https://github.com/mudler/vllm.cpp/issues/2853)).** Its last argument is
+`im.on_device ? &*im.queue : nullptr`, so a device render hands the decode an
+accelerator queue and only a CPU render passes null. The error was a counting
+one: `grep -c 'Ltx2VideoDecodeStreaming('` returns 1, which is the number of call
+sites and says nothing about their arguments. §5.6's refusal then rested on this
+sentence, this row's load asked for bf16 on both arms, and every device render
+threw at `decode.video` until §5.6.1 repaired it. Read this as the measurement
+that has to be redone whenever a route claim is used to argue that a refusal is
+unreachable: count the call sites, then read each one's arguments.
 
 **The storage is float-typed throughout.** `VaeStore::Alloc` allocates `n` floats,
 `ptr()` returns `float*`, `VaeWeightCache::Get` returns `const float*`, and
@@ -553,8 +562,40 @@ The `kLtx2Vae` CUDA arm keeps its refusal, with the message updated to name
 the route predicate are the same predicate**, which is the trap this project has
 already paid for: the arm is chosen by asking the same question the kernel
 refuses on, so a device that cannot serve bf16 is never handed a bf16 volume.
-Production is unaffected — §3 measured that the render decodes on the CPU queue on
-every build — and a bf16 CUDA decode is recorded owed with the lease it needs.
+A bf16 CUDA decode is recorded owed with the lease it needs.
+
+This section also said production was unaffected, on §3's measurement. §3 was
+wrong and §5.6.1 records what that cost.
+
+### 5.6.1 The LOAD now asks for bf16 only where a convolution serves it (#2853)
+
+The refusal above is correct and it stays. What was wrong is that the load walked
+into it: §5 asked `Ltx2LoadVaeWeights` for `kBF16` on both arms, and the render
+hands the decode `im.on_device ? &*im.queue : nullptr` (§3, repaired). So every
+device render threw at `decode.video`, and the pre-existing #1426 fake-accelerator
+case `test_ltx2_video_device_forward` — which asserts as preconditions that the
+platform is `kXPU` and that a backend is registered — died on the throw with
+`assertions: 10 | 10 passed | 0 failed`, every assertion it reached still passing.
+
+`Ltx2VideoEngine::Load` now resolves the decoder bag's width from the arm:
+`im.on_device ? kF32 : kBF16`. That is the refusal's own second route, "load the
+VAE weights at f32", taken on the one arm where the first route is not available.
+The CPU arm keeps upstream's bfloat16 and every width gate in §8 sits there
+unchanged. The encoder is untouched and stays unconditional bf16, because
+`Ltx2ConvVideoEncode` takes no queue at either call site and runs on the host.
+
+Three mutations hold the pair, each applied to a scratch copy and restored:
+
+| mutation | expected | measured |
+|---|---|---|
+| drop `p` from the DEVICE arm of the DiT ternary (#1426's D10) | RED | RED, `test_ltx2_video_device_forward` 30/32, on the perturbed and modality assertions, uncond control green |
+| `kBF16` on both arms (the pre-repair shape) | RED | RED, the refusal throws, 10 assertions run and all 10 pass |
+| `kF32` on both arms | RED | RED, `test_ltx2_video` 114/115, on "the VAE DECODE runs at upstream's dtype" |
+
+The device arm's f32 is a REFUSED width, not a chosen one. When #1007 lands
+`cuda_conv3d`'s bf16 storage, the conditional is the one line the device bf16 arm
+deletes, and the device case's `vae_decode_not_bf16 > 0` is the assertion that
+reds and asks to be flipped to `== 0`.
 
 ---
 
@@ -785,19 +826,14 @@ are both about records a number agreed with and a tree did not.
 
 ## Owed
 
-* **[#2853](https://github.com/mudler/vllm.cpp/issues/2853) — `test_ltx2_video_device_forward`
-  is RED**, and this row's refusal is what it walks into. §5.6's device-bf16
-  refusal (`ltx2_video_vae.cpp`, "a bf16 decode was requested on device ... only
-  the CPU arm serves it") throws inside the pre-existing #1426 fake-accelerator
-  case, which asserts as PRECONDITIONS that the platform is `kXPU` and that a
-  backend is registered for it — so it drives exactly the path the refusal now
-  closes. Found and filed by wave GDNCPUPORT
-  ([#2845](https://github.com/mudler/vllm.cpp/issues/2845)), which touches no
-  LTX2 file and reproduces it identically under `VT_GDN_CHUNKED=0` and `=1`;
-  the refusal string is absent at that branch's pre-merge commit and present at
-  `origin/main`. It is listed HERE rather than fixed there because the choice —
-  load that case's VAE weights at f32, or land the device bf16 arm this section
-  already owes — is this row's, not a GDN kernel row's.
+* ~~**[#2853](https://github.com/mudler/vllm.cpp/issues/2853) —
+  `test_ltx2_video_device_forward` is RED**~~ — **RESOLVED**, see §5.6.1. The row
+  took the first of the two routes this bullet named: the load asks for bf16 on
+  the CPU arm and f32 on the device arm, because `vt::Conv3d` has no bf16 storage
+  arm on an accelerator. The refusal is unchanged. The device bf16 arm stays owed
+  below, and it is what the second route needed. The bullet is kept struck rather
+  than deleted because §3's false route claim is what let the defect land, and a
+  reader of this section needs to see which of the two routes was taken and why.
 * **The scope reconciliation.** §A.7's eight-row table splits the decoder, the
   device kernels and the tiled buffer into three rows this tree cannot separate
   (§0). `.agents/specs/ltx25-completion-scope.md` is operator-owned; this row
