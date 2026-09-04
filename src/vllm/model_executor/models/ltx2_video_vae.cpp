@@ -22,15 +22,27 @@
 //    the debt it pays, so leaving the two disagreeing was the record contradicting
 //    the tree.
 //
-// ─── DTYPE: BOTH ARMS ARE LIVE, AND bf16 IS THE ONE THAT SHIPS ──────────────
+// ─── DTYPE: BOTH ARMS ARE LIVE, AND THE RENDER SHIPS EITHER ONE ─────────────
 //
 // A24 wave 3 (row LTX25-A24-VIDEO-VAE-BF16, issue #2786) landed the bf16 arm the
 // paragraphs below were written owing. The decode now runs at
-// `Ltx2VaeWeights::dtype` and the render loads that bag at `kBF16`, so f32 is the
-// parity REFERENCE and not the shipping path. Read what follows as the reason the
-// reference exists and as the record of what an f32-only oracle cannot see; the
-// six rounding rules the bf16 arm applies are stated at their own sites and
-// measured in the row's spec section 4.
+// `Ltx2VaeWeights::dtype`.
+//
+// THIS BLOCK USED TO SAY THE RENDER LOADS THAT BAG AT `kBF16`, SO f32 WAS THE
+// PARITY REFERENCE AND NOT THE SHIPPING PATH. THAT WAS FALSE (#2853), and it is
+// the same sentence `cuda_ltx2_vae.cu`, `ltx2_video_vae.h` and `docs/FEATURES.md`
+// each carried in their own words. `Ltx2VideoEngine::Load` resolves the bag's
+// width from the arm -- `im.on_device ? kF32 : kBF16` -- because the one
+// `Ltx2VideoDecodeStreaming(` call site passes `im.on_device ? &*im.queue :
+// nullptr` and the refusal at `:1480` below is therefore reachable from the
+// render. So f32 is BOTH the parity REFERENCE every committed golden is measured
+// against AND what a DEVICE render decodes at; bf16 is what a CPU render decodes
+// at, and it is upstream's SDR default. Upstream decodes this VAE at f32 too, on
+// its HDR arm (`vae_dtype_for_hdr`, ltx-pipelines .../media_io/color_config.py:64-66).
+//
+// Read what follows as the reason the f32 arm exists and as the record of what an
+// f32-only oracle cannot see; the six rounding rules the bf16 arm applies are
+// stated at their own sites and measured in the row's spec section 4.
 //
 // WHAT THE bf16 ARM IS NOT BIT-EXACT AGAINST, said here rather than discovered:
 // torch BLOCKS its convolution reduction and this port does not, so at the gated
