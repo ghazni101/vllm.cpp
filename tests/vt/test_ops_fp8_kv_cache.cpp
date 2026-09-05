@@ -25,6 +25,7 @@
 #include <string>
 #include <vector>
 
+#include "vllm/v1/attention/backend.h"
 #include "vllm/v1/kv_cache_dtype.h"
 #include "vt/dtype.h"
 #include "vt/fp8_kv.h"
@@ -394,19 +395,20 @@ TEST_CASE("ParseCacheDType mirrors the vLLM CacheDType surface") {
 // KV-NVFP4-TURBO W0 (#2620). The CacheDType surface as an ENUM, and a refusal
 // that names its owner.
 //
-// Ported from vllm/v1/kv_cache_interface.py:33-84 (KVQuantMode,
+// Ported from vllm/v1/kv_cache_interface.py:39-101,126-128 (KVQuantMode,
 // get_kv_quant_mode, is_quantized_kv_cache, kv_cache_uses_per_token_head_scales)
-// and vllm/utils/torch_utils.py:414-416 (nvfp4_kv_cache_full_dim) @ 555967922.
+// and vllm/utils/torch_utils.py:546-548 (nvfp4_kv_cache_full_dim) @ `e126687a9a`,
+// the ACTIVE parity pin.
 //
 // WHY THE PARAMETER SET IS THE LITERAL. Upstream ships no unit test over
 // `get_kv_quant_mode`; its input domain is the `CacheDType` Literal
-// (config/cache.py:19-35) and nothing else. So the case below enumerates that
+// (config/cache.py:39-57) and nothing else. So the case below enumerates that
 // Literal member by member. A member added upstream and not mirrored here fails
 // `IsCacheDTypeName`, which is the only way a table like this can notice.
 
 namespace {
 
-// vllm/config/cache.py:19-35, in upstream's own order. Kept beside the
+// vllm/config/cache.py:39-57, in upstream's own order. Kept beside the
 // assertions rather than read out of the header, so the header's list and this
 // one have to be written to agree instead of agreeing by construction.
 constexpr const char* kCacheDTypeLiteral[] = {
@@ -418,6 +420,7 @@ constexpr const char* kCacheDTypeLiteral[] = {
     "turboquant_k3v4_nc", "turboquant_3bit_nc",
     "int4_per_token_head", "int8_per_token_head",
     "fp8_per_token_head", "nvfp4",
+    "nvfp4_4over6",
 };
 
 // The message a refusal produced, or "" when the call did not throw.
@@ -438,6 +441,7 @@ TEST_CASE("GetKvQuantMode mirrors vLLM's KVQuantMode over the whole CacheDType L
   using vllm::v1::KVQuantMode;
   using vllm::v1::KvQuantModeIsNvfp4;
   using vllm::v1::KvQuantModeIsPerTokenHead;
+  using vllm::v1::KvQuantModeIsTurboquant;
 
   // Every member of the Literal IS a CacheDType name; nothing else is.
   for (const char* s : kCacheDTypeLiteral) {
@@ -447,38 +451,78 @@ TEST_CASE("GetKvQuantMode mirrors vLLM's KVQuantMode over the whole CacheDType L
   CHECK(IsCacheDTypeName("") == false);
   CHECK(IsCacheDTypeName("fp8_e4m3fn") == false);  // a torch dtype, not a CacheDType
 
-  // kv_cache_interface.py:62-75, arm by arm.
+  // kv_cache_interface.py:83-97, arm by arm.
   CHECK(GetKvQuantMode("auto") == KVQuantMode::kNone);
   CHECK(GetKvQuantMode("float16") == KVQuantMode::kNone);
   CHECK(GetKvQuantMode("bfloat16") == KVQuantMode::kNone);
-  // `:73-74` — the startswith("fp8") arm, which catches four members.
+  // `:95-96` — the startswith("fp8") arm, which catches five members.
   for (const char* s : {"fp8", "fp8_e4m3", "fp8_e5m2", "fp8_inc", "fp8_ds_mla"}) {
     CHECK(GetKvQuantMode(s) == KVQuantMode::kFp8PerTensor);
   }
-  // `:63-70` — the three per-token-head members are matched BEFORE that arm, so
+  // `:85-90` — the three per-token-head members are matched BEFORE that arm, so
   // fp8_per_token_head is NOT kFp8PerTensor. Getting this order wrong is the one
   // way to mirror the function and still answer differently.
   CHECK(GetKvQuantMode("int4_per_token_head") == KVQuantMode::kInt4PerTokenHead);
   CHECK(GetKvQuantMode("int8_per_token_head") == KVQuantMode::kInt8PerTokenHead);
   CHECK(GetKvQuantMode("fp8_per_token_head") == KVQuantMode::kFp8PerTokenHead);
+  // `:91-92` — the nvfp4 arm is startswith, not equality, so the 4over6 variant
+  // folds onto the same mode. Equality here would answer kNone for it and
+  // silently drop it out of every nvfp4 predicate.
   CHECK(GetKvQuantMode("nvfp4") == KVQuantMode::kNvfp4);
-  // `:75` — turboquant_* falls through to NONE upstream. It is quantized in
-  // name only as far as this map is concerned, and mirroring that matters:
-  // `is_quantized_kv_cache` is derived from it.
-  for (const char* s : {"turboquant_k8v4", "turboquant_4bit_nc",
-                        "turboquant_k3v4_nc", "turboquant_3bit_nc"}) {
-    CHECK(GetKvQuantMode(s) == KVQuantMode::kNone);
-  }
+  CHECK(GetKvQuantMode("nvfp4_4over6") == KVQuantMode::kNvfp4);
+  // `:93-94` — turboquant_* maps to its OWN member. At the prior pin 555967922
+  // there were no such members and these names fell through to NONE; the four
+  // modes and the is_turboquant predicate arrived with e126687a9a. Mirroring the
+  // stale answer would invert `is_quantized_kv_cache`, which is derived from it.
+  CHECK(GetKvQuantMode("turboquant_k8v4") == KVQuantMode::kTurboquantK8v4);
+  CHECK(GetKvQuantMode("turboquant_4bit_nc") == KVQuantMode::kTurboquant4bitNc);
+  CHECK(GetKvQuantMode("turboquant_k3v4_nc") == KVQuantMode::kTurboquantK3v4Nc);
+  CHECK(GetKvQuantMode("turboquant_3bit_nc") == KVQuantMode::kTurboquant3bitNc);
 
-  // `:52-58` is_per_token_head and `:60-62` is_nvfp4.
+  // `:58-65` is_per_token_head, `:67-70` is_nvfp4, `:72-80` is_turboquant.
   CHECK(KvQuantModeIsPerTokenHead(KVQuantMode::kInt8PerTokenHead) == true);
   CHECK(KvQuantModeIsPerTokenHead(KVQuantMode::kFp8PerTokenHead) == true);
   CHECK(KvQuantModeIsPerTokenHead(KVQuantMode::kInt4PerTokenHead) == true);
   CHECK(KvQuantModeIsPerTokenHead(KVQuantMode::kFp8PerTensor) == false);
   CHECK(KvQuantModeIsPerTokenHead(KVQuantMode::kNvfp4) == false);
   CHECK(KvQuantModeIsPerTokenHead(KVQuantMode::kNone) == false);
+  CHECK(KvQuantModeIsPerTokenHead(KVQuantMode::kTurboquantK8v4) == false);
   CHECK(KvQuantModeIsNvfp4(KVQuantMode::kNvfp4) == true);
   CHECK(KvQuantModeIsNvfp4(KVQuantMode::kFp8PerTensor) == false);
+  CHECK(KvQuantModeIsTurboquant(KVQuantMode::kTurboquantK8v4) == true);
+  CHECK(KvQuantModeIsTurboquant(KVQuantMode::kTurboquant4bitNc) == true);
+  CHECK(KvQuantModeIsTurboquant(KVQuantMode::kTurboquantK3v4Nc) == true);
+  CHECK(KvQuantModeIsTurboquant(KVQuantMode::kTurboquant3bitNc) == true);
+  CHECK(KvQuantModeIsTurboquant(KVQuantMode::kNvfp4) == false);
+  CHECK(KvQuantModeIsTurboquant(KVQuantMode::kNone) == false);
+
+  // The enum values are upstream's IntEnum values, because a spec field carries
+  // this and a wrong ordinal is invisible until something serialises it.
+  CHECK(static_cast<int>(KVQuantMode::kNone) == 0);
+  CHECK(static_cast<int>(KVQuantMode::kFp8PerTensor) == 1);
+  CHECK(static_cast<int>(KVQuantMode::kInt8PerTokenHead) == 2);
+  CHECK(static_cast<int>(KVQuantMode::kFp8PerTokenHead) == 3);
+  CHECK(static_cast<int>(KVQuantMode::kInt4PerTokenHead) == 4);
+  CHECK(static_cast<int>(KVQuantMode::kNvfp4) == 5);
+  CHECK(static_cast<int>(KVQuantMode::kTurboquantK8v4) == 6);
+  CHECK(static_cast<int>(KVQuantMode::kTurboquant4bitNc) == 7);
+  CHECK(static_cast<int>(KVQuantMode::kTurboquantK3v4Nc) == 8);
+  CHECK(static_cast<int>(KVQuantMode::kTurboquant3bitNc) == 9);
+
+  // The two upstream copies of is_quantized_kv_cache DISAGREE at this pin, and
+  // this tree mirrors both. `IsQuantizedKvCache` is the enum copy
+  // (kv_cache_interface.py:100-101) and answers true for turboquant_*;
+  // `IsQuantizedKvCacheName` (backend.cpp:106) is the string copy
+  // (torch_utils.py:77-82) and answers false. Asserting both is what stops a
+  // later reader from "reconciling" them onto one predicate upstream has not
+  // picked.
+  CHECK(vllm::v1::IsQuantizedKvCache("turboquant_k8v4") == true);
+  CHECK(vllm::v1::IsQuantizedKvCacheName("turboquant_k8v4") == false);
+  CHECK(vllm::v1::IsQuantizedKvCache("auto") == false);
+  CHECK(vllm::v1::IsQuantizedKvCacheName("auto") == false);
+  CHECK(vllm::v1::IsQuantizedKvCacheName("nvfp4") == true);
+  CHECK(vllm::v1::IsQuantizedKvCacheName("nvfp4_4over6") == true);
+  CHECK(vllm::v1::IsQuantizedKvCacheName("fp8_per_token_head") == true);
 
   // The mode reaches the resolved config for the arms that parse, so a later
   // wave dispatches on the enum instead of re-testing the string.
@@ -492,7 +536,7 @@ TEST_CASE("GetKvQuantMode mirrors vLLM's KVQuantMode over the whole CacheDType L
         KVQuantMode::kFp8PerTensor);
 }
 
-// torch_utils.py:414-416 — head_size//2 packed fp4 bytes + head_size//16 fp8
+// torch_utils.py:546-548 — head_size//2 packed fp4 bytes + head_size//16 fp8
 // block-scale bytes. The head sizes are the ones the shipped registries build
 // attention specs with, plus upstream's own admission bound (head_size % 16).
 TEST_CASE("Nvfp4KvCacheFullDim mirrors nvfp4_kv_cache_full_dim") {
@@ -522,6 +566,16 @@ TEST_CASE("An unserved CacheDType member refuses and names the row that owes it"
   // And it must say what an operator can do instead, because "no" without an
   // alternative is what sends them to bf16 without noticing.
   CHECK(nvfp4.find("--kv-cache-dtype fp8") != std::string::npos);
+
+  // nvfp4_4over6 is the same row's, and it must reach the SAME arm: the refusal
+  // dispatches on the mode, not on the literal string, so the variant cannot
+  // fall through to the "no row claims it yet" tail.
+  const std::string over6 = RefusalMessage("nvfp4_4over6");
+  REQUIRE_FALSE(over6.empty());
+  CHECK(over6.find("nvfp4_4over6") != std::string::npos);
+  CHECK(over6.find("KV-NVFP4-TURBO") != std::string::npos);
+  CHECK(over6.find("#2620") != std::string::npos);
+  CHECK(over6.find("no row here") == std::string::npos);
 
   // The per-token-head and turboquant members are this row's too.
   for (const char* s : {"int4_per_token_head", "int8_per_token_head",
