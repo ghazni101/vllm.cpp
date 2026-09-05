@@ -2,14 +2,15 @@
 
 ## What this measures, and why it exists
 
+Until 4 September 2026,
 [`docs/benchmarks/qwen38-27b-exl3-gb10.md`](../../benchmarks/qwen38-27b-exl3-gb10.md)
-leads with 1.25x on the Qwen3.8-27B EXL3 pair. That ratio is **59.5 tok/s counted
+led with 1.25x on the Qwen3.8-27B EXL3 pair. That ratio was **59.5 tok/s counted
 decode-only** against the 47.5 "decode tok/s" the [Mia-AiLab card][card] quotes.
-The same run of ours reads **45.1 tok/s counted over whole-run wall time**. The
-card defines "decode tok/s" nowhere. If it counts with the prefill in, we are at
-0.95x — slower — and the page leads with the favourable half of an open question.
+The same run of ours read **45.1 tok/s counted over whole-run wall time**. The
+card defines "decode tok/s" nowhere. If it counts with the prefill in, we were at
+0.95x, slower, and the page led with the favourable half of an open question.
 
-Prose cannot settle that, and the page says so. This harness settles it by
+Prose could not settle that, and the page said so. This harness settled it by
 measurement instead: it runs **their engine and ours on one box, behind one
 client, on one workload, interleaved**, and computes **both counting conventions
 from the same timings**. With one client and one definition the convention
@@ -17,11 +18,37 @@ question disappears, whichever way the answer falls.
 
 [card]: https://huggingface.co/Mia-AiLab/Qwen3.8-27B-DFlash2-EXL3-5.0bpw
 
-## Status: the harness is built and validated; the RUN is queued, not done
+## Status: the run finished on 4 September 2026
 
-Nothing in this directory is a result. There are no leg JSONs here yet. The job
-is queued on `dgx:gpu0` behind a deep queue, and no number may be quoted from
-this row until `results.txt` and the four leg records exist.
+The job ran to completion on `dgx:gpu0` under lease
+`d32255f7-2004-432a-b656-dcaef50037a9`. All four legs completed 164 of 164
+requests with no failures. `results.txt` and the four `*.clientlog` files here
+are the job's own output, copied unedited off the share.
+
+| leg | order | decode-only tok/s | whole-run tok/s | mean TTFT ms | output tokens | wall s |
+|---|---|---|---|---|---|---|
+| `THEIRS-A` | 1 | 44.63 | 32.54 | 1021.7 | 19,680 | 604.9 |
+| `OURS-A` | 2 | 53.68 | 37.33 | 1062.8 | 20,992 | 562.3 |
+| `THEIRS-B` | 3 | 45.01 | 33.99 | 886.6 | 19,680 | 579.1 |
+| `OURS-B` | 4 | 53.57 | 37.36 | 1055.1 | 20,992 | 561.8 |
+
+```text
+VERDICT decode-only : ours 53.63 vs theirs 44.82 = 1.197x
+VERDICT whole-run   : ours 37.35 vs theirs 33.26 = 1.123x
+```
+
+Their acceptance counter reads 15,238 accepted draft tokens over 19,680 output
+tokens in leg A and 15,253 over 19,680 in leg B. Ours reads nothing, for the
+reason recorded further down.
+
+The per-request JSON records and the server logs stay on the share at
+`/mnt/nas_share/rc/exl3-headtohead/out/`. They are 1.6 MB of per-token timings
+and nothing on the benchmark page is derived from anything but the summaries
+here.
+
+The reading of these legs, the axes they leave open, and what no gate covers is
+on the benchmark page under
+[the head-to-head](../../benchmarks/qwen38-27b-exl3-gb10.md#the-head-to-head-their-engine-and-ours-behind-one-client).
 
 ## The pin is OURS, not theirs
 
@@ -193,8 +220,9 @@ Not matched, and recorded rather than hidden:
 
   That is a mirror gap rather than a limitation of this measurement, it is owed,
   and it is why an engine we wrote can be asked for its acceptance only through a
-  benchmark binary. It needs its own row and issue; this file only records that
-  the gap is what forced the asymmetry above.
+  benchmark binary. It is tracked as
+  [#2770](https://github.com/mudler/vllm.cpp/issues/2770); this file only records
+  that the gap is what forced the asymmetry above.
 
 ## These numbers will NOT reproduce the published 59.5
 
@@ -224,3 +252,7 @@ dies mid-run is reported as that rather than as a slow result.
 | `client.py` | the one client, driving both engines identically |
 | `job-as-run.sh` | the leased job, exactly as submitted |
 | `serve_openai-usage.patch` | the harness adaptation, scoped to their server wrapper |
+| `results.txt` | the job's own record: build recipes, checkpoint sha256 values, leg table, verdicts |
+| `*.clientlog` | one per leg, ending in the client's full `CLIENT_RESULT` summary |
+
+All three of the first files are byte-identical to what ran on the box.
