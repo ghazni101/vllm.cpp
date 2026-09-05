@@ -638,7 +638,36 @@ measurement, and the matched HumanEval run exists to remove it.
    any number on this page was measured on contains that fix.
 
 **One prompt, one length, one device, one boot.** 64 tokens, five runs per leg,
-two legs per arm. No multi-request batching, no long context, no second box.
+two legs per arm. No multi-request batching, no second box. Every headline number
+here is short-context, and the section below says what happens when it is not.
+
+### Acceptance falls with context, so do not carry these figures to long prompts
+
+The speculative figures on this page are taken at 64 input tokens. Acceptance is
+not flat in context length, so they do not transfer. Measured on `dgx:gpu0` in a
+separate job, real HumanEval-shaped prompts, `VT_DFLASH_PAGED=0` on every leg as
+above, two passes per arm:
+
+| input tokens | no-draft tok/s | drafted tok/s | acceptance rate |
+|---|---|---|---|
+| 324 | 16.99 | 57.07 / 57.27 | 0.49 |
+| 2307 | 16.73 | 52.60 / 52.56 | 0.45 |
+| 8159 | 16.22 | 42.05 / 42.00 | 0.37 |
+
+Speculation still pays at every length here, but the margin narrows from 3.37x
+over no draft at 324 tokens to 2.59x at 8159, and acceptance falls from 0.49 to
+0.37. Quote the short-context numbers as short-context numbers.
+
+This was worse until recently. Attention was gated on `causal &&` at nine sites,
+so a config with `is_causal: false` and `sliding_window: 2048` -- which this pair
+uses -- ran unwindowed past the window. On the same 8159 rung the pre-fix tree
+measured 16.51 and 16.54 tok/s at acceptance 0.10, against a 16.22 no-draft
+floor, so speculation bought 1.8% and nothing more. On a synthetic 8159 prompt it
+was an outright loss: 12.60 against 16.34. That is
+[#2784](https://github.com/mudler/vllm.cpp/issues/2784), fixed and then measured;
+the issue carries the full leg table. No number in the tables above this section
+was affected, because at 324 and 2307 tokens the pre-fix and post-fix trees agree
+to 1.0% and 1.6% with identical acceptance.
 
 ## Owed
 
@@ -666,9 +695,8 @@ two legs per arm. No multi-request batching, no long context, no second box.
 - For the earlier `vllm-bench` runs, the unmatched axes against the upstream
   recipe: context (8192 here against their `-cs 262144`) and KV dtype (bf16 here
   against their `-cq nvfp4`, which this engine refuses by name —
-  [#2620](https://github.com/mudler/vllm.cpp/issues/2620), whose named owner row
-  did not exist). `vllm-bench` had no way to select a KV dtype when those runs
-  were taken, so no number on this page states the KV dtype it was measured on.
+  [#2620](https://github.com/mudler/vllm.cpp/issues/2620)). `vllm-bench` had no
+  way to select a KV dtype when those runs were taken, so no number on this page states the KV dtype it was measured on.
   It has taken `--kv-cache-dtype` since `89bfd79b0`, which closed
   [#2619](https://github.com/mudler/vllm.cpp/issues/2619), so a rerun can now
   state it.
@@ -677,6 +705,17 @@ two legs per arm. No multi-request batching, no long context, no second box.
   [#2274](https://github.com/mudler/vllm.cpp/issues/2274), and no number on this
   page was measured on a tree that contains the fix. Every arm here ran
   `VT_DFLASH_PAGED=0` instead.
+- **The nvfp4 KV axis will not close by configuration, and the spike that measured
+  why is [`nvfp4-kv-cache.md`](../../.agents/specs/nvfp4-kv-cache.md).** vLLM
+  serves `nvfp4` KV only on FlashInfer's trtllm-gen path, admitted at compute
+  capability family 100; this box is `sm_121a`, so the pinned oracle refuses the
+  dtype here too and there is no oracle run to gate a port against. What their
+  `-cq nvfp4` denotes is not established either: the pinned exllamav3 has no
+  `tools/serve_openai.py`, its `-cq` takes a bit count rather than a format name
+  (`eval/model_diff.py:475`), and `nvfp4` appears there only in weight handling.
+  So this axis is not one engine lacking a switch the other has, until somebody
+  reads the revision that recipe was written against. Closing it on our side
+  means implementing the arm under `KV-NVFP4-TURBO`, which the spike now owns.
 - [#2570](https://github.com/mudler/vllm.cpp/issues/2570): the `m <= 8` EXL3
   GEMV. When this page was first written it instantiated `(3,1)` only, and this
   checkpoint has no `(3,1)` tensor at all, so the arm was dead on it. `(3,2)`
