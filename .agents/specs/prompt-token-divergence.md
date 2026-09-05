@@ -85,7 +85,7 @@ STAGED copy the server read).
    48/48 at 1024. **This was a standalone harness and NOT the production request
    path.** It never ran `from_json(const nlohmann::json&, CompletionRequest&)`,
    which is where the `prompt` string is actually extracted
-   (`protocol.cpp:280-281`), and it never ran `serving_completion.cpp`. That
+   (`protocol.cpp:330`), and it never ran `serving_completion.cpp`. That
    segment is x86-testable and is UNTESTED, and it sits inside the gap this
    elimination would otherwise be read as closing.
 4. **Not a build-flag or memory defect.** `-O0`, `-O3`, `-O3 -funsigned-char`
@@ -114,7 +114,7 @@ STAGED copy the server read).
    tokenizer under every wrong pattern it likewise always predicts 1024, never
    915.
 7. **Not Unicode normalisation.** The checkpoint declares `normalizer: NFC` and
-   `tokenizer.cpp:388-391` records the deviation that we accept it and do not
+   `tokenizer.cpp:510-513` records the deviation that we accept it and do not
    apply it. Every one of the 48 prompts is ALREADY NFC, so the deviation is
    inert here. (It is still owed: a client that sends non-NFC text gets a
    different tokenization from HF. The tokenizer parity goldens feed it no
@@ -188,7 +188,7 @@ not read as narrower than it is:
 - **A UTF-8 decode truncation inside `Encode`**, which loses text rather than
   re-ranking merges.
 - **The `/v1/completions` request-parse segment**, which item 3 did not
-  exercise: `CompletionRequest`'s `from_json` (`protocol.cpp:280-281`) and
+  exercise: `CompletionRequest`'s `from_json` (`protocol.cpp:330`) and
   `serving_completion.cpp`.
 
 ## The one probe left
@@ -278,7 +278,7 @@ following is closed by that, and the row stays open on each:
 
 **Mechanism 3 is untested and is now the leading candidate.** The
 `/v1/completions` request-parse segment — `from_json(const nlohmann::json&,
-CompletionRequest&)` (`protocol.cpp:280-281`) and `serving_completion.cpp` —
+CompletionRequest&)` (`protocol.cpp:330`) and `serving_completion.cpp` —
 which item 3 did not exercise, and which the arm lane cannot reach because it
 sets `VLLM_CPP_SERVER=OFF`.
 
@@ -296,7 +296,7 @@ sets `VLLM_CPP_SERVER=OFF`.
   `tests/parity/goldens/tokenizer_qwen36/corpus.txt`
   ([#2948](https://github.com/mudler/vllm.cpp/issues/2948)); the corpus now
   carries **687** marks, and the aarch64 lane executes them.
-- The NFC deviation at `src/vllm/tokenizer/tokenizer.cpp:388-391` is accepted
+- The NFC deviation at `src/vllm/tokenizer/tokenizer.cpp:510-513` is accepted
   rather than applied. Neither the golden corpus nor any other gate feeds it
   non-NFC text, so the deviation is unexercised rather than passing. **This is
   deliberate in the added entries too**: every one is NFC-stable, so they probe
