@@ -88,9 +88,10 @@ THREE THINGS IT DOES THAT THE INLINE ONE DID NOT.
    sigma 1e-3 ordering; the two SPREAD columns do not reverse, and multiplicative
    stays worse on both at every sigma. The regime is not academic here: this
    control's median `rel(sumabs)` is 1.9e-05 at sigma 1e-4 and 1.9e-06 at sigma
-   1e-5, which brackets the `1.772e-05` and `1.062e-06` the row's own reading
-   argues over, while sigma 1e-3 draws 3.5e-04. Read "multiplicative is worse" as
-   a sigma 1e-3 statement. Which of the three the real tensors carry is
+   1e-5, and the `1.772e-05` and `1.062e-06` the row's own reading argues over
+   are at or below the first of those -- the LINEAR regime, on the reversed side
+   of this table -- while sigma 1e-3 draws 3.5e-04. Read "multiplicative is
+   worse" as a sigma 1e-3 statement. Which of the three the real tensors carry is
    UNMEASURED. This bounds the METRIC's resolution and is not a significance test
    on the real tensors.
 

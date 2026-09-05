@@ -394,13 +394,15 @@ CPU arms, 2.320338e-02 between CPU and CUDA.
 > | 1.80x | `moe`, defaults framing | **59%** |
 >
 > The four body rows hold to about a point between seed blocks. The four tail
-> rows move by JUST OVER a factor of two — `P(>= 19.9x)` reads 6% on the committed
-> block and 4% on the next one, and across the six disjoint blocks of the
-> [precision study](qwen4exp-gdn-chunked-token-ids-20260904/metric-spread-precision.txt)
-> `P(>= 24.1x)` spans 2.56% to 5.42%, a 2.12x move — so read them as "a few
-> percent", which is the only claim this row needs from them. This line first said
-> "3% on the next one", truncating 3.7% where every other share on this row is
-> rounded, which understated the move it was quoted to demonstrate.
+> rows move by much more than a point: `P(>= 19.9x)` reads 6% on the committed
+> block and 4% on the next one. The widest of the four, over the six disjoint
+> blocks of the
+> [precision study](qwen4exp-gdn-chunked-token-ids-20260904/metric-spread-precision.txt),
+> is `P(>= 24.1x)`, which spans 2.56% to 5.42% — JUST OVER a factor of two, a
+> 2.12x move. So read the tail rows as "a few percent", which is the only claim
+> this row needs from them. This line first said "3% on the next one", truncating
+> 3.7% where every other share on this row is rounded, which understated the move
+> it was quoted to demonstrate.
 >
 > **Every MoE number in this row is an ordinary reading of no change at all.** The
 > control is standard-library, fixed-seed and hermetic, and it is committed as
@@ -437,13 +439,13 @@ CPU arms, 2.320338e-02 between CPU and CUDA.
 > of the ordering the table shows. The two SPREAD columns do not reverse:
 > multiplicative stays worse on both at every sigma. And the regime is not
 > academic for this row — the control's median `rel(sumabs)` is **1.9e-05** at
-> sigma 1e-4 and **1.9e-06** at sigma 1e-5, which brackets the `1.772e-05` and
-> `1.062e-06` the framing tables below argue over, where sigma 1e-3 draws
-> **3.5e-04**. "Multiplicative is read worse" is a sigma 1e-3 statement, and the
-> conclusion this paragraph carries — that the bound does not fail conservatively
-> — survives in both regimes, because the multiplicative model is read worse than
-> the dense one on both SPREAD columns at every sigma, and on all three at sigma
-> 1e-3.
+> sigma 1e-4 and **1.9e-06** at sigma 1e-5, and the `1.772e-05` and `1.062e-06`
+> the framing tables below argue over are at or below the first of those, where
+> sigma 1e-3 draws **3.5e-04**. "Multiplicative is read worse" is a sigma 1e-3
+> statement, and the conclusion this paragraph carries — that the bound does not
+> fail conservatively — survives in both regimes, because the multiplicative
+> model is read worse than the dense one on both SPREAD columns at every sigma,
+> and on all three at sigma 1e-3.
 >
 > **The re-review first published this paragraph the other way round**
 > (`35.3x -> 17.1x -> 5.3x` and `7.6% -> 4.1% -> 1.3%`, from the same uncommitted

@@ -324,8 +324,11 @@ def published(x, digits=2, decimals=0, sci=False):
 
     The `test_the_PUBLISHER_*` cases render through this and compare the result to
     what each surface prints, so a document and this control cannot move apart. A
-    second copy of a rendered string anywhere below would be #2879 again, one
-    level up, so there is not one.
+    rendered string is typed below only in an ESTIMATOR pin -- the `want =` tuples,
+    and the three `rel(sumabs)` medians at the end of
+    `test_the_MAGNITUDE_column_of_that_table_REVERSES_below_sigma_1e_3` -- which
+    reds when the draw moves. No document-site assertion path carries one, and a
+    copy there is what would be #2879 again, one level up.
     """
     v = float(x) if digits is None else sig(x, digits)
     return ("%.*e" if sci else "%.*f") % (decimals, v)
@@ -624,8 +627,12 @@ class MetricSpread(unittest.TestCase):
         """"Multiplicative is worse" is a SIGMA 1e-3 statement, not a general one.
 
         The multiplicative model is scale-INVARIANT: its perturbation is
-        `x * N(0, sigma/sigma_a)`, so every figure it draws is the same at 1e-3,
-        1e-4 and 1e-5. The dense model is not -- as sigma falls it loses the
+        `x * N(0, sigma/sigma_a)`, so the three columns `figures()` returns --
+        the median under-report, the pair p95 and the tail share, every one of
+        them a RATIO or a share of ratios -- are the same at 1e-3, 1e-4 and 1e-5.
+        Its `rel(sumabs)` is NOT: that scales exactly tenfold with sigma, and the
+        scale then divides back out of each ratio taken from it. The dense model
+        does not even hold the ratios -- as sigma falls it loses the
         second-order term that holds its denominator up, and its median
         under-report rises from 75x to 140x, PAST the multiplicative model's
         110x. So in the linear regime the DENSE model is the one read worse on
@@ -961,8 +968,10 @@ class MetricSpread(unittest.TestCase):
          ("u4med",)),
         ("the regime this row's own readings sit in",
          r"median `rel\(sumabs\)` is (\d+(?:\.\d+)?e[-+]?\d+) at sigma 1e-4 and (\d+(?:\.\d+)?e[-+]?\d+) at "
-         r"sigma 1e-5, which brackets the `1\.772e-05` and `1\.062e-06` the "
-         r"row's own reading argues over, while sigma 1e-3 draws (\d+(?:\.\d+)?e[-+]?\d+)",
+         r"sigma 1e-5, and the `1\.772e-05` and `1\.062e-06` the row's own reading "
+         r"argues over are at or below the first of those -- the LINEAR regime, on "
+         r"the reversed side of this table -- while sigma 1e-3 draws "
+         r"(\d+(?:\.\d+)?e[-+]?\d+)",
          ("relmed4", "relmed5", "relmed3")),
     )
 
