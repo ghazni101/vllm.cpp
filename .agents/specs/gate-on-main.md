@@ -9,7 +9,7 @@ Read it as a follow-on in that family, in the same place as
 [`baseline-lane-eviction.md`](baseline-lane-eviction.md), and do not open a
 competing row for it.
 
-Issue: **none yet**, and it is not `#274`. See `## Owed`; AGENTS.md §"Every
+Issue: [**#2950**](https://github.com/mudler/vllm.cpp/issues/2950), filed against `GATE-CI-CONCURRENCY` rather than a row of its own, and it is not `#274`. See `## Owed`; AGENTS.md §"Every
 change starts from an issue" is not satisfied by this document, and an issue must
 exist before any implementation.
 
@@ -966,8 +966,9 @@ be known until it exists, and which the stop condition below is written around.
 
 ## Now
 
-Analysis only. Nothing is implemented, no workflow is edited, and no issue exists
-yet. **No row is claimed, and none should be**: see `## Relation to
+Analysis only. Nothing is implemented and no workflow is edited. The issue is
+[#2950](https://github.com/mudler/vllm.cpp/issues/2950), which owns the gap under
+`GATE-CI-CONCURRENCY`. **No row is claimed, and none should be**: see `## Relation to
 main-verifiability.md`. The next action is the decision between Option 1 first,
 `workflow_dispatch` first, and Option 2 — and whichever wins needs a new issue,
 and lands under `GATE-CI-CONCURRENCY`, before it starts.
