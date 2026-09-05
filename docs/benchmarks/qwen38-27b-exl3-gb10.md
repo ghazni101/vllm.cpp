@@ -383,10 +383,22 @@ two legs per arm. No multi-request batching, no long context, no second box.
   set, so its 76.28 is not transferable and must not be scaled onto the 59.5.
 - The remaining unmatched axes against the upstream recipe: context (8192 here
   against their `-cs 262144`) and KV dtype (bf16 here against their `-cq nvfp4`,
-  which this engine refuses by name — [#2620](https://github.com/mudler/vllm.cpp/issues/2620),
-  whose named owner row did not exist). `vllm-bench` also cannot select a KV
-  dtype at all ([#2619](https://github.com/mudler/vllm.cpp/issues/2619)), so no
-  number on this page states the KV dtype it was measured on.
+  which this engine refuses by name — [#2620](https://github.com/mudler/vllm.cpp/issues/2620)).
+  Every number on this page was measured before `vllm-bench` could select a KV
+  dtype, so none of them states the one it ran on; that flag exists now
+  ([#2619](https://github.com/mudler/vllm.cpp/issues/2619)) and the report names
+  both the requested and the resolved storage, so a repeat of this page states it.
+- **The nvfp4 axis will not close by configuration, and the spike that measured
+  why is [`nvfp4-kv-cache.md`](../../.agents/specs/nvfp4-kv-cache.md).** vLLM
+  serves `nvfp4` KV only on FlashInfer's trtllm-gen path, admitted at compute
+  capability family 100; this box is `sm_121a`, so the pinned oracle refuses the
+  dtype here too. What their `-cq nvfp4` denotes is NOT established: the pinned
+  exllamav3 (`.agents/oracles/exllamav3.md`) has no `tools/serve_openai.py`, its
+  `-cq` takes a bit count rather than a format name (`eval/model_diff.py:475`),
+  and `nvfp4` appears there only in weight handling. So this axis is not "one
+  engine lacks a switch the other has" until somebody reads the revision that
+  recipe was written against. Closing it on our side means implementing the arm
+  under `KV-NVFP4-TURBO`, and the spike records the three things that blocks on.
 - [#2274](https://github.com/mudler/vllm.cpp/issues/2274), so the shipped paged
   route can be measured rather than routed around.
 - [#2570](https://github.com/mudler/vllm.cpp/issues/2570): the `m <= 8` EXL3
