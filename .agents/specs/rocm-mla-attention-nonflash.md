@@ -6,7 +6,12 @@ Base SHA: `d023e3357b907927fb6d459f83d21b4729b78d84`
 
 ## Now
 
-`ACTIVE`.
+`ACTIVE`. The kernels are registered, native, gated and REACHED on the model
+(`op=33 ... selected=vt-native`, and MUT-R1 reproduces `main`'s refusal by
+name). **Generation is NOT re-established**: no token was observed, and the run
+that could have shown one spent ~41 of its 50 minutes loading. That is an open
+question attributed to the loader/allocator lane, not to these kernels -- see
+`## Evidence` and `## Owed`.
 
 ## Scope
 
@@ -265,6 +270,99 @@ further along:
   change did not write is `main` red under its own flag and is reported as
   such.
 
+## Evidence (`strix:gpu0`, gfx1151, ROCm 7.2.4, rc job `943ca573`, tree `56fd248e9`)
+
+`-DVLLM_CPP_HIP=ON -DVLLM_CPP_HIP_ARCHITECTURES=gfx1151`, `ninja -j 4`, no
+ccache. Three earlier jobs bought nothing and each failure was in the harness,
+not the tree: `/opt/rocm/bin` off `PATH`; CMake 3.28 refusing the `hipcc`
+wrapper by name and wanting `/opt/rocm/llvm/bin/clang++`; and `/opt/rocm/lib`
+absent from the library search path, which made `libvllm.so` link and only
+`vllm-cli` fail with 71 `undefined reference to ...@hip_4.2`. Recorded because
+the next reader on a fresh worker will meet all three.
+
+**Build.** `NINJA rc=0`, zero warnings with `-Werror` reaching HIP translation
+units (`6f6caa725`). `[566/583] Building HIP object
+CMakeFiles/vllm.dir/src/vt/rocm/rocm_mla_attn.hip.o` -- this TU's first compile.
+
+**The reference tier, MEASURED at the seam rather than read off `rocm_arch.h`:**
+
+```text
+PROBE_TREE_BASE_SHA=56fd248e9909e0d68381b92fd0c29d64ac0618a5
+ROCm reference tier: UnifiedMemory=0 DeviceMemoryIsHostAddressable=0 ReferenceTierEligible=0
+CHECK_THROWS( (void)vt::GetOp(vt::OpId::kDsaIndexerLogits, DeviceType::kROCM) ) threw as expected!
+CHECK( vt::GetReferenceTierHits() == before ) is correct!  values: CHECK( 0 == 0 )
+VERDICT: the tier is WITHDRAWN here
+```
+
+An older `strix` log describing the opposite carries no base SHA and cannot be
+dated. This one can, which is the whole point of printing it.
+
+**Gate 1**, before and after the whole mutation ladder:
+`4 test cases | 4 passed | 0 failed | 37 skipped`,
+`119 assertions | 119 passed | 0 failed`. The probe-only case runs **2**
+assertions; 119 against 2 is the device loop bodies executing, which is the
+#2715 trap measured rather than argued.
+
+**Reachability, on the real model through the production entry point.** In the
+unmutated leg, `op=33 device=5 selected=vt-native priority=0 registered=1` --
+id 33 is `kMlaPrefillAttention` and device 5 is `kROCM`, both read from
+`include/vt/ops.h` and `include/vt/device.h` rather than from prose. Deleting
+both `RegisterOp` lines (MUT-R1, which IS `main`'s behaviour) reproduces the
+refusal:
+
+```text
+engine-fatal: EngineCore busy loop threw: vt: no kernel for op MlaPrefillAttention
+(id 33) on device rocm (type 5), and the portable CPU reference tier is NOT eligible
+```
+
+**NO TOKEN WAS OBSERVED, and the timeout is the reason to suspect first.**
+Heartbeat bracketing of the job's own log:
+
+| leg | wall | rc |
+|---|---|---|
+| green (both kernels) | ~50 min | 124 (`timeout 3000`) |
+| MUT-R1 (both deleted) | **~41 min** | 1 (refused) |
+| MUT-R2 (decode deleted) | ~49 min | 124 |
+
+MUT-R1 refuses at the FIRST unregistered MLA op, so its ~41 min is the LOAD
+alone -- against a managed-era reference of 1372 s. The green leg's 3000 s
+budget therefore left roughly **9 minutes of forward**, which is not evidence
+about the kernels. The load itself COMPLETES under plain `hipMalloc`
+(`device placement INSTALLED`, the KV auto-fit line, then `op-provider` lines
+that only issue from inside the forward), so the `## Owed` "GLM-5.3 loads on
+gfx1151" claim survives; what is unproven is generation.
+
+**Numeric mutations, and three of five prove NOTHING.** A mutation the compiler
+rejects is not a killed mutation, and the job's own summary line flattened the
+two cases into one number:
+
+| # | mutation | build | gate | verdict |
+|---|---|---|---|---|
+| N1 | prefill drops the bottom-right causal shift | **rc=1** | -- | **NOT PROVEN** -- `error: unused variable 'len_q' [-Werror,-Wunused-variable]` |
+| N2 | decode drops the attention-sink seed | rc=0 | rc=1, `119 assertions | 115 passed | 4 failed` | **KILLED** |
+| N3 | decode ignores the sliding-window start | **rc=1** | -- | **NOT PROVEN** -- `unused parameter 'win_left'` |
+| N4 | decode ignores the DSA selection list | **rc=1** | -- | **NOT PROVEN** -- `unused parameter 'sel_s0'` |
+| N5 | drop the online-softmax rescale, BOTH kernels | rc=0 | rc=1, `119 assertions | 103 passed | 16 failed` | **KILLED** |
+
+So **two** guarantees are proven by the test, not five. N1/N3/N4 each deleted
+the last use of an operand; they are re-expressed to multiply by zero so every
+operand stays used and the GATE has to catch them. Until that lands, the
+sliding-window, selection and causal-shift guarantees are **unproven**.
+
+**Restore.** `ALL FILES RESTORED BYTE-FOR-BYTE` by sha256 against a manifest
+taken before any mutation, and `GATE1[final] rc=0` on the restored tree.
+
+**Full cross-device suite:** `41 test cases | 40 passed | 1 failed`,
+`83970 assertions | 83969 passed | 1 failed`. The one failure is
+`test_backend_cross_device.cpp:2278`, `CHECK( got == ref_b )` in
+"MoeSiluMul matches the CPU oracle" -- the standing bf16 +/-1 ULP red
+#1954/#1513. This wave touches no MoE arithmetic. It is reported, never widened
+into green.
+
+**No speed number is admissible and none is offered.** The DSA indexer pair is
+unregistered, so a sparse step refuses, and `docs/ROCM.md:60-61` applies. The
+ROCm GLM-5.3 speed axis stays **VOID**.
+
 ## Stop conditions
 
 - A numeric arm that needs a widened tolerance to pass stops the wave. The
@@ -277,6 +375,27 @@ further along:
 
 ## Owed
 
+- **Three UNPROVEN guarantees**, and they are unproven because the COMPILER
+  killed the mutation rather than the test: the prefill bottom-right causal
+  shift (N1), the decode sliding-window start (N3), and the decode DSA
+  selection map (N4). Each deleted the last use of an operand and hit
+  `-Werror,-Wunused-*`. Re-expressed to multiply by zero so the TU builds and
+  the gate must catch them. Owner `BACKEND-ROCM`, issue
+  [#2926](https://github.com/mudler/vllm.cpp/issues/2926).
+- **Whether GLM-5.3 generates on `gfx1151` at all after #2511.** No token has
+  been observed on a tree carrying `6b97a6800`. The load COMPLETES but takes
+  ~41 min under plain `hipMalloc` against a managed-era 1372 s, so every leg so
+  far spent its budget loading. The next measurement runs the leg under
+  `VT_ROCM_MANAGED_ALLOC=1` -- which the refusal message itself names -- beside
+  a default-allocator leg at a 3 h timeout, so the allocator is isolated from
+  the kernels. `VT_ROCM_MANAGED_ALLOC=1` is a DIAGNOSTIC LEVER and never a
+  shipping default: #2511 measured 17 GPU faults in 21 managed legs against 0
+  in 21 without. Owner `BACKEND-ROCM`, issue
+  [#2926](https://github.com/mudler/vllm.cpp/issues/2926).
+- **The ~41 min load under plain `hipMalloc`** is recorded as an observation,
+  not a measurement: it is bracketed by 120 s heartbeats on a contended CIFS
+  share and no A/B against the managed allocator has been run. Owner
+  `BACKEND-ROCM`, issue [#2926](https://github.com/mudler/vllm.cpp/issues/2926).
 - `kDsaIndexerLogits` + `kDsaTopkSelect` on ROCm — #2715's W2, still owed. Not
   generation-blocking on a dense step; a SPARSE step (a prompt longer than
   `index_topk`) still refuses. Owner `BACKEND-ROCM`, issue
