@@ -482,7 +482,7 @@ constexpr char kLtx2AutoDurationExtra[] = "auto_duration";
 // they are no longer trusted: the list below is derived from this file on every
 // run and compared, and the failure prints the replacement to paste in.
 // READER ANCHORS (derived and gated by test_ltx2_video):
-// 647 649 1281 1377 1473 1489 1624 1628 1786 1869 1987 2029 2071 2073
+// 680 682 1324 1420 1516 1532 1667 1671 1829 1865 2015 2133 2175 2217 2219
 
 const char* const kKnownLoadExtras[] = {
     kLtx2AudioPromptEmbedsExtra, kLtx2PipelineKindExtra,   kLtx2ModelVersionExtra,
