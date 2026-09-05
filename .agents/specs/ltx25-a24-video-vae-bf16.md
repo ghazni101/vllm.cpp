@@ -656,7 +656,7 @@ this repair buys the render for.
 DECODE'S WIDTH.** `un_normalize` is the decoder's very first arithmetic and its
 statistics narrow to the activation dtype upstream (`ops.py:76-79`, §4.7). This
 tree implements that through the arm's `Round`
-(`ltx2_video_vae.cpp:1553-1578`, the lambda at `:1498-1500`), which is
+(`ltx2_video_vae.cpp:1574-1587`, the lambda at `:1507-1509`), which is
 `BF16ToF32(F32ToBF16(v))` on `kBF16` and the IDENTITY on `kF32`. §4.7 measured the
 f32-statistics hypothesis at **109 of 288 words wrong at C=16 and 1294 of 4096 at
 C=128** against upstream's own bf16 module, and no token gate can see any of it.
@@ -816,9 +816,14 @@ encoder's own owed row instead.
   actually runs it is not gated. That distance is reported per arm rather than
   hidden.
 * **bf16 is lossy and this row makes the decode less precise than it is today.**
-  That is the point: upstream's answer is the bf16 one, and
-  `ltx2_video_vae.cpp:75-78` already says the f32 file is a correctness reference
-  and not the shipping path.
+  That is the point: upstream's answer on its SDR arm is the bf16 one. **This
+  bullet used to close "and `ltx2_video_vae.cpp:75-78` already says the f32 file
+  is a correctness reference and not the shipping path", and BOTH halves of that
+  were wrong (#2853).** f32 is a shipping width, on the device arm §5.6.1 adds,
+  and it is upstream's own HDR width; the anchor had drifted onto the
+  golden-generator paragraph as well. The file now says so at
+  `ltx2_video_vae.cpp:25-42` and `:56-64`, and the precision this bullet gives up
+  is given up on the CPU arm only.
 * **The CUDA arm is not measured, and now not written either (§5.6).** The refusal
   and the route predicate are the same predicate, so nothing on any path reaches
   a bf16 CUDA VAE kernel. A bf16 CUDA decode needs `cuda_conv3d`'s bf16 storage
@@ -1135,9 +1140,9 @@ recorded as ungateable:
 
 | mutation | result |
 |---|---|
-| delete the bf16-on-a-non-CPU-queue refusal (`ltx2_video_vae.cpp:1473-1481`) | the mutation COMPILES (`BUILD_rc=0`, `libvllm.a` relinked) and reds the new subcase: `test_ltx2_vae -tc='*dtype refusals*'` goes 1/1 cases and 3/3 assertions GREEN to **1 of 1 case failed, 1 of 3 assertions red**, `CHECK_THROWS_WITH_AS ... threw a DIFFERENT exception!` -- the decode runs on past the deleted guard and dies downstream on a missing bf16 parameter. Restored byte-for-byte |
-| the SAME subcase with the fake-accelerator registration removed (control) | throws `":177"` "for which no platform is registered", not `":1473"` "only the CPU arm serves it" -- which is the whole content of the retired "cannot be gated on this build" claim, and it holds only in that control |
-| delete the ENTRY-POINT `RequireVaeDType` call alone (`ltx2_video_vae.cpp:1465`) | COMPILES and stays **GREEN**, 1 of 1 case and 3 of 3 assertions. `VaeStore::Alloc` (`:250`) refuses the same bag with the same message a few lines later, so the f16 subcase cannot see that call site's deletion. Recorded rather than repaired: forking the text would give one refusal three messages, which is what the single function exists to prevent, and the case now states that it gates the PREDICATE |
+| delete the bf16-on-a-non-CPU-queue refusal (`ltx2_video_vae.cpp:1495-1504`) | the mutation COMPILES (`BUILD_rc=0`, `libvllm.a` relinked) and reds the new subcase: `test_ltx2_vae -tc='*dtype refusals*'` goes 1/1 cases and 3/3 assertions GREEN to **1 of 1 case failed, 1 of 3 assertions red**, `CHECK_THROWS_WITH_AS ... threw a DIFFERENT exception!` -- the decode runs on past the deleted guard and dies downstream on a missing bf16 parameter. Restored byte-for-byte |
+| the SAME subcase with the fake-accelerator registration removed (control) | throws `":198"` "for which no platform is registered", not `":1496"` "only the CPU arm serves it" -- which is the whole content of the retired "cannot be gated on this build" claim, and it holds only in that control |
+| delete the ENTRY-POINT `RequireVaeDType` call alone (`ltx2_video_vae.cpp:1487`) | COMPILES and stays **GREEN**, 1 of 1 case and 3 of 3 assertions. `VaeStore::Alloc` (`:271`) refuses the same bag with the same message a few lines later, so the f16 subcase cannot see that call site's deletion. Recorded rather than repaired: forking the text would give one refusal three messages, which is what the single function exists to prevent, and the case now states that it gates the PREDICATE |
 
 ### One instrument lost its window and is repaired rather than deleted
 
@@ -1163,7 +1168,7 @@ than "reaches the pixels".
   bf16 owed".
 * **This spec's own `## Owed` said the bf16-on-a-non-CPU-queue refusal "cannot be
   gated on this build", and that was FALSE.** The shadowing by
-  `RequirePooledDevice` (`ltx2_video_vae.cpp:1441`, throwing at `:177`) is real
+  `RequirePooledDevice` (`ltx2_video_vae.cpp:1463`, throwing at `:198`) is real
   ONLY in the control condition, when no platform is registered for the device
   type. `vllm::platforms::RegisterPlatform` and `vt::RegisterBackend` are public
   APIs, and `grep -rln 'platforms::RegisterPlatform' tests/` names THIRTEEN other
@@ -1172,13 +1177,14 @@ than "reaches the pixels".
   the new subcase is shaped after). Doing so here reaches the refusal with no GPU
   and no lease.
   Both arms measured on the same binary: with the fake `kXPU` backend and platform
-  registered the decode throws "only the CPU arm serves it" (`:1473`); with the
+  registered the decode throws "only the CPU arm serves it" (`:1496`); with the
   registration removed and nothing else changed it throws "for which no platform
-  is registered" (`:177`). All three of this row's dtype refusals are now gated in
+  is registered" (`:198`). All three of this row's dtype refusals are now gated in
   "ltx2 vae: the dtype refusals this arm adds are REACHED, not merely written".
-* **SEVEN RECORDS CARRIED "the render decodes on the CPU queue", THE FIRST REPAIR
-  FOUND TWO OF THEM BY MEMORY RATHER THAN BY SEARCH, AND THE SECOND STILL MISSED
-  ONE ([#2853](https://github.com/mudler/vllm.cpp/issues/2853)).** That is the
+* **TEN RECORDS CARRIED ONE CLAIM IN SEVERAL SENTENCES -- THAT THE RENDER NEVER
+  HANDS THIS DECODE A DEVICE QUEUE, SO f32 IS A REFERENCE WIDTH AND NOT A SHIPPING
+  ONE -- AND EACH OF THE THREE SWEEPS REPORTED ITS OWN COUNT AS THE TOTAL
+  ([#2853](https://github.com/mudler/vllm.cpp/issues/2853)).** That is the
   original defect again -- a count that stood in for a search -- so the repair is
   recorded with the searches that found the rest, not with its total. The bearers,
   in the order they were found: §3 and `cuda_ltx2_vae.cu:41-50` (repaired first,
@@ -1187,19 +1193,41 @@ than "reaches the pixels".
   argued for, in the header of the file that owns that refusal --
   `ltx2_video_vae_kernels.h:48-50` ("bf16 is the arm the render loads") and
   `docs/FEATURES.md:225` ("bf16 is CPU-ONLY ... which costs nothing because the
-  render decodes on the CPU queue"); and finally
+  render decodes on the CPU queue"); then
   `src/vllm/model_executor/models/ltx2_video_vae.cpp:25-33`, the banner and
   paragraph of the file that IMPLEMENTS the refusal ("bf16 IS THE ONE THAT SHIPS",
   "the render loads that bag at `kBF16`, so f32 is the parity REFERENCE and not the
-  shipping path"). `FEATURES.md:228`, the DEVICE-arm row, named no width at all and
-  now names f32.
+  shipping path"); and finally, on a third sweep, three more. **(8)**
+  `ltx2_video_vae.cpp:56-58`, the file's SECOND dtype banner -- "DTYPE: THE f32
+  REFERENCE ARM, AND WHY IT IS NOT WHAT SHIPS", with "it is the choice a reference
+  arm makes" in the sentence under it. **(9)** `ltx2_video_vae.cpp:69-70` in the
+  next paragraph of the same section, "So f32 here is the reference arm's
+  convention and nothing more". **(10)** §7's own risk bullet in this document,
+  "`ltx2_video_vae.cpp:75-78` already says the f32 file is a correctness reference
+  and not the shipping path" -- whose anchor had drifted onto the golden-generator
+  paragraph as well. The three repairs are at `ltx2_video_vae.cpp:56-64` and
+  `:71-75` and in §7 above. `FEATURES.md:228`,
+  the DEVICE-arm row, named no width at all and now names f32.
 
-  **THE SEVENTH IS THE ONE THE LESSON IS FOR.** It was invisible to every phrase
-  the earlier bearers taught -- it says neither "queue" nor "CPU-only" -- and only
-  a spelling set widened to "the one that ships", "not the shipping path" and
-  "render loads" reached it. A sweep is complete against the SPELLINGS it tried and
-  never against the claim, so the spellings are listed in the pull request body
-  rather than summarised. Four traps were live on this host: `grep` wraps `ugrep`
+  **THE LAST THREE ARE THE ONES THE LESSON IS FOR, AND NONE OF THEM NEEDED A NEW
+  SPELLING.** The second sweep widened the phrase set to "the one that ships",
+  "not the shipping path" and "render loads" in order to reach the first banner.
+  On `origin/main`, unchanged, two of those same terms return TWO of the three it
+  missed: `git grep -i "what ships"` returns `ltx2_video_vae.cpp:44`, the second
+  banner at its base line number, and `git grep -i "not the shipping path"`
+  returns exactly three hits -- `:30` and `:96`, which the wave repaired, and this
+  document's line 690, which is the §7 bullet and which it did not. The THIRD, the
+  "reference arm's convention" sentence, sits four lines further down inside the
+  second banner's own section and came from an independent phrase family
+  (`reference arm`). The second banner sat 24 lines below the first,
+  in the file that wave had just repaired at `:25-42` and `:111-118`, stating the
+  opposite of both; the risk bullet was in this document. So the miss was not a
+  spelling gap. It was reading a term's output only as far as the hit that was
+  expected. A sweep is complete against neither its spellings nor the claim until
+  every hit every term returns has been read to a verdict, which is why the terms
+  and their hits are listed in the pull request body rather than summarised.
+
+  Four traps were live on this host: `grep` wraps `ugrep`
   and its `--include` silently admitted a `cmake/` file; zsh ate an unquoted
   `--include=*.py` and returned "no matches found" at a non-zero rc that reads
   exactly like a clean sweep; `-E` treats `\|` as a literal pipe; and
@@ -1208,7 +1236,10 @@ than "reaches the pixels".
   The sweep was therefore run three ways: `git grep` over tracked files,
   `/usr/bin/grep -rn` bypassing the wrapper, and a Python pass that strips comment
   markers, refuses a stream carrying a NUL byte by name instead of reading it as no
-  match, and joins the lines before matching. Three sites the sweep surfaced are
+  match, and joins the lines before matching. The third sweep added the control the
+  first two lacked: three phrases KNOWN to be present and one known to be absent,
+  run in the same command shape as the real terms, so a bare zero is separable from
+  a broken command. Three sites the sweep surfaced are
   NOT bearers and are recorded as cleared rather than dropped:
   `ltx25-a24-leaves-bf16.md:180` and `ltx25-device-residency.md:714` are about the
   ENCODER, which really does take no queue, and `FEATURES.md:226` says the same of

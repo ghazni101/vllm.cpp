@@ -34,7 +34,7 @@
 // each carried in their own words. `Ltx2VideoEngine::Load` resolves the bag's
 // width from the arm -- `im.on_device ? kF32 : kBF16` -- because the one
 // `Ltx2VideoDecodeStreaming(` call site passes `im.on_device ? &*im.queue :
-// nullptr` and the refusal at `:1488-1492` below is therefore reachable from the
+// nullptr` and the refusal at `:1495-1504` below is therefore reachable from the
 // render. So f32 is BOTH the parity REFERENCE every committed golden is measured
 // against AND what a DEVICE render decodes at; bf16 is what a CPU render decodes
 // at, and it is upstream's SDR default. Upstream decodes this VAE at f32 too, on
@@ -53,21 +53,26 @@
 // asserts that relation rather than asserting a number. The arithmetic is gated
 // bit-exactly one rule per kernel instead.
 //
-// ─── DTYPE: THE f32 REFERENCE ARM, AND WHY IT IS NOT WHAT SHIPS ─────────────
-// Every buffer below is f32, and unlike the audio VAE next door that is NOT an
-// upstream-grounded choice — it is the choice a reference arm makes, and it is
-// annotated here because AGENTS.md requires an f32 on a model path to carry a
-// reason, and because a too-WIDE dtype is the one defect a correctness gate
-// structurally cannot report: it stays numerically right, the goldens stay green,
-// and the only symptom is twice the bytes moved.
+// ─── DTYPE: WHY THE f32 ARM EXISTS, AND WHAT IT COSTS A DEVICE RENDER ──────
+// Every buffer below is f32 on this arm. Unlike the audio VAE next door there is
+// no spectral-metric argument for it: it is the width a parity reference needs,
+// and since #2853 it is also the width a DEVICE render decodes at, for the reason
+// the banner above gives. It is annotated here because AGENTS.md requires an f32
+// on a model path to carry a reason, and because a too-WIDE dtype is the one
+// defect a correctness gate structurally cannot report: it stays numerically
+// right, the goldens stay green, and the only symptom is twice the bytes moved --
+// here, +776.6 MiB of decoder weights resident on every device render.
 //
 // Upstream does the OPPOSITE of what the audio VAE does. `ConvVideoDecoder.forward`
 // runs in the CHECKPOINT's dtype: it casts in with `sample.to(weights_dtype)` on
 // entry and back with `sample.to(output_dtype)` on exit
 // (conv_video_decoder.py:283-286, 355-356). There is no autocast, no float32
 // pin, and no spectral-metric argument of the kind that justifies the audio
-// tower's f32 (ltx2_audio_vae.cpp:7-12 -> vocoder.py:585-595). So f32 here is
-// the reference arm's convention and nothing more.
+// tower's f32 (ltx2_audio_vae.cpp:7-12 -> vocoder.py:585-595). So the CHECKPOINT
+// never asks for f32 here, and on the CPU arm this file follows it to bf16. What
+// selects f32 on the device is this tree's own queue predicate, and upstream's
+// own reason for the same width is a COLOUR SPACE, not a queue (`vae_dtype_for_hdr`
+// again). Both are recorded in section 5.6.1 of the row's spec.
 //
 // The golden CANNOT catch this either, and that is worth stating plainly rather
 // than leaving for someone to discover: the generator's `fill_from_stream` casts
