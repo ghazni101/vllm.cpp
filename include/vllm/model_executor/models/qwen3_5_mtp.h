@@ -146,6 +146,15 @@ class Qwen3_5MTPModel {
       const vt::Tensor& target_hidden_states,
       const v1::CommonAttentionMetadata& attn_meta, PagedKvCache& draft_kv,
       vt::Queue& queue, int64_t spec_step_idx = 0) const;
+  // Device-resident input_ids variant (MTP perf: eliminates D2H+H2D round-trip
+  // between draft steps). Same head math as ForwardPaged, but input_ids are
+  // already on the device (e.g. from a prior GreedyArgmax). No host copy.
+  Qwen3_5MTPHiddenStates ForwardPagedDev(
+      const int64_t* dev_input_ids, int64_t num_input_ids,
+      const std::vector<int32_t>& positions,
+      const vt::Tensor& target_hidden_states,
+      const v1::CommonAttentionMetadata& attn_meta, PagedKvCache& draft_kv,
+      vt::Queue& queue, int64_t spec_step_idx = 0) const;
 
   // Gather `rows` of a [T,H] bf16 device hidden-state tensor into a fresh,
   // owning [rows.size(), H] bf16 device buffer (SPEC-MTP-K-GT-1, #81).

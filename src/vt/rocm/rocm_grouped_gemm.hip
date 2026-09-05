@@ -836,6 +836,213 @@ int KQuantDecodeCoopWarps(DType wdt, int64_t m, int64_t nsb) {
   return wdt == DType::kQ6_K ? 8 : 1;
 }
 
+// --- Multi-row MMVQ kernel for MTP verify forward (m=2..8) -----------------
+//
+// The M-tiled kernel (KQuantGemmMTiledK) gives one warp MT=16 consecutive
+// activation rows but calls DotQ4K/DotQ5K/DotQ6K per row, which re-extracts
+// weight scales and re-dequantizes weight nibbles on every call even though
+// the weight superblock is the same. For m=4 (k=3 verify), 12 of 16 template
+// rows are predicated off, wasting instruction cache and registers.
+//
+// This kernel extends the MMVQ GEMV pattern to m>1: each warp handles one
+// output column for ALL m rows, reading the weight superblock once and
+// computing m dot products. Weight dequantization (nibble extraction, scale
+// extraction) is done once and shared across rows. The activation read and
+// dp4a are per-row. The reduction is per-row but uses the same shuffle pattern.
+//
+// NUMERICS CONTRACT — BIT-IDENTICAL to KQuantGemmK per row, by the same
+// argument as KQuantGemvMmvqRow: integer phase (exact), term reconstruction
+// (same float expression), association replay (same lane ownership). Each
+// row's computation is independent and follows the identical pattern as the
+// m=1 MMVQ kernel. The weight block is shared; only the activation differs.
+template <typename OutT, int Fmt, int MaxM>
+__device__ inline void KQuantGemvMmvqMultiRowRow(
+    OutT* __restrict__ out, const uint8_t* __restrict__ w_row,
+    const BlockQ8_K* __restrict__ act, int64_t j, int64_t m, int64_t n,
+    int64_t nsb, size_t w_block_bytes) {
+  const int lane = threadIdx.x;
+  float partial[MaxM];
+#pragma unroll
+  for (int r = 0; r < MaxM; ++r) partial[r] = 0.0f;
+
+  const int passes = static_cast<int>((nsb + 3) / 4);
+  for (int p = 0; p < passes; ++p) {
+    const int sb = p * 4 + (lane >> 3);
+    const int c = lane & 7;
+    int acc[MaxM];
+    int sumi_c[MaxM];
+#pragma unroll
+    for (int r = 0; r < MaxM; ++r) { acc[r] = 0; sumi_c[r] = 0; }
+
+    if (sb < nsb) {
+      const uint8_t* blk =
+          w_row + static_cast<size_t>(sb) * w_block_bytes;
+      if constexpr (Fmt == 2) {  // Q6_K
+        const int q = c >> 2, seg = c & 3;
+        const uint8_t* ql = blk + q * 64 + (seg & 1) * 32;
+        const uint8_t* qh = blk + kQK_K / 2 + q * 32;
+        const int8_t* sc = reinterpret_cast<const int8_t*>(blk + 192);
+        const int shift = (seg >> 1) * 4;
+        const int hs = seg * 2;
+        static constexpr uint32_t kBias32Word = 0x20202020u;
+        static constexpr uint32_t kBiasGuard = 0x80808080u;
+        // Pre-extract weight nibbles once (shared across all rows)
+        uint32_t v_words[8];
+#pragma unroll
+        for (int w = 0; w < 8; ++w) {
+          uint32_t Wq, Wh;
+          memcpy(&Wq, ql + 4 * w, 4);
+          memcpy(&Wh, qh + 4 * w, 4);
+          v_words[w] = ((Wq >> shift) & 0x0F0F0F0Fu) |
+                       (((Wh >> hs) & 0x03030303u) << 4);
+        }
+        // Per-row dot product
+#pragma unroll
+        for (int r = 0; r < MaxM; ++r) {
+          if (r >= m) break;
+          const BlockQ8_K* yb = act + static_cast<int64_t>(r) * nsb + sb;
+          const int8_t* q8 = yb->qs + c * 32;
+          int sub0 = 0, sub1 = 0;
+#pragma unroll
+          for (int w = 0; w < 8; ++w) {
+            uint32_t W8;
+            memcpy(&W8, q8 + 4 * w, 4);
+            uint32_t vb = ((v_words[w] | kBiasGuard) - kBias32Word) ^ kBiasGuard;
+            if (w < 4)
+              sub0 = amd_mixed_dot(*reinterpret_cast<char4*>(&vb),
+                                   *reinterpret_cast<char4*>(&W8), sub0, false);
+            else
+              sub1 = amd_mixed_dot(*reinterpret_cast<char4*>(&vb),
+                                   *reinterpret_cast<char4*>(&W8), sub1, false);
+          }
+          acc[r] = static_cast<int>(sc[2 * c]) * sub0 +
+                   static_cast<int>(sc[2 * c + 1]) * sub1;
+        }
+      } else {  // Q4_K / Q5_K
+        uint32_t W0, W1, W2;
+        memcpy(&W0, blk + 4, 4);
+        memcpy(&W1, blk + 8, 4);
+        memcpy(&W2, blk + 12, 4);
+        int scale, mn;
+        if (c < 4) {
+          scale = static_cast<int>((W0 >> (8 * c)) & 0x3F);
+          mn = static_cast<int>((W1 >> (8 * c)) & 0x3F);
+        } else {
+          const int i4 = 8 * (c - 4);
+          scale = static_cast<int>(((W2 >> i4) & 0xF) |
+                                   (((W0 >> (i4 + 6)) & 3) << 4));
+          mn = static_cast<int>(((W2 >> (i4 + 4)) & 0xF) |
+                                (((W1 >> (i4 + 6)) & 3) << 4));
+        }
+        const uint8_t* qb = blk + (Fmt == 1 ? 48 : 16) + (c >> 1) * 32;
+        const int shift = (c & 1) ? 4 : 0;
+        const uint8_t* hm = blk + 16;
+        // Pre-extract weight nibbles once (shared across all rows)
+        uint32_t v_words[8];
+#pragma unroll
+        for (int w = 0; w < 8; ++w) {
+          uint32_t Wq;
+          memcpy(&Wq, qb + 4 * w, 4);
+          v_words[w] = (Wq >> shift) & 0x0F0F0F0Fu;
+          if constexpr (Fmt == 1) {
+            uint32_t Wh;
+            memcpy(&Wh, hm + 4 * w, 4);
+            v_words[w] |= ((Wh >> c) & 0x01010101u) << 4;
+          }
+        }
+        // Per-row dot product
+#pragma unroll
+        for (int r = 0; r < MaxM; ++r) {
+          if (r >= m) break;
+          const BlockQ8_K* yb = act + static_cast<int64_t>(r) * nsb + sb;
+          const int8_t* q8 = yb->qs + c * 32;
+          int sub = 0;
+#pragma unroll
+          for (int w = 0; w < 8; ++w) {
+            uint32_t W8;
+            memcpy(&W8, q8 + 4 * w, 4);
+            sub = amd_mixed_dot(*reinterpret_cast<char4*>(&v_words[w]),
+                                *reinterpret_cast<char4*>(&W8), sub, false);
+          }
+          acc[r] = scale * sub;
+          sumi_c[r] = mn * (yb->bsums[2 * c] + yb->bsums[2 * c + 1]);
+        }
+      }
+    }
+    // Reduce each row across the 8-lane octet
+#pragma unroll
+    for (int r = 0; r < MaxM; ++r) {
+      if (r >= m) break;
+#pragma unroll
+      for (int off = 4; off > 0; off >>= 1) {
+        acc[r] += __shfl_down_sync(0xffffffffULL, acc[r], off);
+        sumi_c[r] += __shfl_down_sync(0xffffffffULL, sumi_c[r], off);
+      }
+    }
+    // Fold this pass's super-blocks into per-row partials
+    const int rem = static_cast<int>(nsb - p * 4);
+    const int nact = rem < 4 ? rem : 4;
+    for (int kk = 0; kk < nact; ++kk) {
+      const int sbk = p * 4 + kk;
+#pragma unroll
+      for (int r = 0; r < MaxM; ++r) {
+        if (r >= m) break;
+        const int isum = __shfl_sync(0xffffffffULL, acc[r], 8 * kk);
+        const int SUMI = __shfl_sync(0xffffffffULL, sumi_c[r], 8 * kk);
+        float term = 0.0f;
+        if (lane == 8 * kk) {
+          const uint8_t* wblk =
+              w_row + static_cast<size_t>(sbk) * w_block_bytes;
+          const BlockQ8_K* yb_r =
+              act + static_cast<int64_t>(r) * nsb + sbk;
+          uint16_t dh;
+          if constexpr (Fmt == 2) memcpy(&dh, wblk + 208, 2);
+          else memcpy(&dh, wblk, 2);
+          const float d = DF16ToF32(dh) * yb_r->d;
+          if constexpr (Fmt != 2) {
+            uint16_t dmh;
+            memcpy(&dmh, wblk + 2, 2);
+            const float dmin = DF16ToF32(dmh) * yb_r->d;
+            term = d * static_cast<float>(isum) -
+                   dmin * static_cast<float>(SUMI);
+          } else {
+            term = d * static_cast<float>(isum);
+          }
+        }
+        const float P = __shfl_sync(0xffffffffULL, term, 8 * kk);
+        if ((sbk & 31) == lane) partial[r] += P;
+      }
+    }
+  }
+  // Final cross-lane reduction and write
+#pragma unroll
+  for (int r = 0; r < MaxM; ++r) {
+    if (r >= m) break;
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+      partial[r] += __shfl_down_sync(0xffffffffULL, partial[r], off);
+    if (lane == 0) {
+      if constexpr (sizeof(OutT) == 4)
+        out[static_cast<int64_t>(r) * n + j] = partial[r];
+      else
+        out[static_cast<int64_t>(r) * n + j] = DF32ToBF16(partial[r]);
+    }
+  }
+}
+
+template <typename OutT, int Fmt, int MaxM>
+__global__ void KQuantGemvMmvqMultiRowK(
+    OutT* __restrict__ out, const uint8_t* __restrict__ weight,
+    const BlockQ8_K* __restrict__ act, int64_t m, int64_t n, int64_t nsb,
+    size_t w_block_bytes) {
+  const int64_t j =
+      static_cast<int64_t>(blockIdx.x) * blockDim.y + threadIdx.y;
+  if (j >= n) return;
+  const uint8_t* w_row =
+      weight + static_cast<size_t>(j) * static_cast<size_t>(nsb) * w_block_bytes;
+  KQuantGemvMmvqMultiRowRow<OutT, Fmt, MaxM>(out, w_row, act, j, m, n, nsb,
+                                             w_block_bytes);
+}
 }  // namespace
 
 // T4a testing hook: fill dst (device ptr, k/256 BlockQ8_K blocks for row a)
@@ -1143,6 +1350,47 @@ void MatmulBTQuantKernelRocmGdn(Queue& q, Tensor& out, const Tensor& a, const Te
             qact, a.data, ActDtOf(a.dtype), a.stride[0], m, nsb);
       }
       Check(hipGetLastError(), "q8_K quant");
+    }
+    // Multi-row MMVQ for small m (MTP verify forward, m=2..8). Same env flag
+    // as the m==1 arm (VT_GEMV_MMVQ=1), extended to share weight reads across
+    // rows. Replaces the M-tiled GEMM for small m, where MT=16 wastes 12+ rows.
+    // Bit-identical to KQuantGemmK per row (contract on KQuantGemvMmvqMultiRowRow).
+    const bool gemv_mmvq_m =
+        mmvq_e != nullptr && mmvq_e[0] == '1' && mmvq_e[1] == '\0' &&
+        m >= 2 && m <= 8;
+    if (gemv_mmvq_m) {
+      ++g_mmvq_route_gemv;
+      constexpr int kMaxM = 8;
+      int gemv_warps_mr = 8;
+      if (const char* we = std::getenv("VT_GEMV_WARPS")) {
+        const int v = std::atoi(we);
+        if (v >= 1 && v <= 8) gemv_warps_mr = v;
+      }
+      const int64_t ggrid = (n + gemv_warps_mr - 1) / gemv_warps_mr;
+      dim3 gblock(32, gemv_warps_mr);
+      if (out.dtype == DType::kF32) {
+        if (fmt == 2)
+          KQuantGemvMmvqMultiRowK<float, 2, kMaxM><<<static_cast<unsigned>(ggrid), gblock, 0, s>>>(
+              static_cast<float*>(out.data), w, qact, m, n, nsb, w_block_bytes);
+        else if (fmt == 1)
+          KQuantGemvMmvqMultiRowK<float, 1, kMaxM><<<static_cast<unsigned>(ggrid), gblock, 0, s>>>(
+              static_cast<float*>(out.data), w, qact, m, n, nsb, w_block_bytes);
+        else
+          KQuantGemvMmvqMultiRowK<float, 0, kMaxM><<<static_cast<unsigned>(ggrid), gblock, 0, s>>>(
+              static_cast<float*>(out.data), w, qact, m, n, nsb, w_block_bytes);
+      } else {
+        if (fmt == 2)
+          KQuantGemvMmvqMultiRowK<uint16_t, 2, kMaxM><<<static_cast<unsigned>(ggrid), gblock, 0, s>>>(
+              static_cast<uint16_t*>(out.data), w, qact, m, n, nsb, w_block_bytes);
+        else if (fmt == 1)
+          KQuantGemvMmvqMultiRowK<uint16_t, 1, kMaxM><<<static_cast<unsigned>(ggrid), gblock, 0, s>>>(
+              static_cast<uint16_t*>(out.data), w, qact, m, n, nsb, w_block_bytes);
+        else
+          KQuantGemvMmvqMultiRowK<uint16_t, 0, kMaxM><<<static_cast<unsigned>(ggrid), gblock, 0, s>>>(
+              static_cast<uint16_t*>(out.data), w, qact, m, n, nsb, w_block_bytes);
+      }
+      Check(hipGetLastError(), "K-quant gemv mmvq multi-row");
+      return;
     }
 
     if (gemv_mmvq) {  // non-fused arm (nsb too large for the LDS fold)
