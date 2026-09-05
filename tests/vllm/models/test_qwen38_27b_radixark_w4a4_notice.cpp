@@ -21,12 +21,16 @@
 // checkpoint is numerically plausible, so the tokens still match. That is the
 // class `AGENTS.md` §"Inherit vLLM defaults" names: the gate passes and the path
 // is wrong. Only a diagnostic can close it, so the assertions below are on the
-// diagnostic, and every one of them enters through `vllm::LoadQwen3_5Dense` with
+// diagnostic. Every HERMETIC case enters through `vllm::LoadQwen3_5Dense` with
 // STDERR CAPTURED -- never on the notice function alone, because a test that
 // calls the function directly stays green when the production call site is
-// deleted, and that is the mutation this file is built to fail.
+// deleted, and that is the mutation this file is built to fail. The env-gated
+// case 7 is the one exception, deliberately: it reads the real artifact's
+// HEADERS, so there are no weight bytes for a loader to read, and what it adds
+// is the COUNTS over the real 2194 names rather than the reachability the other
+// seven already hold.
 //
-// HERMETIC. Cases 1-6 build a one-layer synthetic checkpoint carrying this
+// HERMETIC. Cases 1-6 and 8 build a one-layer synthetic checkpoint carrying this
 // artifact's REAL module names and a `quantization_config` built from its REAL
 // one, so CI needs no NAS file and no network. The live arm at the bottom is
 // env-gated on VLLM_CPP_QWEN38_27B_RADIXARK_DIR and SKIPS LOUDLY when unset; it
@@ -418,6 +422,13 @@ TEST_CASE("RadixArk W4A4: a checkpoint declaring NVFP4 that we run W4A16 says so
   // The module names, so the count reconciles against the file.
   CHECK(Mentions(r.stderr_text, "model.language_model.layers.0.mlp.gate_proj"));
   CHECK(Mentions(r.stderr_text, "model.language_model.layers.0.mlp.down_proj"));
+  // An output head is NOT carved out of the count. An earlier draft of this
+  // message said W4A16 was correct for a head whatever the declaration says,
+  // and the pin falsifies it: `ModelOptMixedPrecisionConfig` dispatches a
+  // `ParallelLMHead` on `quant_algo` like any other Linear, with no head
+  // branch, so a head declared NVFP4 resolves upstream to the fp4-ACTIVATION
+  // method too.
+  CHECK(Mentions(r.stderr_text, "no output-head carve-out"));
   // The owner. Visible debt with no owner is a complaint.
   CHECK(Mentions(r.stderr_text, "QUANT-QWEN38-27B-NVFP4-ARM"));
   CHECK(Mentions(r.stderr_text, "#2760"));
@@ -501,7 +512,10 @@ TEST_CASE("RadixArk W4A4: a checkpoint with no ModelOpt quantization_config prin
   const ScopedEnv off("VT_MODELOPT_W4A4", nullptr);
   vllm::HfConfig config = OneLayerConfig(OneLayerQuantConfig("NVFP4"));
   // compressed-tensors sits in the same field; `IsMixedPrecision` is how a
-  // loader tells them apart (modelopt.py:2333-2339).
+  // loader tells them apart, mirroring
+  // `ModelOptMixedPrecisionConfig.override_quantization_method`, which claims a
+  // config only for `quant_algo == "MIXED_PRECISION"` (modelopt.py:2225-2231 @
+  // the parity pin `e126687a9a828d513c01a07cd69f025f27d63280`).
   config.raw["quantization_config"]["quant_method"] = "compressed-tensors";
   const LoadResult r = LoadCapturingStderr(OneLayerSpecs(/*nvfp4_input_scale=*/true),
                                            config);

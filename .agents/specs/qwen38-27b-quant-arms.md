@@ -1979,13 +1979,29 @@ prints nothing new.
 
 The message names the count, the two algorithms in full words, that no
 throughput axis moves and the numerics do, how many modules ship the divisor,
-the knob, up to eight module names, the row and the issue. It also names the ONE
-module for which W4A16 is CORRECT whatever the declaration says: vLLM resolves a
-quantized output head through `ModelOptNvFp4W4A16LinearMethod`, which deletes
-`input_scale` (`modelopt.py:1365`, registered at `:1358`, @ the pin
-`5559679229bc961848b121ccdeaa8fa5d79bec98`). `lm_head` is therefore listed and
-explained rather than hidden, because a count that quietly drops a module is a
-count a reader cannot reconcile against the file.
+the knob, up to eight module names, the row and the issue.
+
+**And it says that an output head is NOT an exception, which is the one claim
+the implementation had to be corrected on.** The draft message asserted that
+W4A16 is CORRECT for a head whatever the declaration says, on the strength of
+`ModelOptNvFp4W4A16LinearMethod` deleting `input_scale`. Read at the ACTIVE
+parity pin `e126687a9a828d513c01a07cd69f025f27d63280`, that is false for THIS
+declaration: `ModelOptMixedPrecisionConfig.get_quant_method` dispatches a
+`ParallelLMHead` on `quant_algo` exactly like any other `LinearBase`
+(`modelopt.py:2426-2438`) and has no head branch anywhere in it, so a head
+declared `NVFP4` resolves upstream to `ModelOptNvFp4LinearMethod`, the
+fp4-ACTIVATION method. `ModelOptNvFp4W4A16LinearMethod` -- which does delete
+`input_scale` (`modelopt.py:1375`, registered at `:1365`) -- is what a head
+declared `W4A16_NVFP4` gets, which is `nvidia/Qwen3.6-27B-NVFP4` and `r0b0tlab`,
+not `RadixArk`. `LoadDenseLmHead` pins this build's head to that arm regardless.
+So `lm_head` diverges for the same reason its 192 siblings do, it is listed
+rather than hidden, and the count reconciles against the file.
+
+The anchors above are read at `e126687a9a`, not at `5559679229bc961848b121ccdeaa8fa5d79bec98`.
+`docs/ENVIRONMENT.md` and `LoadDenseLmHead`'s own comment still cite the old
+pin's `modelopt.py:1365`/`:1358` for the same two lines; those are two of the
+"at least 177" files `.agents/upstream-sync.md` records as behind the advanced
+pin, and re-anchoring them is that reconciliation's work rather than W7's.
 
 ### What W7 did NOT deliver, and is owed
 

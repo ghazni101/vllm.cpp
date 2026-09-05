@@ -1191,19 +1191,36 @@ inline std::string ActivationArmNotice(const MixedPrecisionConfig& c,
   out += "\n  " + std::to_string(with_divisor) +
          " of them ship the activation divisor <module>.input_scale that the "
          "W4A4 arm would read";
+  // Only TWO endings exist, because `with_divisor` is zero whenever
+  // `w4a4_opt_in` is set: a module that ships the divisor under the knob is not
+  // divergent at all and never reaches that counter. A third branch for
+  // "opted in AND counted" would be unreachable text.
   out += with_divisor == 0
              ? ", so this build could not take that arm even with VT_MODELOPT_W4A4=1."
-             : (w4a4_opt_in
-                    ? "."
-                    : ", and VT_MODELOPT_W4A4 is unset, so it is dropped "
-                      "(docs/ENVIRONMENT.md records consuming it producing "
-                      "incoherent text on nvidia/Qwen3.6-27B-NVFP4).");
+             : ", and VT_MODELOPT_W4A4 is unset, so it is dropped "
+               "(docs/ENVIRONMENT.md records consuming it producing "
+               "incoherent text on nvidia/Qwen3.6-27B-NVFP4).";
+  // AN OUTPUT HEAD IS NOT AN EXCEPTION, and an earlier draft of this line said
+  // it was. `LoadDenseLmHead` forces this build's NVFP4 head weight-only unless
+  // VT_MODELOPT_W4A4=1, citing `ModelOptNvFp4W4A16LinearMethod`, and that method
+  // is what upstream gives a head declared `W4A16_NVFP4` -- NOT one declared
+  // `NVFP4`. At the parity pin `e126687a9a828d513c01a07cd69f025f27d63280`,
+  // `ModelOptMixedPrecisionConfig.get_quant_method` dispatches a
+  // `ParallelLMHead` on `quant_algo` exactly like any other `LinearBase`
+  // (modelopt.py:2426-2438), with no head branch anywhere in it. So the head of
+  // THIS checkpoint diverges for the same reason its 192 siblings do, and
+  // hiding it would make the count irreconcilable against the file.
   out +=
-      "\n  W4A16 is CORRECT for an OUTPUT HEAD whatever the declaration says, "
-      "and lm_head is listed rather than hidden so this count reconciles "
-      "against the file: vLLM resolves a quantized head through "
-      "ModelOptNvFp4W4A16LinearMethod, which DELETES input_scale "
-      "(modelopt.py:1365, registered at :1358).";
+      "\n  An OUTPUT HEAD is not an exception: at the parity pin e126687a9a, "
+      "ModelOptMixedPrecisionConfig dispatches a ParallelLMHead on quant_algo "
+      "like any other Linear (modelopt.py:2426-2438), so a head declared NVFP4 "
+      "resolves upstream to ModelOptNvFp4LinearMethod, the fp4-ACTIVATION "
+      "method -- there is no output-head carve-out. "
+      "ModelOptNvFp4W4A16LinearMethod, which deletes input_scale "
+      "(modelopt.py:1375, registered at :1365), is what a head declared "
+      "W4A16_NVFP4 gets, and it is the arm LoadDenseLmHead pins this build's "
+      "head to whatever the declaration says. lm_head, when present, is "
+      "therefore listed rather than hidden.";
   out += "\n  declared NVFP4, executed W4A16: " +
          detail::JoinModules(divergent, 8);
   out +=

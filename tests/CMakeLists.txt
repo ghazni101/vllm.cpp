@@ -4008,9 +4008,9 @@ set_tests_properties(test_glm_moe_dsa_forward PROPERTIES
 # `vllm::LoadQwen3_5Dense` with stderr captured, never through the notice
 # function alone, because a test that calls the function directly stays green
 # when the production call site is deleted. Cases 1-6 are hermetic over a
-# one-layer synthetic checkpoint in the artifact's own module names; case 7 is
-# env-gated on VLLM_CPP_QWEN38_27B_RADIXARK_DIR and reads only `config.json` and
-# the three shards' safetensors headers.
+# one-layer synthetic checkpoint in the artifact's own module names, as is case
+# 8; case 7 is env-gated on VLLM_CPP_QWEN38_27B_RADIXARK_DIR and reads only
+# `config.json` and the three shards' safetensors headers.
 vllm_cpp_add_test(test_qwen38_27b_radixark_w4a4_notice
   vllm/models/test_qwen38_27b_radixark_w4a4_notice.cpp)
 target_include_directories(test_qwen38_27b_radixark_w4a4_notice PRIVATE
