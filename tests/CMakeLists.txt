@@ -2605,6 +2605,11 @@ vllm_cpp_add_test(test_rocm_quant_dot vt/test_rocm_quant_dot.cpp)
 target_include_directories(test_rocm_quant_dot PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_rocm_skinny_f32 vt/test_rocm_skinny_f32.cpp)
 target_include_directories(test_rocm_skinny_f32 PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# T36's op gate for the VT_PREFILL_TILE arm (KQuantGemmMTiledK). The standing
+# quant gate cannot express it: both of its arms share one env lever, so with
+# the lever on the OFF/ON memcmp is a tautology. Skips with no AMD GPU.
+vllm_cpp_add_test(test_rocm_prefill_tile vt/test_rocm_prefill_tile.cpp)
+target_include_directories(test_rocm_prefill_tile PRIVATE ${CMAKE_SOURCE_DIR}/src)
 # #785 P1 GPU product-seam witness. Executable only — NOT add_test.
 # Ordinary CTest must not see this target. Runner fail-closes on 77/nonzero.
 add_executable(test_ops_paged_attn_sharedk_wmma_p1_gpu
