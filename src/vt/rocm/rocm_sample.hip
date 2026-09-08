@@ -10,6 +10,7 @@
 #include <string>
 
 #include "vt/ops.h"
+#include "vt/grow_only_stream_scratch.h"
 #include "vt/sample_common.h"
 namespace vt::rocm {
 namespace {
@@ -519,20 +520,21 @@ void RandomSampleKernelRocm(Queue& q, Tensor& token_ids, const Tensor& probs,
   // the vocab is small or the batch is large enough to fill the GPU already.
   if (SampleSplitEnabled() && v >= 4096 && n <= 64) {
     constexpr int kBpr = kSampleSplitBlocks;
-    // Grow-only scratch (hipMallocAsync, stream-ordered — legal inside graph
-    // capture, same pattern as the greedy argmax split in rocm_dense_basic.hip).
-    static float* part_score = nullptr;
-    static int64_t* part_idx = nullptr;
-    static int64_t part_rows = 0;
-    if (part_rows < n) {
-      Check(hipMallocAsync(reinterpret_cast<void**>(&part_score),
-                           static_cast<size_t>(n) * kBpr * sizeof(float), s),
-            "sample_split scratch");
-      Check(hipMallocAsync(reinterpret_cast<void**>(&part_idx),
-                           static_cast<size_t>(n) * kBpr * sizeof(int64_t), s),
-            "sample_split scratch");
-      part_rows = n;
-    }
+    // Queue identities distinguish devices and reused native stream handles.
+    // Reserve the maximum split batch once so growth never invalidates captured
+    // pointers or discards allocations. Keep the slab resident for graph replay,
+    // following GrowOnlyStreamScratch's lifetime contract (#3062).
+    constexpr size_t kPartials = 64 * kBpr;
+    static vt::GrowOnlyStreamScratch<uint64_t> scratch;
+    void* slab = scratch.Ensure(q.id, kPartials * (sizeof(float) + sizeof(int64_t)),
+                               [s](size_t bytes) {
+      void* block = nullptr;
+      Check(hipMallocAsync(&block, bytes, s), "sample_split scratch");
+      return block;
+    });
+    // f32 scores match GumbelScore and the single-block sampler's reduction.
+    auto* part_score = static_cast<float*>(slab);
+    auto* part_idx = reinterpret_cast<int64_t*>(part_score + kPartials);
     RandomSampleSplitAK<<<static_cast<unsigned>(n * kBpr), kVocabBlock, 0, s>>>(
         part_score, part_idx, probs.Ptr<float>(), seeds.Ptr<int64_t>(), v, kBpr);
     // Phase B reduces kBpr partials in shared arrays sized kSampleSplitBlocks,
