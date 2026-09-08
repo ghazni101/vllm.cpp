@@ -1807,7 +1807,6 @@ void MatmulBTQuantKernelRocmGdn(Queue& q, Tensor& out, const Tensor& a, const Te
       dim3 gblock(32, kGemvWarps);
       if (gemv_fused) {
         const size_t lds_bytes = static_cast<size_t>(nsb) * sizeof(BlockQ8_K);
-      ++g_mmvq_route_fused;
         if (fmt == 2)
           KQuantGemvMmvqFusedK<OutT, 2><<<static_cast<unsigned>(ggrid), gblock,
                                          lds_bytes, s>>>(
