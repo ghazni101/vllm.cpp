@@ -951,6 +951,78 @@ TEST_CASE("ROCm apply_min_p / penalties surface matches CPU mask pattern") {
   }
 }
 
+TEST_CASE("ROCm random_sample: unwarmed capture refuses and warmed retry recovers") {
+  if (!HasRocm()) {
+    MESSAGE("no ROCm backend registered; capture recovery gate PENDING");
+    return;
+  }
+  const char* fast = std::getenv("VT_FAST_RANDOM_SAMPLE");
+  const char* split = std::getenv("VT_SAMPLE_SPLIT");
+  if ((fast != nullptr && fast[0] == '0') ||
+      (split != nullptr && split[0] == '0')) {
+    MESSAGE("split sampler disabled; its cold-allocation refusal is inapplicable");
+    return;
+  }
+  Backend& gpu = vt::GetBackend(DeviceType::kROCM);
+  REQUIRE(gpu.SupportsGraphCapture());
+  QueueGuard queue(gpu);
+  constexpr int64_t vocab = 8192;
+  std::vector<float> probs(static_cast<size_t>(vocab), 0.0f);
+  probs[11] = 1.0f;
+  int64_t seed = 12345;
+  RocmDeviceTensor dp(gpu, queue.q, DType::kF32, {1, vocab}, probs.data());
+  RocmDeviceTensor ds(gpu, queue.q, DType::kI64, {1}, &seed);
+  RocmDeviceTensor out(gpu, queue.q, DType::kI64, {1});
+  gpu.Synchronize(queue.q);
+  auto sample = [&] { vt::RandomSample(queue.q, out.tensor(), dp.tensor(), ds.tensor()); };
+  auto check_token = [&](int64_t expected) {
+    int64_t token = -1;
+    out.Download(queue.q, &token);
+    CHECK(token == expected);
+  };
+  auto set_token = [&](int64_t token) {
+    std::fill(probs.begin(), probs.end(), 0.0f);
+    probs[static_cast<size_t>(token)] = 1.0f;
+    gpu.Copy(queue.q, dp.tensor().data, probs.data(), probs.size() * sizeof(float));
+  };
+
+  // #3062: no allocation node may be cached as process-owned eager scratch.
+  // The backend requires warmup, so refuse before allocating or launching.
+  gpu.BeginCapture(queue.q);
+  std::string refusal;
+  try {
+    sample();
+  } catch (const std::runtime_error& error) {
+    refusal = error.what();
+  }
+  // The query/refusal must leave an empty capture that can end normally.
+  void* empty = gpu.EndCaptureGraph(queue.q);
+  gpu.DestroyGraph(empty);
+  REQUIRE_MESSAGE(!refusal.empty(), "unwarmed split capture must refuse before allocating scratch");
+  CHECK(refusal.find("pre-warm") != std::string::npos);
+
+  sample(); // Eager warmup after refusal must allocate a usable slab.
+  check_token(11);
+  gpu.BeginCapture(queue.q);
+  sample();
+  struct Graph {
+    Backend& backend;
+    void* value;
+    ~Graph() { if (value != nullptr) backend.DestroyGraph(value); }
+  } graph{gpu, gpu.EndCaptureGraph(queue.q)};
+  set_token(37);
+  sample(); // Eager access before the graph's first execution.
+  check_token(37);
+  set_token(73);
+  gpu.ReplayGraph(queue.q, graph.value);
+  check_token(73);
+  gpu.DestroyGraph(graph.value);
+  graph.value = nullptr;
+  set_token(113);
+  sample(); // Destroying the graph must not destroy the cached allocation.
+  check_token(113);
+}
+
 TEST_CASE("ROCm random_sample: concurrent queues retain independent graph scratch") {
   if (!HasRocm()) {
     MESSAGE("no ROCm backend registered; device scratch gate PENDING");
