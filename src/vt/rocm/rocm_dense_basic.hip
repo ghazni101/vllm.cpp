@@ -337,10 +337,14 @@ void GeluMulSeparateRocm(Queue& q, void* out, const void* gate, const void* up, 
 // Thread mapping and quant body are the QuantizeQ8KKWarpCoop pair (8 threads
 // per super-block, 32 elements per thread, ascending amax with
 // lower-chunk-index tie-break, butterfly xor reduce). BYTE-EXACTNESS: the
-// split path stores silu(g)*up through __float2bfloat16 (SiluMulK::St) and
-// the quantizer loads those bits via DBF16ToF32; this kernel performs the
-// identical store and consumes __bfloat162float of the same bf16 -- the same
-// f32 the standalone quantizer reads.
+// split path (#2957's SiluMulK) narrows silu(g) to bf16 BEFORE the multiply
+// (NarrowTo(silu(g)) * up, cpu oracle RoundThrough) and stores the product
+// through __float2bfloat16; the quantizer loads those bits via DBF16ToF32.
+// This kernel performs the identical sequence -- silu(g) round-tripped
+// through bf16, then multiplied, then the product stored the same way -- so
+// it consumes the same f32 the standalone quantizer reads. Skipping the
+// intermediate silu narrowing re-introduced the pre-#2957 bf16 divergence on
+// this lever path.
 __global__ void SiluMulQuantQ8KKWarpCoop(
     __hip_bfloat16* __restrict__ act, vt::cpu::BlockQ8_K* __restrict__ scratch,
     const __hip_bfloat16* __restrict__ gu, int64_t total_sb, int64_t d,
@@ -369,7 +373,10 @@ __global__ void SiluMulQuantQ8KKWarpCoop(
   for (int j = 0; j < kChunk; ++j) {
     const float g = __bfloat162float(grow[col0 + j]);
     const float u = __bfloat162float(urow[col0 + j]);
-    const __hip_bfloat16 bf = __float2bfloat16((g / (1.0f + expf(-g))) * u);
+    // #2957 parity: round silu(g) to the gate dtype (bf16) BEFORE the
+    // multiply, exactly as SiluMulK::St does on the unfused path.
+    const float sf = __bfloat162float(__float2bfloat16(g / (1.0f + expf(-g))));
+    const __hip_bfloat16 bf = __float2bfloat16(sf * u);
     act[i * d + col0 + j] = bf;
     vals[j] = __bfloat162float(bf);
     if (const float ax = fabsf(vals[j]); ax > amax) { amax = ax; mx = vals[j]; }
