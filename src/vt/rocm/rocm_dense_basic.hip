@@ -439,9 +439,12 @@ void GreedyArgmaxKernelRocm(Queue& q, Tensor& out, const Tensor& logits) {
   // Engine + cross-device tests use i64 token ids.
   if (out.dtype == DType::kI64) {
     if (logits.dtype == DType::kF32) {
-      // T14 opt-in (read once per process like sibling arms): row-split
-      // two-phase argmax for decode-shaped [small rows, huge vocab].
-      static const bool argmax_split = [] {
+      // T14 opt-in, read PER CALL like the CUDA sibling's convention so a
+      // test process can flip the flag between legs and a captured decode
+      // graph picks the arm up at launch/capture time. A once-per-process
+      // static made the byte-identity test's flag-ON leg silently reuse the
+      // serial reduction — the arm under test never ran.
+      const bool argmax_split = [] {
         const char* e = std::getenv("VT_ARGMAX_SPLIT");
         return e != nullptr && e[0] == '1' && e[1] == '\0';
       }();
