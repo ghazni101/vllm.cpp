@@ -528,6 +528,19 @@ void RandomSampleKernelRocm(Queue& q, Tensor& token_ids, const Tensor& probs,
     static vt::GrowOnlyStreamScratch<uint64_t> scratch;
     void* slab = scratch.Ensure(q.id, kPartials * (sizeof(float) + sizeof(int64_t)),
                                [s](size_t bytes) {
+      // The backend requires prewarm before capture. hipMallocAsync inside
+      // capture creates graph-owned storage, not reusable eager scratch.
+      // Check only on a pool miss and never publish such an allocation (#3062).
+      hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
+      Check(hipStreamIsCapturing(s, &capture), "sample_split scratch capture query");
+      if (capture == hipStreamCaptureStatusActive) {
+        throw std::runtime_error(
+            "vt rocm: sample_split scratch: pre-warm RandomSample on this queue before graph capture");
+      }
+      if (capture != hipStreamCaptureStatusNone) {
+        throw std::runtime_error(
+            "vt rocm: sample_split scratch: capture is invalidated; end capture before pre-warming RandomSample");
+      }
       void* block = nullptr;
       Check(hipMallocAsync(&block, bytes, s), "sample_split scratch");
       return block;

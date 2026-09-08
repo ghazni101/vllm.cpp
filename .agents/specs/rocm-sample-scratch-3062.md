@@ -111,5 +111,13 @@ Callers continue to own submission serialization for a shared queue.
 
 ## Now
 
-ACTIVE: spec committed before regression and implementation.
-No correctness or performance gate result is claimed yet.
+ACTIVE: the capture-refusal amendment precedes its regression and guard.
+The host dispatcher suite failed three of eight cases before the guard and
+passes all eight afterward. Seven scratch mutations fail: removed guard,
+ignored query error, wrong capture branch, allocation before the query,
+1024-thread phase B, missing partial lanes, and a query on warmed hits.
+Each source mutation was restored byte-for-byte.
+
+The device recovery case and the existing concurrent replay case remain
+PENDING until the operator runs them under a lease. Host execution does not
+establish device capture behavior. No performance result is claimed.
