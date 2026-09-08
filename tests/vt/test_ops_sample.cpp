@@ -978,6 +978,8 @@ TEST_CASE("ROCm random_sample: concurrent queues retain independent graph scratc
   // Capture the small batch first, grow afterward, then replay the small graph.
   // This checks that later calls cannot invalidate the graph's baked pointers.
   da.tensor().shape[0] = 1;
+  sa.tensor().shape[0] = 1;
+  oa.tensor().shape[0] = 1;
   vt::RandomSample(qa.q, oa.tensor(), da.tensor(), sa.tensor());
   gpu.Synchronize(qa.q);
   gpu.BeginCapture(qa.q);
@@ -988,6 +990,8 @@ TEST_CASE("ROCm random_sample: concurrent queues retain independent graph scratc
     ~Graph() { backend.DestroyGraph(value); }
   } ga{gpu, gpu.EndCaptureGraph(qa.q)};
   da.tensor().shape[0] = rows;
+  sa.tensor().shape[0] = rows;
+  oa.tensor().shape[0] = rows;
   vt::RandomSample(qa.q, oa.tensor(), da.tensor(), sa.tensor());
   gpu.Synchronize(qa.q);
   gpu.ReplayGraph(qa.q, ga.value);
