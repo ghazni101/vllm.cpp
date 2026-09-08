@@ -10,9 +10,12 @@
 #include <doctest/doctest.h>
 
 #include <cmath>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <limits>
+#include <thread>
 #include <vector>
 
 #include "vt/backend.h"
@@ -945,6 +948,94 @@ TEST_CASE("ROCm apply_min_p / penalties surface matches CPU mask pattern") {
   for (size_t i = 0; i < 8; ++i) {
     if (std::isinf(lc[i])) CHECK(std::isinf(out[i]));
     else CHECK(out[i] == doctest::Approx(lc[i]).epsilon(1e-5));
+  }
+}
+
+TEST_CASE("ROCm random_sample: concurrent queues retain independent graph scratch") {
+  if (!HasRocm()) {
+    MESSAGE("no ROCm backend registered; device scratch gate PENDING");
+    return;
+  }
+  Backend& gpu = vt::GetBackend(DeviceType::kROCM);
+  REQUIRE(gpu.SupportsGraphCapture());
+  constexpr int64_t rows = 64, vocab = 8192, rounds = 256;
+  QueueGuard qa(gpu), qb(gpu);
+  std::vector<float> pa(static_cast<size_t>(rows * vocab), 0.0f), pb(pa);
+  for (int64_t row = 0; row < rows; ++row) {
+    pa[static_cast<size_t>(row * vocab + 11)] = 1.0f;
+    pb[static_cast<size_t>(row * vocab + vocab - 11)] = 1.0f;
+  }
+  std::vector<int64_t> seeds(static_cast<size_t>(rows), 12345);
+  RocmDeviceTensor da(gpu, qa.q, DType::kF32, {rows, vocab}, pa.data());
+  RocmDeviceTensor db(gpu, qb.q, DType::kF32, {rows, vocab}, pb.data());
+  RocmDeviceTensor sa(gpu, qa.q, DType::kI64, {rows}, seeds.data());
+  RocmDeviceTensor sb(gpu, qb.q, DType::kI64, {rows}, seeds.data());
+  RocmDeviceTensor oa(gpu, qa.q, DType::kI64, {rows});
+  RocmDeviceTensor ob(gpu, qb.q, DType::kI64, {rows});
+  gpu.Synchronize(qa.q);
+  gpu.Synchronize(qb.q);
+
+  // Capture the small batch first, grow afterward, then replay the small graph.
+  // This checks that later calls cannot invalidate the graph's baked pointers.
+  da.tensor().shape[0] = 1;
+  vt::RandomSample(qa.q, oa.tensor(), da.tensor(), sa.tensor());
+  gpu.Synchronize(qa.q);
+  gpu.BeginCapture(qa.q);
+  vt::RandomSample(qa.q, oa.tensor(), da.tensor(), sa.tensor());
+  struct Graph {
+    Backend& backend;
+    void* value;
+    ~Graph() { backend.DestroyGraph(value); }
+  } ga{gpu, gpu.EndCaptureGraph(qa.q)};
+  da.tensor().shape[0] = rows;
+  vt::RandomSample(qa.q, oa.tensor(), da.tensor(), sa.tensor());
+  gpu.Synchronize(qa.q);
+  gpu.ReplayGraph(qa.q, ga.value);
+  std::vector<int64_t> first(static_cast<size_t>(rows));
+  oa.Download(qa.q, first.data());
+  CHECK(first[0] == 11);
+
+  // Both captured graphs now refer to the same maximum-size allocation on the
+  // unfixed dispatcher. Interleaving their phases can substitute another
+  // queue's token. One-hot distributions remove numerical-tolerance ambiguity.
+  gpu.BeginCapture(qa.q);
+  vt::RandomSample(qa.q, oa.tensor(), da.tensor(), sa.tensor());
+  Graph ga_full{gpu, gpu.EndCaptureGraph(qa.q)};
+  vt::RandomSample(qb.q, ob.tensor(), db.tensor(), sb.tensor());
+  gpu.Synchronize(qb.q);
+  gpu.BeginCapture(qb.q);
+  vt::RandomSample(qb.q, ob.tensor(), db.tensor(), sb.tensor());
+  Graph gb{gpu, gpu.EndCaptureGraph(qb.q)};
+  struct Pinned {
+    Backend& backend;
+    void* value;
+    ~Pinned() { backend.FreePinned(value); }
+  } ha{gpu, gpu.AllocPinned(static_cast<size_t>(rounds * rows) * sizeof(int64_t))},
+    hb{gpu, gpu.AllocPinned(static_cast<size_t>(rounds * rows) * sizeof(int64_t))};
+  std::atomic<int> ready{0};
+  std::exception_ptr errors[2];
+  auto submit = [&](int lane, Queue& q, void* graph, Tensor& out, void* host) {
+    ready.fetch_add(1);
+    while (ready.load() != 2) std::this_thread::yield();
+    try {
+      for (int64_t i = 0; i < rounds; ++i) {
+        gpu.ReplayGraph(q, graph);
+        gpu.Copy(q, static_cast<int64_t*>(host) + i * rows, out.data,
+                 static_cast<size_t>(rows) * sizeof(int64_t));
+      }
+      gpu.Synchronize(q);
+    } catch (...) {
+      errors[lane] = std::current_exception();
+    }
+  };
+  std::thread a(submit, 0, std::ref(qa.q), ga_full.value, std::ref(oa.tensor()), ha.value);
+  std::thread b(submit, 1, std::ref(qb.q), gb.value, std::ref(ob.tensor()), hb.value);
+  a.join();
+  b.join();
+  for (const auto& error : errors) if (error) std::rethrow_exception(error);
+  for (int64_t i = 0; i < rounds * rows; ++i) {
+    REQUIRE(static_cast<int64_t*>(ha.value)[i] == 11);
+    REQUIRE(static_cast<int64_t*>(hb.value)[i] == vocab - 11);
   }
 }
 
