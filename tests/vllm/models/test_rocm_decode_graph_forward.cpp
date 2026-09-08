@@ -306,11 +306,24 @@ TEST_CASE("ROCm T2b: ModelRegistry::Forward reaches the captured decode-graph on
     in.num_reqs = 1;
     in.pure_decode = true;
     in.gather_logits = false;
+    // The graph driver caps its padded batch at gdn_state_slots (the GDN
+    // state-cache slot count); left at the 0 default, max_num_reqs=0 and the
+    // capture arm never engages. The pool above allocates num_blocks slots.
+    in.gdn_state_slots = 4;
     const ForwardLogits out = vllm::ModelRegistry::Forward(*model, in);
     REQUIRE(out.on_device());
     REQUIRE(out.device_tensor.data != nullptr);
     for (float x : {0.0F}) (void)x;  // suppress unused-warning in no-assert builds
   }
+
+  // The steps above are only evidence of the captured path if the graph was
+  // actually captured and replayed. Assert on the backend's instrumentation:
+  // step 1 captures, steps 2-5 replay (per padded batch size, the dedup
+  // registry may share one exec — replay COUNT still grows per step). Without
+  // this, a gate that silently disengages leaves the test green over five
+  // eager steps — the mutation-weakness the reviewer flagged.
+  REQUIRE(b.GraphsCaptured() >= 1);
+  REQUIRE(b.GraphReplays() >= 4);
 
   MESSAGE("ROCm T2b: 5 pure-decode steps through ModelRegistry::Forward on gfx1100");
 }

@@ -117,6 +117,12 @@ class RocmPlatform final : public Platform {
   //   string — no device present — does not match and degrades to opt-in (eager),
   //   the conservative answer.
   bool static_graph_requires_opt_in() const override {
+    // Explicit escape hatch: an operator on a non-evidence arch can opt in
+    // deliberately. Without it the opt-in was impossible to satisfy off
+    // gfx1100 — the gate was eager everywhere else with no override.
+    if (const char* e = std::getenv("VLLM_CPP_ROCM_STATIC_GRAPH")) {
+      return !(e[0] == '1' && e[1] == '\0');
+    }
     const std::string arch = vt::rocm::DeviceArchName(0);
     return !IsGfx1100(arch);
   }
