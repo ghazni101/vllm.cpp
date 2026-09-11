@@ -1296,10 +1296,13 @@ def check_draw_preconditions(records: Sequence[Mapping[str, Any]]) -> tuple[int,
         return EXIT_ACT_ARM_MIXED, [
             "this evidence root holds more than one NVFP4 activation arm "
             f"({sorted(str(a) for a in act_arms)}). `VT_MODELOPT_W4A4=1` "
-            "consumes the checkpoint's `input_scale`, flipping "
+            "consumes a MODELOPT checkpoint's `input_scale`, flipping "
             "`IsTrueW4A4()` onto the CUTLASS fp4-activation GEMM; unset, the "
             "same weights route to the W4A16 Marlin arm, which carries no "
-            "tactic path at all. The two arms therefore run DIFFERENT GEMMs, "
+            "tactic path at all. (The compressed-tensors spelling is not "
+            "gated by the knob: `LoadCtNvfp4Raw` sets `alpha` "
+            "unconditionally, so there the arm is decided by the artifact.) "
+            "The arms can therefore run DIFFERENT GEMMs, "
             "and a draw spread pooled across them names no path; run one root "
             "per arm"
         ]

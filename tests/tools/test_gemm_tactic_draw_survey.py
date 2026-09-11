@@ -1808,6 +1808,40 @@ class ShellDriverTest(unittest.TestCase):
         for command in commands:
             self.assertIn("$SMOKE_ARG", command, command)
 
+    def test_every_draw_command_and_the_score_command_carry_the_activation_arm(self) -> None:
+        """The two argument lines a behavioural test provably cannot reach.
+
+        Under `--smoke` `DRAWS=1`, so the main N-draw phase re-invokes with
+        `--draws 1`, `run_draw` early-returns on `draws/draw00/DONE`, and the
+        end-to-end assertion only ever reads the PREFLIGHT's record. The
+        score-phase `--command` line is likewise built as a string and handed to
+        the leg runner. Deleting the arm from either left the whole suite green.
+
+        Textual is the RIGHT instrument here and only here: the defect is an
+        argument missing from a line no executing test reaches, so asserting the
+        line is asserting the thing that breaks.
+        """
+
+        text = self.SCRIPT.read_text(encoding="utf-8")
+        commands, current = [], None
+        for line in text.splitlines():
+            if current is not None:
+                current.append(line)
+            elif '"$SURVEY" draw' in line:
+                current = [line]
+            if current is not None and not line.rstrip().endswith("\\"):
+                commands.append(" ".join(current))
+                current = None
+        self.assertEqual(len(commands), 2, commands)
+        for command in commands:
+            self.assertIn("$W4A4_ARG", command, command)
+
+        leg = [ln for ln in text.splitlines() if "--score-leg {arm}" in ln]
+        self.assertEqual(len(leg), 1, leg)
+        # A leg replaying a frozen map under the OTHER arm executes a different
+        # kernel family from the draw that produced it.
+        self.assertIn("--modelopt-w4a4 $MODELOPT_W4A4", leg[0], leg[0])
+
     # --- the ACTIVATION arm reaches the bench, on every path -------------
     def arm_recording_bench(self, root: pathlib.Path, witness: pathlib.Path) -> None:
         """A bench that reports the activation arm it was actually given.
