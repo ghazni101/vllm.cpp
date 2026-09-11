@@ -1144,19 +1144,12 @@ Tensor ResidentWeight(Dev d, const OwnedTensor& w, std::vector<int64_t> shape = 
   // them -- it kept a private copy, so the fix never reached it. That is the
   // off-framework-model hazard the decode-framework-routing audit names.
   if (vllm::platforms::GetPlatform(d.q.device.type).is_cpu()) {
-    Tensor t = MakeTensor(const_cast<uint8_t*>(w.bytes.data()), w.dtype,
-                          d.q.device, shape);
-    // CIQ G7: carry the i8mm-repack marker from the OwnedTensor to the vt::Tensor
-    // the GEMM actually sees. This is the ONLY host->kernel weight-tensor
-    // construction on the CPU forward (MakeTensor drops it by default), so
-    // without this the kernel reads repacked bytes as a plain q8_0 weight ->
-    // garbage. Only ever true on the CPU keep-quant path (a staged device never
-    // repacks), so it is inert everywhere else.
+    Tensor t = w.ViewOn(const_cast<uint8_t*>(w.bytes.data()), d.q.device, shape);
+    // This arm owns repacked/elem_kn_repacked and NOT q8_0_aligned, exactly as
+    // it did before ViewOn: MakeTensor dropped all three and this arm restored
+    // these two. The second resident helper below returns the view unchanged,
+    // which also matches main, where it returns MakeTensor with no markers.
     t.repacked = w.repacked;
-    // Same reasoning for the elementwise [N,K] -> [K,N] repack: without this the
-    // kernel would read transposed bytes as a plain [N,K] weight. Set only on
-    // this CPU-resident construction, which is exactly where MatmulBTKernel
-    // consumes it; a staged device weight is never elem-repacked.
     t.elem_kn_repacked = w.elem_kn_repacked;
     return t;
   }
@@ -1286,8 +1279,7 @@ Tensor ResidentWeight(Dev d, const OwnedTensor& w, std::vector<int64_t> shape = 
       if (aliased) {
         // NOT `load_stats::AddDeviceUpload`: nothing was uploaded. Issue #150's
         // counter measures bytes moved host->device, and this branch moves none.
-        return MakeTensor(const_cast<uint8_t*>(w.bytes.data()), w.dtype, d.q.device,
-                          shape);
+        return w.ViewOn(const_cast<uint8_t*>(w.bytes.data()), d.q.device, shape);
       }
     }
     // A MISALIGNED BORROW, or the `VT_QWEN35_ALIAS_HOST_WEIGHTS=0` A/B, reaches
@@ -1311,7 +1303,7 @@ Tensor ResidentWeight(Dev d, const OwnedTensor& w, std::vector<int64_t> shape = 
     // costs a second full copy of the model out of the same unified RAM.
     AdoptDeviceBytesAsHost(d.b, w);
   }
-  return MakeTensor(w.d_dev.get(), w.dtype, d.q.device, shape);
+  return w.ViewOn(w.d_dev.get(), d.q.device, shape);
 }
 
 }  // namespace (closed so the bridge below has EXTERNAL linkage; the unnamed
@@ -5665,7 +5657,8 @@ DBuf FullAttnBlock(Dev d, const FullAttnLayerWeights& w, const HfConfig& cfg,
     vt::RmsNorm(d.q, dkn2d, Reshape(kf, {T * Hkv, Dh}), dkw,
                 vt::RmsNormArgs{eps, true});
     DBuf dpos(d, DType::kI32, {T}, positions.data());
-    vt::RopeNeox(d.q, dq3.t(), dk3.t(), dpos.t(), vt::RopeArgs{base, rot});
+    // A resolved zero rotary width preserves the normalized query/key bytes.
+    if (rot != 0) vt::RopeNeox(d.q, dq3.t(), dk3.t(), dpos.t(), vt::RopeArgs{base, rot});
   }
   Tensor qn3 = dq3.t();
   Tensor kn3 = dk3.t();
@@ -5837,7 +5830,8 @@ DBuf FullAttnBlockPaged(Dev d, const FullAttnLayerWeights& w, const HfConfig& cf
     Tensor dkn2d = Reshape(dk3.t(), {T * Hkv, Dh});
     vt::RmsNorm(d.q, dkn2d, Reshape(kf, {T * Hkv, Dh}), dkw,
                 vt::RmsNormArgs{eps, true});
-    vt::RopeNeox(d.q, dq3.t(), dk3.t(), sdi.positions.t(), vt::RopeArgs{base, rot});
+    // Keep negative-width validation in the shared primitive. Only zero is no work.
+    if (rot != 0) vt::RopeNeox(d.q, dq3.t(), dk3.t(), sdi.positions.t(), vt::RopeArgs{base, rot});
   }
   Tensor qn3 = dq3.t();
   Tensor kn3 = dk3.t();

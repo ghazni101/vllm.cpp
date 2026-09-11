@@ -557,6 +557,10 @@ vllm_cpp_add_test(test_qwen35_paged_forward vllm/models/test_qwen35_paged_forwar
 # GDN-MOE-BF16-OUT (#1168): the MoE forward's GDN output-activation dtype probe
 # lives in the not-installed qwen3_5_internal.h, beside the other detail:: seams.
 target_include_directories(test_qwen35_paged_forward PRIVATE ${CMAKE_SOURCE_DIR}/src)
+add_test(NAME test_qwen35_zero_rope_unfused COMMAND test_qwen35_paged_forward
+  "--test-case=qwen35 zero rotary*")
+set_tests_properties(test_qwen35_zero_rope_unfused PROPERTIES
+  ENVIRONMENT "VT_FUSE_ATTN_PREAMBLE=0")
 # GDN-MOE-BF16-OUT (#1168), fresh-review repair. `GdnOutDType()` caches its
 # getenv in a function-local static, so one process observes exactly ONE value of
 # VT_GDN_OUT_BF16 and a single run cannot tell a resolver that READS the lever
@@ -2656,6 +2660,7 @@ set_tests_properties(test_backend_cross_device_vt_attn_decode_d128 PROPERTIES
 # of that skeleton carrying a DECISION is gated on a CPU-only CI runner with no
 # AMD GPU. The rest of the ROCm skeleton is under VLLM_CPP_HIP below.
 vllm_cpp_add_test(test_rocm_arch vt/test_rocm_arch.cpp)
+vllm_cpp_add_test(test_rocm_f16_contract vt/test_rocm_f16_contract.cpp)
 # The grow-only per-stream device scratch pool (#2712). UNCONDITIONAL for the
 # same reason test_rocm_arch is: src/vt/grow_only_stream_scratch.h is free of
 # HIP and CUDA headers, so the piece of the ROCm scratch allocators that holds
@@ -2685,6 +2690,46 @@ if(VLLM_CPP_HIP)
 # Plain C++ (no HIP header): every assertion goes through the vt:: seam. Each
 # case no-ops when the build has HIP but the box has no AMD GPU.
 vllm_cpp_add_test(test_rocm_backend vt/test_rocm_backend.cpp)
+# HIP runtime queries prove allocation provenance and stream capture for split.
+vllm_cpp_add_test(test_rocm_attn_gate_split vt/test_rocm_attn_gate_split.cpp)
+target_compile_definitions(test_rocm_attn_gate_split PRIVATE __HIP_PLATFORM_AMD__)
+# Resource-specific cases run in separate processes so a missing second device
+# or insufficient memory reports its own skip without hiding the ordinary gate.
+add_test(NAME test_rocm_attn_gate_split_device_binding COMMAND test_rocm_attn_gate_split
+  --no-skip "--test-case=ROCm split binds*")
+add_test(NAME test_rocm_attn_gate_split_large_index COMMAND test_rocm_attn_gate_split
+  --no-skip "--test-case=ROCm split indexes*")
+set_tests_properties(test_rocm_attn_gate_split_device_binding
+  test_rocm_attn_gate_split_large_index PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+vllm_cpp_add_test(test_rocm_f16_weights vt/test_rocm_f16_weights.cpp)
+add_test(NAME test_rocm_f16_graph_dedup COMMAND test_rocm_f16_weights
+  "--test-case=ROCm F16 graph handles*")
+set_tests_properties(test_rocm_f16_graph_dedup PROPERTIES
+  ENVIRONMENT "VT_CUDA_GRAPH_DEDUP=1")
+add_executable(test_rocm_f16_device vt/test_rocm_f16_device.hip)
+target_link_libraries(test_rocm_f16_device PRIVATE vllm::vllm)
+foreach(_f16_allocation_target test_rocm_f16_weights test_rocm_f16_device)
+  target_sources(${_f16_allocation_target} PRIVATE vt/rocm_f16_alloc_observer.hip)
+  target_link_options(${_f16_allocation_target} PRIVATE
+    "LINKER:--wrap=hipMalloc" "LINKER:--wrap=hipFree")
+endforeach()
+vllm_cpp_set_warnings(test_rocm_f16_device)
+add_test(NAME test_rocm_f16_device COMMAND test_rocm_f16_device)
+set_tests_properties(test_rocm_f16_device PROPERTIES SKIP_RETURN_CODE 77)
+add_executable(test_rocm_f16_model vllm/test_rocm_f16_model.cpp)
+target_link_libraries(test_rocm_f16_model PRIVATE vllm::vllm)
+vllm_cpp_set_warnings(test_rocm_f16_model)
+add_test(NAME test_rocm_f16_model COMMAND test_rocm_f16_model)
+set_tests_properties(test_rocm_f16_model PROPERTIES SKIP_RETURN_CODE 77)
+# Duplicate provider registrations keep their first entry. Wrap the native
+# kernel symbols at link time so observation still executes the real kernels.
+foreach(_f16_observed_target test_rocm_f16_model test_gguf_keep_quant)
+  target_link_options(${_f16_observed_target} PRIVATE
+    "LINKER:--wrap=_ZN2vt4rocm16MatmulKernelRocmERNS_5QueueERNS_6TensorERKS3_S6_"
+    "LINKER:--wrap=_ZN2vt4rocm18MatmulBTKernelRocmERNS_5QueueERNS_6TensorERKS3_S6_"
+    "LINKER:--wrap=_ZN2vt4rocm19EmbeddingKernelRocmERNS_5QueueERNS_6TensorERKS3_S6_"
+    "LINKER:--wrap=_ZN2vt4rocm17CastF32KernelRocmERNS_5QueueERNS_6TensorERKS3_")
+endforeach()
 vllm_cpp_add_test(test_rocm_fp8_kv_cache vt/test_rocm_fp8_kv_cache.cpp)
 # BACKEND-ROCM silu-gate dtype rounding repair (#2889 silu item, #1954): the
 # ROCm SiluAndMul/MoeSiluMul kernels narrow silu(gate) to the gate dtype before
