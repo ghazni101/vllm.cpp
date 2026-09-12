@@ -5201,3 +5201,300 @@ TEST_CASE("ROCm registers the two attention ops GLM-5.3 non-flash reaches (#2926
       "the speed axis stays VOID";
   MESSAGE(owed);
 }
+
+// ---------------------------------------------------------------------------
+// MODEL-MM-QWEN4-EXP W1 — the first three `qwen4_exp` ops to reach ROCm.
+// Spec `.agents/specs/qwen4-exp-rocm-ops.md`, issue
+// ISSUE-LOCAL-01M2A1DTCZQVAH7M193XT9PN2V.
+//
+// THE REGISTRATION ASSERTION IS THE POINT OF THESE THREE CASES, not the NMSE.
+// The header of this file and the two comments at the grouped-GEMM cases above
+// say why: assertion (1), oracle equality, is GREEN on a backend with no kernel
+// at all wherever the portable reference tier is live, so it can never tell a
+// native arm from the tier. `vt::OpRegistered` is the native-only probe
+// (`src/vt/op_provider.cpp:801-825`) and is the only assertion that can.
+//
+// On `gfx1151` — the only AMD fleet device — the tier is not installed at all
+// (spec D2: `ReferenceTierEligible` gates on `DeviceMemoryIsHostAddressable()`,
+// `RocmBackend` returns `unified_memory_`, and `ResolveMemoryPolicy` computes
+// that false on this board since #2511). So a missing arm there is a REFUSAL by
+// name, not a slow path, and a `qwen4_exp` forward cannot emit a token while
+// any of these three is unregistered. The registration assertion is therefore
+// `REQUIRE`d and not `CHECK`ed: a false here is not a degraded mode to keep
+// measuring past.
+// ---------------------------------------------------------------------------
+
+namespace {
+// Whether THIS build linked a ROCm backend at all. A CPU-only or CUDA-only
+// build asserts nothing about ROCm; a ROCm build asserts everything.
+bool RocmBuilt() {
+  for (DeviceType dt : RegisteredDevices()) {
+    if (dt == DeviceType::kROCM) return true;
+  }
+  return false;
+}
+}  // namespace
+
+TEST_CASE("qwen4_exp gated-residual write-back matches the CPU oracle and is NATIVE on ROCm") {
+  // hc_count = 3 ON PURPOSE. The op's arithmetic divides by `hc_count` in two
+  // places and 1/3 is inexact in binary, so a power-of-two hc would let a
+  // reciprocal-multiply port pass that the real config (hc_count = 4 at the
+  // released checkpoint, 3 in golden case B) would separate.
+  constexpr int64_t T = 5, kHc = 3, kH = 7;
+  constexpr int64_t kFlat = kHc * kH;
+  const size_t hn = static_cast<size_t>(T) * kFlat;
+  const size_t bn = static_cast<size_t>(T) * kH;
+  const size_t in = static_cast<size_t>(T) * kHc;
+
+  const std::vector<float> hyper0 = RandomVec(hn, 4401);
+  const std::vector<float> block = RandomVec(bn, 4402);
+  // Injection is `2*sigmoid(.)` upstream, so it lives in (0, 2) and never
+  // straddles zero. Feeding it a signed random vector would let a sign error in
+  // the broadcast average out across the fixture.
+  const std::vector<float> inj = RandomVec(in, 4403, 0.25f, 1.75f);
+
+  vt::Qwen4ExpGatedResidualArgs args;
+  args.hc_count = kHc;
+  args.hidden_size = kH;
+  args.lowrank = 4;      // read by neither arm of this op; set so the struct is valid
+  args.eps = 1e-6f;
+
+  if (RocmBuilt()) {
+    REQUIRE(vt::OpRegistered(vt::OpId::kQwen4ExpGatedResidualWriteBack, DeviceType::kROCM));
+  }
+
+  std::vector<float> ref = hyper0;  // IN PLACE: the oracle starts from the same bytes
+  {
+    vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+    Queue cq = cpu.CreateQueue();
+    const Device cd{DeviceType::kCPU, 0};
+    std::vector<float> cb = block, ci = inj;
+    Tensor th = T2(ref.data(), cd, T, kFlat);
+    Tensor tb = T2(cb.data(), cd, T, kH);
+    Tensor ti = T2(ci.data(), cd, T, kHc);
+    vt::Qwen4ExpGatedResidualWriteBack(cq, th, tb, ti, args);
+    cpu.DestroyQueue(cq);
+  }
+  // The op must actually MOVE the residual, or an arm that returned `hyper`
+  // untouched would read green against an oracle that also did nothing.
+  {
+    bool moved = false;
+    for (size_t i = 0; i < ref.size(); ++i) {
+      if (ref[i] != hyper0[i]) moved = true;
+    }
+    REQUIRE(moved);
+  }
+
+  for (DeviceType dt : RegisteredDevices()) {
+    if (!OpAvailable(vt::OpId::kQwen4ExpGatedResidualWriteBack, dt)) continue;
+    CAPTURE(DeviceName(dt));
+    vt::Backend& dev = vt::GetBackend(dt);
+    Queue q = dev.CreateQueue();
+    const Device d{dt, 0};
+    DevBuf dh(dev, q, hn);
+    DevBuf db(dev, q, bn);
+    DevBuf di(dev, q, in);
+    dh.Upload(hyper0);
+    db.Upload(block);
+    di.Upload(inj);
+    Tensor th = T2(dh.ptr(), d, T, kFlat);
+    Tensor tb = T2(db.ptr(), d, T, kH);
+    Tensor ti = T2(di.ptr(), d, T, kHc);
+    // `OpRegistered` says a native provider EXISTS; this says the call did not
+    // fall through to the portable tier anyway.
+    const unsigned long long hits_before = vt::GetReferenceTierHits();
+    vt::Qwen4ExpGatedResidualWriteBack(q, th, tb, ti, args);
+    dev.Synchronize(q);
+    CHECK(vt::GetReferenceTierHits() == hits_before);
+    CHECK(Nmse(ref, dh.Download()) <= kNmseTol);
+    dev.DestroyQueue(q);
+  }
+}
+
+TEST_CASE("grouped RMS norm matches the CPU oracle and is NATIVE on ROCm") {
+  // group_size = 5 and 3 groups: neither the group extent nor the group count
+  // is a power of two, so a kernel that reduced over the whole row, or indexed
+  // the weight per group instead of flat, cannot coincide with the oracle.
+  constexpr int64_t kRows = 6, kGroup = 5, kGroups = 3;
+  constexpr int64_t kHidden = kGroup * kGroups;
+  const size_t n = static_cast<size_t>(kRows) * kHidden;
+  const std::vector<float> x = RandomVec(n, 4411);
+  // The gamma is RAW HuggingFace, centred on zero: every `qwen4_exp` consumer
+  // adds the 1 itself (#2218). A weight drawn around 1.0 would make a dropped
+  // `gemma` fold invisible.
+  const std::vector<float> w = RandomVec(kHidden, 4412, -0.25f, 0.25f);
+
+  if (RocmBuilt()) {
+    REQUIRE(vt::OpRegistered(vt::OpId::kRmsNormGroup, DeviceType::kROCM));
+  }
+
+  // BOTH polarities. With `gemma = false` the affine is `w` and with `true` it
+  // is `1 + w`; an arm that hard-coded either one passes the other's fixture
+  // only by accident, and the released checkpoint needs `true`.
+  std::vector<float> ref_gemma_false;
+  for (bool gemma : {false, true}) {
+    CAPTURE(gemma);
+    vt::RmsNormGroupArgs args;
+    args.eps = 1e-6f;
+    args.gemma = gemma;
+    args.group_size = kGroup;
+
+    std::vector<float> ref(n, 0.0f);
+    {
+      vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+      Queue cq = cpu.CreateQueue();
+      const Device cd{DeviceType::kCPU, 0};
+      std::vector<float> cx = x, cw = w;
+      Tensor tout = T2(ref.data(), cd, kRows, kHidden);
+      Tensor tx = T2(cx.data(), cd, kRows, kHidden);
+      Tensor tw = T1(cw.data(), cd, kHidden);
+      vt::RmsNormGroup(cq, tout, tx, tw, args);
+      cpu.DestroyQueue(cq);
+    }
+    // The two polarities must produce DIFFERENT numbers, proved by difference
+    // rather than asserted, or the `gemma` arm is untested while reading green.
+    if (!gemma) {
+      ref_gemma_false = ref;
+    } else {
+      REQUIRE(ref_gemma_false.size() == ref.size());
+      bool fold_moved = false;
+      for (size_t i = 0; i < ref.size(); ++i) {
+        if (ref[i] != ref_gemma_false[i]) fold_moved = true;
+      }
+      REQUIRE(fold_moved);
+    }
+
+    for (DeviceType dt : RegisteredDevices()) {
+      if (!OpAvailable(vt::OpId::kRmsNormGroup, dt)) continue;
+      CAPTURE(DeviceName(dt));
+      vt::Backend& dev = vt::GetBackend(dt);
+      Queue q = dev.CreateQueue();
+      const Device d{dt, 0};
+      DevBuf dx(dev, q, n);
+      DevBuf dw(dev, q, static_cast<size_t>(kHidden));
+      DevBuf dout(dev, q, n);
+      dx.Upload(x);
+      dw.Upload(w);
+      Tensor tx = T2(dx.ptr(), d, kRows, kHidden);
+      Tensor tw = T1(dw.ptr(), d, kHidden);
+      Tensor tout = T2(dout.ptr(), d, kRows, kHidden);
+      const unsigned long long hits_before = vt::GetReferenceTierHits();
+      vt::RmsNormGroup(q, tout, tx, tw, args);
+      dev.Synchronize(q);
+      CHECK(vt::GetReferenceTierHits() == hits_before);
+      CHECK(Nmse(ref, dout.Download()) <= kNmseTol);
+      dev.DestroyQueue(q);
+    }
+  }
+}
+
+TEST_CASE("qwen4_exp gated-residual MIXER matches the CPU oracle and is NATIVE on ROCm") {
+  // The mixer is the one op of this wave whose gate is a TOLERANCE by
+  // construction and not by choice: its three projections go through
+  // `vt::MatmulBT`, and a device GEMM re-associates the K reduction, so no
+  // device arm can be bit-identical to the CPU sibling. That is the donor's own
+  // recorded consequence (`src/vt/cuda/cuda_qwen4_exp.cu`, the shared-seam
+  // paragraph), inherited here unchanged.
+  constexpr int64_t T = 4, kHc = 3, kH = 7, kR = 5;
+  constexpr int64_t kFlat = kHc * kH;
+  const size_t hn = static_cast<size_t>(T) * kFlat;
+  const size_t mn = static_cast<size_t>(T) * kH;
+  const size_t injn = static_cast<size_t>(T) * kHc;
+  const size_t dn = static_cast<size_t>(kR) * kFlat;
+  const size_t un = static_cast<size_t>(kFlat) * kR;
+  const size_t bin = static_cast<size_t>(kHc) * kFlat;
+
+  const std::vector<float> hyper = RandomVec(hn, 4421);
+  const std::vector<float> norm_w = RandomVec(kFlat, 4422, -0.25f, 0.25f);
+  // Small projection weights: the mix stages feed sigmoids, and a weight scale
+  // that saturates every gate would make the fixture insensitive to the very
+  // stage it is meant to cover.
+  const std::vector<float> mix_d = RandomVec(dn, 4423, -0.2f, 0.2f);
+  const std::vector<float> mix_u = RandomVec(un, 4424, -0.2f, 0.2f);
+  const std::vector<float> inj_w = RandomVec(bin, 4425, -0.2f, 0.2f);
+
+  vt::Qwen4ExpGatedResidualArgs args;
+  args.hc_count = kHc;
+  args.hidden_size = kH;
+  args.lowrank = kR;
+  args.eps = 1e-6f;
+
+  if (RocmBuilt()) {
+    REQUIRE(vt::OpRegistered(vt::OpId::kQwen4ExpGatedResidual, DeviceType::kROCM));
+    // The GEMM this arm routes its three projections through. Asserted beside
+    // it because the mixer reads the PAIR, and half the pair is not half the
+    // capability: without `kMatmulBT` the arm registers and then throws at its
+    // first projection.
+    REQUIRE(vt::OpRegistered(vt::OpId::kMatmulBT, DeviceType::kROCM));
+  }
+
+  // BOTH arms of the `use_combine` pair. With a null pair the op is upstream's
+  // terminal mixer and writes `mixed` alone; with a live pair it also writes
+  // `injection`. An arm that ignored the null case would fault on the terminal
+  // layer of every real forward.
+  for (bool combine : {false, true}) {
+    CAPTURE(combine);
+    std::vector<float> ref_mixed(mn, 0.0f);
+    std::vector<float> ref_inj(injn, 0.0f);
+    {
+      vt::Backend& cpu = vt::GetBackend(DeviceType::kCPU);
+      Queue cq = cpu.CreateQueue();
+      const Device cd{DeviceType::kCPU, 0};
+      std::vector<float> ch = hyper, cw = norm_w, cd_ = mix_d, cu = mix_u, cb = inj_w;
+      Tensor tmixed = T2(ref_mixed.data(), cd, T, kH);
+      Tensor thyper = T2(ch.data(), cd, T, kFlat);
+      Tensor tw = T1(cw.data(), cd, kFlat);
+      Tensor tdown = T2(cd_.data(), cd, kR, kFlat);
+      Tensor tup = T2(cu.data(), cd, kFlat, kR);
+      Tensor tbi = T2(cb.data(), cd, kHc, kFlat);
+      Tensor tinj = T2(ref_inj.data(), cd, T, kHc);
+      vt::Qwen4ExpGatedResidual(cq, tmixed, combine ? &tinj : nullptr, thyper, tw, tdown, tup,
+                                combine ? &tbi : nullptr, args);
+      cpu.DestroyQueue(cq);
+    }
+    if (combine) {
+      // `injection` is `2*sigmoid(.)`, so every element must be inside (0, 2).
+      // A transposed or unwritten injection lands outside or stays zero, and
+      // NMSE alone would hide either behind the much larger `mixed`.
+      for (size_t i = 0; i < ref_inj.size(); ++i) {
+        REQUIRE(ref_inj[i] > 0.0f);
+        REQUIRE(ref_inj[i] < 2.0f);
+      }
+    }
+
+    for (DeviceType dt : RegisteredDevices()) {
+      if (!OpAvailable(vt::OpId::kQwen4ExpGatedResidual, dt)) continue;
+      CAPTURE(DeviceName(dt));
+      vt::Backend& dev = vt::GetBackend(dt);
+      Queue q = dev.CreateQueue();
+      const Device d{dt, 0};
+      DevBuf dh(dev, q, hn);
+      DevBuf dw(dev, q, static_cast<size_t>(kFlat));
+      DevBuf dd(dev, q, dn);
+      DevBuf du(dev, q, un);
+      DevBuf dbi(dev, q, bin);
+      DevBuf dmixed(dev, q, mn);
+      DevBuf dinj(dev, q, injn);
+      dh.Upload(hyper);
+      dw.Upload(norm_w);
+      dd.Upload(mix_d);
+      du.Upload(mix_u);
+      dbi.Upload(inj_w);
+      Tensor thyper = T2(dh.ptr(), d, T, kFlat);
+      Tensor tw = T1(dw.ptr(), d, kFlat);
+      Tensor tdown = T2(dd.ptr(), d, kR, kFlat);
+      Tensor tup = T2(du.ptr(), d, kFlat, kR);
+      Tensor tbi = T2(dbi.ptr(), d, kHc, kFlat);
+      Tensor tmixed = T2(dmixed.ptr(), d, T, kH);
+      Tensor tinj = T2(dinj.ptr(), d, T, kHc);
+      const unsigned long long hits_before = vt::GetReferenceTierHits();
+      vt::Qwen4ExpGatedResidual(q, tmixed, combine ? &tinj : nullptr, thyper, tw, tdown, tup,
+                                combine ? &tbi : nullptr, args);
+      dev.Synchronize(q);
+      CHECK(vt::GetReferenceTierHits() == hits_before);
+      CHECK(Nmse(ref_mixed, dmixed.Download()) <= kNmseTol);
+      if (combine) CHECK(Nmse(ref_inj, dinj.Download()) <= kNmseTol);
+      dev.DestroyQueue(q);
+    }
+  }
+}
