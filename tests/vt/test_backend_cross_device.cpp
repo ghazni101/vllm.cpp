@@ -71,6 +71,18 @@ const char* DeviceName(DeviceType t) {
   return "?";
 }
 
+// THE SAME NAME, AS A `std::string`, BECAUSE DOCTEST PRINTS THE `const char*`
+// AS `1`. `MESSAGE(a << b)` expands to `mb * a << b`, and `MessageBuilder`'s
+// chain stringifies through `doctest::toString`, which for a `const char* const
+// &` operand resolves to the `bool` overload and renders the pointer as `1`.
+// `CAPTURE` takes the same path. Both then record a measurement that cannot say
+// which device produced it, which is worse than recording nothing. Verified
+// against `third_party/doctest/doctest.h` 2.5.2 rather than assumed: the
+// `std::string` operand has its own overload at :1158 and prints the name.
+// Other sites in this file still pass the raw pointer and still print `1`;
+// see ISSUE-LOCAL-01M2A7P3C95W3PBAVT9SC6KKY5.
+std::string DeviceTag(DeviceType t) { return std::string(DeviceName(t)); }
+
 // Normalized mean squared error, the same statistic
 // tests/vt/test_ops_quant_dot.cpp gates on: sum((a-b)^2) / sum(a^2).
 double Nmse(const std::vector<float>& ref, const std::vector<float>& got) {
@@ -5287,7 +5299,7 @@ TEST_CASE("qwen4_exp gated-residual write-back matches the CPU oracle and is NAT
 
   for (DeviceType dt : RegisteredDevices()) {
     if (!OpAvailable(vt::OpId::kQwen4ExpGatedResidualWriteBack, dt)) continue;
-    CAPTURE(DeviceName(dt));
+    CAPTURE(DeviceTag(dt));
     vt::Backend& dev = vt::GetBackend(dt);
     Queue q = dev.CreateQueue();
     const Device d{dt, 0};
@@ -5311,7 +5323,7 @@ TEST_CASE("qwen4_exp gated-residual write-back matches the CPU oracle and is NAT
     // much margin it had; a wave that reports "green" and cannot say how green
     // has measured a bar and not an arm.
     const double nmse = Nmse(ref, dh.Download());
-    MESSAGE("qwen4_exp write-back NMSE " << DeviceName(dt) << " = " << nmse);
+    MESSAGE("qwen4_exp write-back NMSE " << DeviceTag(dt) << " = " << nmse);
     CHECK(nmse <= kNmseTol);
     dev.DestroyQueue(q);
   }
@@ -5324,7 +5336,25 @@ TEST_CASE("grouped RMS norm matches the CPU oracle and is NATIVE on ROCm") {
   constexpr int64_t kRows = 6, kGroup = 5, kGroups = 3;
   constexpr int64_t kHidden = kGroup * kGroups;
   const size_t n = static_cast<size_t>(kRows) * kHidden;
-  const std::vector<float> x = RandomVec(n, 4411);
+  std::vector<float> x = RandomVec(n, 4411);
+  // TWO ROWS ARE RESCALED SO THE EPS PLACEMENT IS OBSERVABLE AT ALL. The kernel
+  // comment claims eps sits INSIDE the rsqrt and is added to the MEAN SQUARE;
+  // on O(1) data with eps = 1e-6 that claim is unmeasurable, and a fresh review
+  // showed both ways of breaking it surviving this case at NMSE 2.4e-12. Each
+  // row below makes one half of the claim move the output, and RMS norm returns
+  // every row to O(1) whatever its input scale, so neither row distorts the
+  // NMSE the other rows contribute to.
+  //
+  //   row 0, scaled 1e-3: mean square ~ 1.3e-6, the same order as eps. Adding
+  //     eps to the ROOT instead (`1/(sqrt(ms) + eps)`) then shifts the scale by
+  //     ~32%, where at unit scale it shifts it by ~1e-6.
+  //   row 1, scaled 1e6: sqrt(ms) ~ 1.2e6, so adding eps OUTSIDE the reciprocal
+  //     (`1/sqrt(ms) + eps`) more than doubles that row's output. At unit scale
+  //     that same edit is a 1e-6 relative change and reads as rounding.
+  for (int64_t j = 0; j < kHidden; ++j) {
+    x[static_cast<size_t>(j)] *= 1e-3f;
+    x[static_cast<size_t>(kHidden + j)] *= 1e6f;
+  }
   // The gamma is RAW HuggingFace, centred on zero: every `qwen4_exp` consumer
   // adds the 1 itself (#2218). A weight drawn around 1.0 would make a dropped
   // `gemma` fold invisible.
@@ -5372,7 +5402,7 @@ TEST_CASE("grouped RMS norm matches the CPU oracle and is NATIVE on ROCm") {
 
     for (DeviceType dt : RegisteredDevices()) {
       if (!OpAvailable(vt::OpId::kRmsNormGroup, dt)) continue;
-      CAPTURE(DeviceName(dt));
+      CAPTURE(DeviceTag(dt));
       vt::Backend& dev = vt::GetBackend(dt);
       Queue q = dev.CreateQueue();
       const Device d{dt, 0};
@@ -5389,7 +5419,7 @@ TEST_CASE("grouped RMS norm matches the CPU oracle and is NATIVE on ROCm") {
       dev.Synchronize(q);
       CHECK(vt::GetReferenceTierHits() == hits_before);
       const double nmse = Nmse(ref, dout.Download());
-      MESSAGE("rmsnorm_group NMSE " << DeviceName(dt) << " gemma=" << gemma << " = " << nmse);
+      MESSAGE("rmsnorm_group NMSE " << DeviceTag(dt) << " gemma=" << gemma << " = " << nmse);
       CHECK(nmse <= kNmseTol);
       dev.DestroyQueue(q);
     }
@@ -5414,11 +5444,24 @@ TEST_CASE("qwen4_exp gated-residual MIXER matches the CPU oracle and is NATIVE o
 
   const std::vector<float> hyper = RandomVec(hn, 4421);
   const std::vector<float> norm_w = RandomVec(kFlat, 4422, -0.25f, 0.25f);
-  // Small projection weights: the mix stages feed sigmoids, and a weight scale
-  // that saturates every gate would make the fixture insensitive to the very
-  // stage it is meant to cover.
-  const std::vector<float> mix_d = RandomVec(dn, 4423, -0.2f, 0.2f);
-  const std::vector<float> mix_u = RandomVec(un, 4424, -0.2f, 0.2f);
+  // THE PROJECTION SCALES ARE CALIBRATED, AND A FRESH REVIEW PROVED THE FIRST
+  // CALIBRATION BLIND. At the original +/-0.2 on both mix projections, deleting
+  // DIVISION 1 inside the SiLU — the placement `src/vt/rocm/rocm_qwen4_exp.hip`
+  // calls load-bearing because SiLU is not homogeneous — measured NMSE
+  // 0.000490056 against this 5e-4 bar and PASSED with 2% of margin. The
+  // tolerance was not the defect. `down(normed)` landed at |a| ~ 0.5, inside
+  // SiLU's near-linear part, where `silu(a/hc)` and `silu(a)/hc` differ by
+  // little more than a scale; and `up()` at +/-0.2 then left `sigmoid(gate)`
+  // spanning only 0.488..0.512, so the whole low-rank branch was a
+  // near-constant 0.5 and could not move the output whatever it computed.
+  //
+  // `mix_down` at +/-2.0 puts the pre-activation at |a| ~ 5, inside SiLU's
+  // knee, and `mix_up` at +/-0.5 opens `sigmoid(gate)` to 0.27..0.81 — a live
+  // gate that is still nowhere near saturation, which is what the previous
+  // comment was right to protect against. The injection arm projects `normed`
+  // directly and never reads `low`, so `inj_w` stays where it was.
+  const std::vector<float> mix_d = RandomVec(dn, 4423, -2.0f, 2.0f);
+  const std::vector<float> mix_u = RandomVec(un, 4424, -0.5f, 0.5f);
   const std::vector<float> inj_w = RandomVec(bin, 4425, -0.2f, 0.2f);
 
   vt::Qwen4ExpGatedResidualArgs args;
@@ -5472,7 +5515,7 @@ TEST_CASE("qwen4_exp gated-residual MIXER matches the CPU oracle and is NATIVE o
 
     for (DeviceType dt : RegisteredDevices()) {
       if (!OpAvailable(vt::OpId::kQwen4ExpGatedResidual, dt)) continue;
-      CAPTURE(DeviceName(dt));
+      CAPTURE(DeviceTag(dt));
       vt::Backend& dev = vt::GetBackend(dt);
       Queue q = dev.CreateQueue();
       const Device d{dt, 0};
@@ -5501,12 +5544,12 @@ TEST_CASE("qwen4_exp gated-residual MIXER matches the CPU oracle and is NATIVE o
       dev.Synchronize(q);
       CHECK(vt::GetReferenceTierHits() == hits_before);
       const double nmse_mixed = Nmse(ref_mixed, dmixed.Download());
-      MESSAGE("qwen4_exp mixer NMSE " << DeviceName(dt) << " combine=" << combine
+      MESSAGE("qwen4_exp mixer NMSE " << DeviceTag(dt) << " combine=" << combine
                                       << " mixed = " << nmse_mixed);
       CHECK(nmse_mixed <= kNmseTol);
       if (combine) {
         const double nmse_inj = Nmse(ref_inj, dinj.Download());
-        MESSAGE("qwen4_exp mixer NMSE " << DeviceName(dt) << " injection = " << nmse_inj);
+        MESSAGE("qwen4_exp mixer NMSE " << DeviceTag(dt) << " injection = " << nmse_inj);
         CHECK(nmse_inj <= kNmseTol);
       }
       dev.DestroyQueue(q);

@@ -119,11 +119,19 @@ recorded here rather than resolved silently:
    in its own comment that the form exists "to lower to an FMA". Ours is
    `(x*rrms) * (1 + w)`, which is what transformers writes at
    `modeling_qwen4_exp.py:177` and what the CPU arm computes. The two agree in
-   exact arithmetic and differ by one rounding. **Ours is kept**, because the
-   CPU arm is the only oracle that can fail this arm — G1 is NMSE against it —
-   and adopting a lowering hint from a Triton kernel would move the ROCm arm
-   away from that oracle while matching nothing measurable. A lowering hint is
-   not a behaviour, and D3 is about behaviour.
+   exact arithmetic and are NOT bit-identical: once `|w| < 2^-24`, `fl(1 + w)`
+   rounds `w` away entirely, so the difference is a real one and not only
+   associativity. **Ours is kept, and it is also the mirror.** vLLM's own
+   PyTorch reference for this norm writes
+   `return (normalized * (1.0 + self.weight.float())).to(input_dtype)` at
+   `vllm/models/qwen4_exp/common/hyperconnection.py:87`, in the `common/` file
+   that both the `nvidia/` and `amd/` layers import. Our spelling is therefore
+   what upstream DEFINES as the behaviour, and the Triton `y += y*w` is an FMA
+   lowering of that same behaviour rather than a second one. The measurement
+   agrees: the CPU arm is the only oracle that can fail this arm — G1 is NMSE
+   against it — and adopting the lowering hint would move the ROCm arm away from
+   that oracle AND away from upstream's own reference while matching nothing. A
+   lowering hint is not a behaviour, and D3 is about behaviour.
 2. **A shared `[GROUP_DIM]` norm affine.** vLLM's kernel admits one
    (`W_SHARED`) beside the full `[DIM]` layout. `vt::RmsNormGroup`'s contract
    requires the full-row weight (`src/vt/ops.cpp:1228`), so the shared form is
@@ -173,6 +181,29 @@ Red first, per op, each failing for the intended reason before the arm exists:
 
 ## Owed
 
+- **W1 LANDS UNREACHED, and this bullet is the record AGENTS.md "Nothing lands
+  dead" requires.** The three arms `kQwen4ExpGatedResidual`,
+  `kQwen4ExpGatedResidualWriteBack` and `kRmsNormGroup` are registered on ROCm
+  and are reached by NO production entry point on that device. The weights load
+  since #3097, but `ModelRegistry::Forward` cannot complete a `qwen4_exp` step
+  on `rocm`: it throws at the first of the six arms that is still missing
+  (`kQwen4ExpPleConv`, `kQwen4ExpPleGate`, `kQwen4ExpQsaCompress`,
+  `kQwen4ExpQsaGatherAttention`, `kIndexSelect`, `kIndexCopy`). Their only
+  caller today is the cross-device suite. **The row that owns the wiring is
+  `MODEL-MM-QWEN4-EXP`, this row, through waves W2 to W4**; the issue that
+  tracks it is this row's own, named in the commit and pull request bodies
+  rather than here, because a row-owned issue is not an owed reference. D2 is
+  why the slice is staged rather than held back: on a board with no reference
+  tier a partial port
+  refuses by name, so there is no half-working forward to ship and no way to
+  reach these three from production until the sixth arm lands.
+- **The remaining `CAPTURE(DeviceName(dt))` sites in
+  `tests/vt/test_backend_cross_device.cpp`**, tracked by
+  `ISSUE-LOCAL-01M2A7P3C95W3PBAVT9SC6KKY5`. doctest stringifies a `const char*`
+  operand through its `bool` overload and renders the device name as `1`, so a
+  failing cross-device assertion cannot say which device failed. The three W1
+  cases are repaired in place with a `DeviceTag()` helper; roughly forty older
+  sites belong to other rows and are not swept here.
 - **G4 and its oracle.** vLLM's own AMD `qwen4_exp` backend at the current pin
   is the natural denominator on gfx1151, and it is UNMEASURED: nobody has built
   or run it on this board. **The platform half of that question is already
