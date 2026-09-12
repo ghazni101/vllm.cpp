@@ -411,6 +411,46 @@ struck with its reason or moved to `## Owed`; none is quietly dropped.
   `LD_LIBRARY_PATH=$(dirname $(find /opt -name libamdhip64.so.7 | head -1))`
   before running it, or the gate exits 127 having measured nothing.
 
+- **G1b (unit, REVIEW REPAIR). PASSED on `strix:gpu0`, 2026-09-12.** Job
+  `7a757f2a-d078-44f9-998d-2ef504b74cc6`, `rc run -d strix:gpu0`, built in the
+  lease from a `--depth 1` clone of this branch at `0593ea477` with
+  `git status --porcelain` at 0 bytes, `-DVLLM_CPP_HIP=ON
+  -DVLLM_CPP_HIP_ARCHITECTURES=gfx1151`, `LD_LIBRARY_PATH=/opt/rocm-7.2.4/lib`.
+
+  | Run | `test_backend_cross_device` | `test_gguf_keep_quant` |
+  |---|---|---|
+  | GREEN | `48 cases / 48 passed / 0 failed / 0 skipped`, `84061 assertions / 0 failed` | `61 cases / 61 passed / 0 failed / 0 skipped`, `12626 assertions / 0 failed` |
+
+  **The association mutation now REDS, and that is the point of this run.**
+  `DotIQ4_NL` was rewritten in the lease to `(d*sumi1) + (d*sumi2)`, the binary
+  was proved changed (`md5` `d2ec91c1...` -> `2d0d4667...`), and the new case
+  failed:
+
+  ```text
+  TEST CASE: IQ4_NL keeps upstream's association order d*(s1+s2), bit for bit
+  ERROR: CHECK( bits(got[0]) == bits(upstream_order) ) is NOT correct!
+    values: CHECK( 3240805058 == 3240805059 )
+  1 case | 0 passed | 1 failed | 47 skipped
+  ```
+
+  **One ulp.** `3240805058` against `3240805059` is the entire size of the
+  guarantee, and it is why every NMSE gate on this row was blind to it. The
+  tree was restored byte for byte afterwards (`git status --porcelain` 0 bytes,
+  `md5` back to `d2ec91c1...`) and the suite returned to
+  `48 cases / 48 passed / 0 failed`.
+
+- **G1 (CPU). PASSED, 2026-09-12.** `ctest --test-dir build`, 751 tests, **740
+  passed**. The remaining 11 are 10 `Skipped` (CUDA, ROCm, `modelopt`,
+  `voxtral`, the two `minimax_music3` real-device arms, `capi` device arms) and
+  one pre-existing failure, `test_rocm_f16_contract`, which asserts that
+  `OwnedTensor::View` carries the `repacked` / `q8_0_aligned` /
+  `elem_kn_repacked` markers and does not. The three files that decide it
+  (`tests/vt/test_rocm_f16_contract.cpp`, `include/vt/tensor.h`,
+  `include/vllm/model_executor/models/qwen3_5_weights.h`) are byte-identical
+  between this row's base and `origin/main`, and this row touches none of them.
+  **This is the gate the first wave omitted**, and it is what found the
+  `test_gguf_keep_quant` red that the review reported.
+
 - **G1 (CUDA).** Not owed by this row: arm 3 was already landed by #2419.
 - **G2 (admission).** `UD-IQ1_S` opens and its IQ4_NL tensors keep their blocks
   on ROCm, with `VT_OP_PROVIDER_STATS` showing zero reference-tier hits for the
