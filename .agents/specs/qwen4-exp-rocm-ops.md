@@ -83,6 +83,52 @@ Where our CUDA arm and vLLM's AMD arm agree, port ours: it is already gated
 against our CPU oracle and carries this tree's conventions. Where they disagree,
 vLLM wins and the spec records the difference.
 
+## D3a. What W1 read in vLLM's AMD backend, and the three differences
+
+D3 says the mirror decides wherever it defines behaviour, so W1 read
+`vllm/models/qwen4_exp/amd/ops/hc.py` at the pin `e126687a9a` before porting.
+The mirror covers all three of this wave's ops:
+`_grouped_gemma_rmsnorm_kernel` is `vt::RmsNormGroup`, `_hc_silu_kernel` and
+`_hc_gate_mix_kernel` are stages 2 and 3 of `vt::Qwen4ExpGatedResidual`, and
+`_hc_combine_kernel` is `vt::Qwen4ExpGatedResidualWriteBack` with its injection
+scaling fused in.
+
+**The algorithms agree.** The division by `hc_count` sits inside the SiLU and
+not after it, the mix is a mean over the hc branches and not a sum, the gate
+multiplies the NORMED stream and not the raw one, the injection is
+`2 * sigmoid(logits / hc_count)`, and the grouped norm puts eps inside the
+rsqrt over the mean square. Every one of those is what our CPU oracle and our
+CUDA arm already compute, so D3's "where they agree, port ours" applies and the
+ROCm arms are transcriptions of `cuda_qwen4_exp.cu` and `cuda_rms_norm_group.cu`.
+
+Three differences exist and none of them is an algorithm difference. They are
+recorded here rather than resolved silently:
+
+1. **The Gemma affine's spelling.** vLLM writes `y = x*rrms; y += y*w` and says
+   in its own comment that the form exists "to lower to an FMA". Ours is
+   `(x*rrms) * (1 + w)`, which is what transformers writes at
+   `modeling_qwen4_exp.py:177` and what the CPU arm computes. The two agree in
+   exact arithmetic and differ by one rounding. **Ours is kept**, because the
+   CPU arm is the only oracle that can fail this arm — G1 is NMSE against it —
+   and adopting a lowering hint from a Triton kernel would move the ROCm arm
+   away from that oracle while matching nothing measurable. A lowering hint is
+   not a behaviour, and D3 is about behaviour.
+2. **A shared `[GROUP_DIM]` norm affine.** vLLM's kernel admits one
+   (`W_SHARED`) beside the full `[DIM]` layout. `vt::RmsNormGroup`'s contract
+   requires the full-row weight (`src/vt/ops.cpp:1228`), so the shared form is
+   not expressible at this op at all. It is OWED, not implemented: no
+   `qwen4_exp` checkpoint this tree loads stores one, and widening an op
+   contract to match a capability nothing exercises would be a second, untested
+   arm.
+3. **The injection fusion boundary.** vLLM computes
+   `2*sigmoid(logits/hc)` inside `_hc_combine_kernel`, keeping it in f32
+   registers; this tree computes it in the MIXER, stores it to the caller's
+   `injection` tensor, and the write-back reads it back. Where that tensor is
+   bf16 the two differ by one narrowing. The boundary is this tree's op
+   contract, shared by the CPU oracle and the CUDA arm, and moving it for one
+   device would make the ROCm arm answer a different op. Recorded as a known
+   narrowing, owed to whichever wave revisits the op split.
+
 ## Tests
 
 Red first, per op, each failing for the intended reason before the arm exists:
@@ -118,9 +164,25 @@ Red first, per op, each failing for the intended reason before the arm exists:
 
 - **G4 and its oracle.** vLLM's own AMD `qwen4_exp` backend at the current pin
   is the natural denominator on gfx1151, and it is UNMEASURED: nobody has built
-  or run it on this board. Whether Triton compiles those kernels for gfx1151 is
-  the open question and it should be answered EARLY, because it decides whether
-  this model can ever have a token gate on AMD hardware.
+  or run it on this board. **The platform half of that question is already
+  answered from evidence committed in this repository**, and the answer narrows
+  what is still owed rather than closing it. Triton itself WORKS on gfx1151 at
+  3.8.0 — `docs/bench-evidence/oracle-vllm-gfx1151-20260903/job-phase3.txt:69-70`
+  and `job-phase2.txt:64` — conditional on `python3-dev`, because Triton's AMD
+  driver compiles `hip_utils.c` at import time; without it the same probe reads
+  `TRITON_JIT_ON_GFX1151 = FAIL ValueError`
+  (`job-phase1b.txt:281`), and installing the package turned that FAIL into the
+  PASS. Since vLLM's RDNA paths ARE Triton kernels, that precondition applies to
+  any run of them. **What remains open is narrower:** whether vLLM's SPECIFIC
+  `qwen4_exp` AMD Triton kernels compile and run on this board. That is now a
+  build-and-run question, not a platform-viability one.
+- **The oracle recipe is committed and must be followed rather than
+  improvised.** A bare `rc` worker on `strix` carries no torch and no triton
+  (probed: `ModuleNotFoundError: No module named 'torch'`), so any future oracle
+  wave installs through `docs/bench-evidence/oracle-vllm-gfx1151-20260903/`
+  (`phase1b.sh`, `phase2.sh`, `phase3.sh`, `phase4.sh`). That recipe also
+  records that `HSA_OVERRIDE_GFX_VERSION` is never set, because it makes the
+  runtime report a different device and no oracle measurement survives it.
 - **The MTP head**, unimplemented on every device.
 - **The vision tower**, which has no ROCm-specific work and no artifact.
 - **The CPU comparison arm no longer fits `strix:gpu0`.** It peaked at 73.9 GiB
@@ -141,5 +203,14 @@ Red first, per op, each failing for the intended reason before the arm exists:
 
 ## Now
 
-`ACTIVE`, 2026-09-12. Spec only, no product code. This is a scoping wave: it
-opens the work, it does not do it. Next action is W1.
+`ACTIVE`, 2026-09-12. **W1 landed three of the nine arms**:
+`kQwen4ExpGatedResidual`, `kQwen4ExpGatedResidualWriteBack` and
+`kRmsNormGroup`, in `src/vt/rocm/rocm_qwen4_exp.hip` and
+`src/vt/rocm/rocm_rms_norm_group.hip`, each with a cross-device case that
+REQUIRE-proves its ROCm registration. Six arms remain owed and the forward
+still refuses on ROCm, because a partial port buys nothing runnable on a board
+with no reference tier (D2). Next action is W2, `kIndexSelect` and
+`kIndexCopy`.
+
+No throughput, latency or memory number is admissible from this row, and W1
+took none.
