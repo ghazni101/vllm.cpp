@@ -321,8 +321,38 @@ kernel exists:
 
 ## Gates
 
-- **G1 (unit).** The suites above, green on CPU, on `strix:gpu0` for the ROCm
-  arms, and on a CUDA box for arm 3.
+- **G1 (unit). PASSED on `strix:gpu0`, 2026-09-12.** `rc run -d strix:gpu0`,
+  HIP 7.2.53211, ROCm 7.2.4, `gfx1151`. Built in the lease from a `--depth 1`
+  clone of this row's branch with `git rev-parse HEAD` asserted equal to the
+  commit under test and `git status --porcelain` at 0 bytes.
+
+  | Run | Head | Result |
+  |---|---|---|
+  | RED | `3c529c87e` | `47 cases / 45 passed / 2 failed`, `84040 assertions / 0 failed` |
+  | GREEN | `6f77c7081` | `47 cases / 47 passed / 0 failed / 0 skipped`, `84044 assertions / 0 failed`, `Status: SUCCESS!` |
+
+  **The red is the evidence, not a mishap.** Both failing cases were the two new
+  IQ4_NL ones and both THREW for the intended reason:
+  `cross_device.cpp:2544 no keep-quant kernel for dtype iq4_nl` and
+  `cross_device.cpp:3809 matmul_bt_quant_grouped: no keep-quant kernel for dtype
+  iq4_nl`. **Zero failed assertions against two failed cases is the signature of
+  a ROUTE gap rather than a numerical one**: nothing computed a wrong answer,
+  the work never started. The cause was the wrapper in `rocm_quant_dot.hip`,
+  whose delegation allowlist and whose `IsRocmKeepQuantSupported` both excluded
+  IQ4_NL, so the kernels in the GDN provider were unreachable.
+
+  The assertion count RISING by 4 across the pair is what shows the new format
+  executed rather than being skipped: in the red run those cases threw before
+  their checks ran. `0 skipped` on the green run is asserted, not assumed.
+
+  Build was clean at `-Werror` with **0 warnings**.
+
+  **One environment fact for the next runner:** the test binary does not find
+  `libamdhip64.so.7` on its own in the strix worker. Export
+  `LD_LIBRARY_PATH=$(dirname $(find /opt -name libamdhip64.so.7 | head -1))`
+  before running it, or the gate exits 127 having measured nothing.
+
+- **G1 (CUDA).** Not owed by this row: arm 3 was already landed by #2419.
 - **G2 (admission).** `UD-IQ1_S` opens and its IQ4_NL tensors keep their blocks
   on ROCm, with `VT_OP_PROVIDER_STATS` showing zero reference-tier hits for the
   IQ4_NL GEMM and gather.
@@ -368,8 +398,12 @@ kernel exists:
 
 ## Now
 
-`ACTIVE`, 2026-09-12. Spec committed, no product code, base pinned to
-`origin/main` `18f39771c`.
+`ACTIVE`, 2026-09-12. Base `18f39771c`. **The ROCm arm is implemented and its
+unit gate PASSED on `strix:gpu0`** (see `## Gates` G1). Of the four arms this
+spec opened with, three are gone: the gather landed as #3097, the CUDA dot was
+already landed as #2419 and this spec was simply wrong about it, and what
+remains is the ROCm dot, which is done, plus the record repair, which is in
+this change.
 
 **The scope shrank between drafting and committing, and the record says so
 rather than pretending it was always this size.** #3097 landed the ROCm
