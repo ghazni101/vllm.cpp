@@ -537,6 +537,7 @@ vllm_cpp_add_test(test_qwen3_break_point vllm/models/test_qwen3_break_point.cpp)
 vllm_cpp_add_test(test_qwen3_decode_graph_seam vllm/models/test_qwen3_decode_graph_seam.cpp)
 vllm_cpp_add_test(test_qwen3_moe_decode_graph_seam vllm/models/test_qwen3_moe_decode_graph_seam.cpp)
 vllm_cpp_add_test(test_moe_async_device_ids vllm/models/test_moe_async_device_ids.cpp)
+vllm_cpp_add_test(test_rocm_moe_bf16 vllm/models/test_rocm_moe_bf16.cpp)
 vllm_cpp_add_test(test_voxtral_decode_graph_seam vllm/models/test_voxtral_decode_graph_seam.cpp)
 vllm_cpp_add_test(test_deepseek_v2_decode_graph_seam vllm/models/test_deepseek_v2_decode_graph_seam.cpp)
 vllm_cpp_add_test(test_qwen3_5_decode_graph_seam vllm/models/test_qwen3_5_decode_graph_seam.cpp)
@@ -1900,6 +1901,16 @@ vllm_cpp_add_test(test_act_dump
   vllm/model_executor/test_act_dump.cpp)
 target_include_directories(test_act_dump PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
+# BACKEND-ROCM-BF16-MOE (#3116): the LM-head output boundary, replayed over the
+# primary's own captured head input. The fixture is a directory of raw captures,
+# so the two replay cases skip themselves (`doctest::skip`, reported skipped in
+# doctest's own summary) and the binary still exits 77 (Skipped) without
+# `VT_MOE_HEAD_FIXTURE` rather than reporting a green gate that never ran. The
+# fixture-free call-site case in the same binary runs either way, and a failure
+# in it keeps its own non-zero exit instead of being folded into the skip.
+vllm_cpp_add_test(test_qwen3_moe_lm_head_bf16
+  vllm/model_executor/test_qwen3_moe_lm_head_bf16.cpp)
+
 vllm_cpp_add_test(test_moe_fit_resolver
   vllm/model_executor/test_moe_fit_resolver.cpp)
 target_include_directories(test_moe_fit_resolver PRIVATE ${CMAKE_SOURCE_DIR}/src)
@@ -3258,10 +3269,33 @@ target_include_directories(test_ops_moe_grouped PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_moe_router_tie_stability vt/test_moe_router_tie_stability.cpp)
 target_include_directories(test_moe_router_tie_stability PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_ops_moe_grouped_bf16 vt/test_ops_moe_grouped_bf16.cpp)
+vllm_cpp_add_test(test_rocm_moe_grouped_bf16 vt/test_rocm_moe_grouped_bf16.cpp)
+vllm_cpp_add_test(test_rocm_moe_upstream vt/test_rocm_moe_upstream.cpp)
+vllm_cpp_add_test(test_moe_bf16_native_contract vt/test_moe_bf16_native_contract.cpp)
+# BACKEND-ROCM-BF16-MOE (#3094): the row's CPU gate on the production token
+# gate's reference-set predicate. The predicate is pure host code in
+# tests/support/rocm_moe_reference_set.h, so this case needs no device and no
+# oracle file, while tests/vllm/models/test_rocm_moe_bf16.cpp applies the same
+# predicate to the captured records.
+vllm_cpp_add_test(test_rocm_moe_reference_set support/test_rocm_moe_reference_set.cpp)
+if(VLLM_CPP_HIP)
+  foreach(moe_test IN ITEMS test_rocm_moe_grouped_bf16 test_rocm_moe_upstream
+                            test_moe_bf16_native_contract)
+    target_compile_definitions(${moe_test} PRIVATE __HIP_PLATFORM_AMD__=1)
+  endforeach()
+endif()
 vllm_cpp_add_test(test_ops_moe_grouped_bf16_gate_up_silu
                   vt/test_ops_moe_grouped_bf16_gate_up_silu.cpp)
 vllm_cpp_add_test(test_ops_moe_nongated_relu2 vt/test_ops_moe_nongated_relu2.cpp)
 vllm_cpp_add_test(test_ops_rmsnorm vt/test_ops_rmsnorm.cpp)
+vllm_cpp_add_test(test_ops_residual_rmsnorm vt/test_ops_residual_rmsnorm.cpp)
+if(VLLM_CPP_HIP)
+  target_compile_definitions(test_ops_residual_rmsnorm PRIVATE __HIP_PLATFORM_AMD__=1)
+  target_compile_definitions(test_rocm_moe_bf16 PRIVATE __HIP_PLATFORM_AMD__=1)
+  # The head-boundary replay names the ROCm device itself (hipGetDevice /
+  # hipSetDevice around each queue), exactly as the residual siblings do.
+  target_compile_definitions(test_qwen3_moe_lm_head_bf16 PRIVATE __HIP_PLATFORM_AMD__=1)
+endif()
 vllm_cpp_add_test(test_ops_rmsnorm_weight_dtype vt/test_ops_rmsnorm_weight_dtype.cpp)
 vllm_cpp_add_test(test_ops_rmsnorm_quant_fp8_weight_dtype
                   vt/test_ops_rmsnorm_quant_fp8_weight_dtype.cpp)
