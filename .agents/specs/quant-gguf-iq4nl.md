@@ -5,7 +5,7 @@
   rows: `BACKEND-ROCM` ([#41](https://github.com/mudler/vllm.cpp/issues/41))
   and `QUANT-CUDA-GATES`.
 - Claim: `CLAIM-QUANT-GGUF-IQ4_NL`
-- Base: `18f39771c` (`origin/main`, 2026-09-12)
+- Base: `97cb6964b` (`origin/main`, 2026-09-12; the merge-base after the review rebase)
 - Pull request shape: **one pull request** carrying the spec and the
   implementation, spec committed first. Developer decision, 2026-09-11.
 
@@ -489,6 +489,18 @@ struck with its reason or moved to `## Owed`; none is quietly dropped.
   is missing is an independent numerical authority for the CODEBOOK and the
   nibble order, which only upstream's own output can supply. The CPU dequantizer
   is gated that way (`test_gguf_dequant.cpp:528`) and the dot is not.
+- **The ACROSS-block association order, which no bit-exact case pins.** The
+  case `IQ4_NL keeps upstream's association order d*(s1+s2), bit for bit`
+  (`tests/vt/test_backend_cross_device.cpp`) is built at ONE operand point and
+  ONE block (M = N = 1, K = 32) precisely so the warp reduction adds only zeros
+  and the device result IS the single-block dot. That is what makes it
+  discriminating WITHIN a block, and it is also its limit: a kernel that kept
+  `d*(sumi1+sumi2)` inside each block but reassociated the reduction ACROSS
+  blocks (`nb > 1`) would pass this case unchanged. That order remains gated
+  only by the NMSE band, which a reassociation of about 1e-7 relative sits four
+  orders of magnitude inside. Closing it needs a multi-block fixture whose
+  per-block partials are themselves chosen so the two reduction orders differ
+  in the last bit.
 
 ## Stop conditions
 
@@ -503,7 +515,7 @@ struck with its reason or moved to `## Owed`; none is quietly dropped.
 
 ## Now
 
-`ACTIVE`, 2026-09-12. Base `18f39771c`. **The ROCm arm is implemented and its
+`ACTIVE`, 2026-09-12. Base `97cb6964b`. **The ROCm arm is implemented and its
 unit gate PASSED on `strix:gpu0`** (see `## Gates` G1). Of the four arms this
 spec opened with, three are gone: the gather landed as #3097, the CUDA dot was
 already landed as #2419 and this spec was simply wrong about it, and what

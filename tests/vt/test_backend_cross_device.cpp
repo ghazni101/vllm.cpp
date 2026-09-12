@@ -2695,6 +2695,21 @@ TEST_CASE("IQ4_NL keeps upstream's association order d*(s1+s2), bit for bit") {
                   "operands make the two orders differ by one ulp, and a "
                   "fixture where they agree gates nothing");
 
+  // REQUIRE-proven registration on ROCm (never a silent skip -- review sweep
+  // on #523: an OpAvailable-guarded case passes green with the registration
+  // deleted). ROCm is the arm this row added, so a build that carries the
+  // backend and has lost the IQ4_NL admission must FAIL here rather than fall
+  // through to a pass that measured only the CPU.
+  const bool rocm_built = [&] {
+    for (DeviceType dt : RegisteredDevices()) if (dt == DeviceType::kROCM) return true;
+    return false;
+  }();
+  if (rocm_built) {
+    REQUIRE_MESSAGE(OpAvailable(vt::OpId::kMatmulBTQuant, DeviceType::kROCM),
+                    "kMatmulBTQuant must be registered on ROCm -- a missing "
+                    "registration is a failure, never a skip");
+  }
+
   for (DeviceType dt : RegisteredDevices()) {
     if (!OpAvailable(vt::OpId::kMatmulBTQuant, dt)) continue;
     CAPTURE(DeviceName(dt));
