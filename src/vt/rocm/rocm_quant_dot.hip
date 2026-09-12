@@ -779,7 +779,10 @@ bool IsRocmKeepQuantSupported(DType dt, WType* out) {
     case DType::kIQ2_S: *out = WType::kIQ2_S; return true;
     case DType::kIQ1_S: *out = WType::kIQ1_S; return true;
     case DType::kIQ1_XXXS: *out = WType::kIQ1_XXXS; return true;
-    // Q4_0 / Q8_0 / MXFP4 dot a Q8_0 activation and have no native arm here.
+    // Q4_0 / Q8_0 / IQ4_NL / MXFP4 dot a Q8_0 activation and have no native arm
+    // here. IQ4_NL is in that class since QUANT-GGUF-IQ4_NL, and it is why the
+    // delegation lists above name it: this predicate can never admit it, so the
+    // wrapper must hand it to the GDN kernels instead of falling through.
     default: return false;
   }
 }

@@ -154,6 +154,37 @@ device arms keep that order. A kernel that reassociates is not this kernel, and
 the goldens below will not detect the difference on small inputs, which is
 precisely why this is stated as a design decision rather than left to review.
 
+**Stating it was not enough, and a review proved it.** A fresh reviewer mutated
+`DotIQ4_NL` to `(d*sumi1) + (d*sumi2)`, proved the binary changed, and watched
+all 47 cases stay green on `strix:gpu0`. Every gate this row had was an NMSE
+band at `5e-4`; reassociation moves the result by about `1e-7` relative, which
+is four orders of magnitude inside it. The guarantee was claimed and unpinned.
+
+**It is now pinned BIT-EXACTLY** by
+`tests/vt/test_backend_cross_device.cpp` `IQ4_NL keeps upstream's association
+order d*(s1+s2), bit for bit`, which runs on every device that registers
+`kMatmulBTQuant`, the CPU included, so CI carries half of it without an AMD
+runner. Three properties make it able to see the defect, and each one is a way
+a lazier fixture stops being able to:
+
+- **One block, `M = N = 1`.** With `nb == 1` the warp reduction adds only zeros
+  to lane 0's value, so the device result is the dot itself rather than a
+  reassociated sum over blocks. A multi-block case cannot be compared bit for
+  bit against anything, because the device sums blocks in warp order and the CPU
+  sums them sequentially.
+- **An exactly-quantizable activation.** The values are `k/64` with
+  `max |k| = 127`, so `amax/127 = 1/64` is f16-exact and every `roundf` returns
+  the integer it started from. The test therefore KNOWS the quantized
+  activation and computes the expected value itself, instead of asking a kernel.
+- **A full-mantissa weight scale** (`0x2123` as raw f16 bits). This is the part
+  that is easy to get wrong: with a short-mantissa scale such as a power of two,
+  `d*sumi1` and `d*sumi2` are both exact and the two associations AGREE. The
+  case carries a `REQUIRE` that the two orders differ on its own operands, so a
+  fixture that degenerates fails instead of passing vacuously.
+
+The difference it detects is one ulp. That is the true size of the guarantee,
+and a test that needs an ulp is the only kind that can hold it.
+
 ### D2. IQ4_NL is a 32-element block on a Q8_0 activation
 
 This is the structural fact that makes arm 3 a variant rather than a table
@@ -285,9 +316,14 @@ its target by design. Do not quote 96 GiB as an allocatable figure.
   16-entry codebook with IQ4_XS, so it is live here rather than theoretical.
   Mitigation: seal `kValuesIq4nl` by digest and by its lane alphabet, in the
   shape `tests/vt/test_ops_quant_dot.cpp:717` already uses.
-- **R2. Reassociation passes a small golden.** See D1. Mitigation: goldens
-  taken from the oracle's own kernel over real checkpoint bytes, per block and
-  in total, not a synthetic tensor.
+- **R2. Reassociation passes a small golden.** See D1. **This risk MATERIALISED
+  and was caught by review, not by a gate.** The planned mitigation (oracle
+  goldens over real checkpoint bytes) was never delivered, and it would not have
+  been sufficient on its own either: a golden compared under any tolerance band
+  cannot see a one-ulp reassociation, and a multi-block golden cannot be
+  compared without one. The delivered mitigation is the single-block bit-exact
+  case named in D1, which is the only shape in which the two orders are
+  distinguishable.
 - **R3. The CUDA Q8_0-activation variant is a new dispatch path, not an
   entry.** It can regress the Q8_K path it sits beside. Mitigation: the Q8_K
   formats' existing cases must stay byte-identical; assert that rather than
@@ -301,23 +337,46 @@ its target by design. Do not quote 96 GiB as an allocatable figure.
 
 ## Tests
 
-Red first, in this order, each failing for the intended reason before any
-kernel exists:
+This list was written as a plan and **four of its six items were not delivered
+in the first wave**. A fresh review found that, and the list below now records
+what the tree has rather than what the plan wanted. Each undelivered item is
+struck with its reason or moved to `## Owed`; none is quietly dropped.
 
-1. `tests/vt/test_rocm_quant_dot.cpp` — IQ4_NL dot against oracle-produced
-   goldens over real `UD-IQ1_S` `ffn_down_exps` bytes, per block and total.
-2. `tests/vt/test_ops_quant_traits.cpp` — reader and vt geometry agree for
-   IQ4_NL, 18-byte block, `QK4_NL = 32`, against the oracle's own
-   `sizeof(block_iq4_nl)` printed by the harness.
-3. `tests/vllm/test_gguf_keep_quant.cpp` — routing by name: IQ4_NL routes
-   `kKeepQuant` on ROCm and CUDA GEMM arms, and on the gather.
-4. `tests/vt/test_backend_cross_device.cpp` — IQ4_NL GEMM within NMSE <= 5e-4
-   of the CPU oracle, on a real launch shape rather than a toy one. The Q6_K
-   precedent is explicit about why: its gate ran `M=3, N=8, K=512` against a
-   production launch of 6400 blocks and never tested a launch.
-5. A gather case that decodes an IQ4_NL block row on device and matches
-   `DequantIQ4_NL`.
-6. The three D4 mutations, each restoring the tree byte for byte afterwards.
+1. ~~`tests/vt/test_rocm_quant_dot.cpp` — IQ4_NL dot against oracle-produced
+   goldens over real `UD-IQ1_S` `ffn_down_exps` bytes.~~ **NOT DELIVERED.**
+   That file compiles the Q8_K-activation family only, and the goldens need the
+   67.56 GiB artifact staged beside the oracle. Owed below, and it is a
+   correctness widening rather than the association guarantee, which item 7
+   now holds.
+2. ~~`tests/vt/test_ops_quant_traits.cpp` — reader and vt geometry for
+   IQ4_NL.~~ **NOT NEEDED: already present.** IQ4_NL's 18-byte block and
+   `QK4_NL = 32` landed under #1989 with the reader arm, and the geometry
+   cross-check covers it. Re-asserting it would have been a second reading of
+   the same table.
+3. `tests/vllm/test_gguf_keep_quant.cpp` — **DELIVERED, and it was the defect
+   the review found.** The device admission set in `gguf_keep_quant.cpp` and the
+   independent set the test holds at its `device_capable` term are two
+   descriptions of one rule, and the first wave moved only the first: the ROCm
+   leg red on type 20 and on both totals. The test now admits `kIQ4_NL` on ROCm
+   and its GEMM term moves 22 -> 24.
+4. `tests/vt/test_backend_cross_device.cpp` — **DELIVERED** on the single-matrix
+   and grouped arms, within NMSE <= 5e-4 of the CPU oracle, and **extended in
+   this repair to the fused gate+up+SwiGLU arm**, whose `fmts` table the first
+   wave left unextended while teaching its `elems_per_block` about IQ4_NL. That
+   branch was unreachable, which is a gate that reads like coverage and measures
+   nothing. The fused seam does serve the format
+   (`rocm_moe_gate_up_swiglu.hip:159-160` delegates to the grouped GEMM), so the
+   row was added rather than the line deleted.
+5. ~~A gather case that decodes an IQ4_NL block row on device.~~ **LANDED
+   ELSEWHERE:** #3097 carries the ROCm gather and its case. This row does not
+   reimplement it.
+6. The three D4 mutations — **PERFORMED BY THE FRESH REVIEW**, which is where
+   they belong, and one of them survived. See item 7.
+7. **NEW, and the reason this section was rewritten:**
+   `tests/vt/test_backend_cross_device.cpp` `IQ4_NL keeps upstream's association
+   order d*(s1+s2), bit for bit`. It is the only case here that can fail on a
+   reassociated kernel. See D1 for why its three fixture properties are each
+   load-bearing.
 
 ## Gates
 
@@ -384,6 +443,12 @@ kernel exists:
 - IQ2_XS, IQ1_M, Q5_0, Q4_0, IQ3_S and MXFP4 on ROCm (#1940). Wiring the
   already-written CUDA `DotMXFP4` onto arm 3's variant.
 - The `hipMalloc` ceiling above 76 GiB on this board, unmeasured by design.
+- **An IQ4_NL dot golden from the oracle's own kernel over real `UD-IQ1_S`
+  `ffn_down_exps` bytes** (the struck test item 1). The delivered gates are an
+  NMSE band against our own CPU kernel plus the bit-exact association case; what
+  is missing is an independent numerical authority for the CODEBOOK and the
+  nibble order, which only upstream's own output can supply. The CPU dequantizer
+  is gated that way (`test_gguf_dequant.cpp:528`) and the dot is not.
 
 ## Stop conditions
 

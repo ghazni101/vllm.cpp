@@ -1,14 +1,14 @@
 ID: ISSUE-LOCAL-01M29ECVDVH5A89TBKA8K72YRD
 Title: IQ4_NL has no native quantized compute on ROCm
 Row: QUANT-GGUF-IQ4_NL
-State: OPEN
+State: CLOSED
 Kind: bug
 GitHub: -
 Mirror: PENDING
 Availability: FULL
 Created: 2026-09-11
 Updated: 2026-09-12
-Closed: -
+Closed: 2026-09-12
 
 ## Problem
 
@@ -26,7 +26,7 @@ Record defect in the same area. .agents/quantization-matrix.md carries QUANT-GGU
 
 ## Resolution
 
--
+Fixed by row QUANT-GGUF-IQ4_NL (PR #3149), 2026-09-12. The last remaining arm, the ROCm IQ4_NL keep-quant dot, landed: DotIQ4_NL in src/vt/rocm/rocm_grouped_gemm.hip reads the sealed d_kvalues_iq4nl of rocm_quant_iq_tables.h and feeds IQ4NLGemmK (single matrix) and GroupedIQ4NLK (expert towers) against the QuantizeQ8_0K activation the Q8_0 arm already used; the rocm_quant_dot.hip wrapper delegates kIQ4_NL to those kernels on both the single and the grouped seam, and DeviceKeepQuantSupported admits kIQ4_NL for kROCM in gguf_keep_quant.cpp. Gated on strix:gpu0 (gfx1151, HIP 7.2.53211, ROCm 7.2.4) under an rc lease, red then green on the same box: RED at 3c529c87e, 47 cases / 45 passed / 2 failed, 84040 assertions / 0 failed, both failures the new IQ4_NL cases throwing 'no keep-quant kernel for dtype iq4_nl'; GREEN at 6f77c7081, 47 cases / 47 passed / 0 failed / 0 skipped, 84044 assertions / 0 failed. Full evidence in .agents/specs/quant-gguf-iq4nl.md section Gates, G1. The other two bullets of the problem statement were already reconciled above: the ROCm gather landed as #3097 and the CUDA GEMM had landed as #2419. IsRocmKeepQuantSupported still excludes IQ4_NL by construction, because that predicate is the Q8_K-activation family; the delegation lists are the route.
 
 ## Reconciliation 2026-09-12: the gather half landed while this issue was open
 
@@ -85,3 +85,7 @@ exactly that class. One predicate is not the backend.
 
 **What remains, and it is now a single arm:** the ROCm IQ4_NL keep-quant dot.
 Nothing else in this issue's original three bullets is still true.
+
+**That single arm landed on 2026-09-12 and this issue is CLOSED.** The two
+reconciliations above are kept as written, so the order in which the three
+bullets fell stays auditable. `## Resolution` carries the dated evidence.
