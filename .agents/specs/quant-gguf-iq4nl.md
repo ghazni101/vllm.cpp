@@ -439,6 +439,24 @@ struck with its reason or moved to `## Owed`; none is quietly dropped.
   `md5` back to `d2ec91c1...`) and the suite returned to
   `48 cases / 48 passed / 0 failed`.
 
+- **G1c (unit, SECOND REVIEW REPAIR). PASSED, 2026-09-12**, at `fd2a12310`.
+
+  | Gate | Result |
+  |---|---|
+  | `check-pr-size.py --base origin/main --head HEAD --branch row/QUANT-GGUF-IQ4_NL` | `OK: every explicit path class is within its review budget.` (it printed `ERROR: checker change 'scripts/check-gate-commands.py' requires semantic mutation evidence` before this commit, and it exits 0 either way -- the OUTPUT is the result) |
+  | `tests/scripts/test_check_gate_commands.py` | `70 passed, 4 subtests passed` |
+  | `ctest --test-dir build`, CPU | `99% tests passed, 1 tests failed out of 758`; the one failure is `test_rocm_f16_contract`, the pre-existing red G1 above already proved this row does not own; 14 skipped |
+  | `strix:gpu0`, job `2d6f8de9-8e2f-412d-a514-f8db5512de0c` | `test_backend_cross_device` `48 cases / 48 passed / 0 failed / 0 skipped`, `84062 assertions / 0 failed`; `test_gguf_keep_quant` `61 cases / 61 passed / 0 failed / 0 skipped`, `12626 assertions / 0 failed`. `--depth 1` clone at `fd2a12310`, `git status --porcelain` 0 bytes, `LD_LIBRARY_PATH=/opt/rocm-7.2.4/lib` |
+
+  **The baseline entry is written down as a mutation, not as a claim.**
+  `Iq4nlRunnablePopulationTests` was proved load-bearing by deleting
+  `"QUANT-GGUF-IQ4_NL"` from `RUNNABLE_BASELINE` with `__pycache__` cleared: all
+  three of its cases went red, and restoring the line left the working tree
+  byte-identical and returned the three to green.
+
+  The assertion count on `strix` rose from G1b's `84061` to `84062`, which is
+  the single REQUIRE the anti-skip repair adds. It EXECUTED; it was not skipped.
+
 - **G1 (CPU). PASSED, 2026-09-12.** `ctest --test-dir build`, 751 tests, **740
   passed**. The remaining 11 are 10 `Skipped` (CUDA, ROCm, `modelopt`,
   `voxtral`, the two `minimax_music3` real-device arms, `capi` device arms) and
