@@ -73,12 +73,33 @@ const char* DeviceName(DeviceType t) {
 
 // THE SAME NAME, AS A `std::string`, BECAUSE DOCTEST PRINTS THE `const char*`
 // AS `1`. `MESSAGE(a << b)` expands to `mb * a << b`, and `MessageBuilder`'s
-// chain stringifies through `doctest::toString`, which for a `const char* const
-// &` operand resolves to the `bool` overload and renders the pointer as `1`.
-// `CAPTURE` takes the same path. Both then record a measurement that cannot say
-// which device produced it, which is worse than recording nothing. Verified
-// against `third_party/doctest/doctest.h` 2.5.2 rather than assumed: the
-// `std::string` operand has its own overload at :1158 and prints the name.
+// chain stringifies through `doctest::toString`; `CAPTURE` takes the same path.
+// Both then record a measurement that cannot say which device produced it,
+// which is worse than recording nothing.
+//
+// Both halves were RUN against `third_party/doctest/doctest.h` 2.5.2 rather
+// than read: a standalone probe prints `raw=1` and `str=ROCM` for the same
+// name. The mechanism is ostream insertion in BOTH directions, not a pair of
+// `toString` overloads:
+//   - `const char*` satisfies `types::is_pointer` at :1114-1117, so
+//     `StringMaker` inherits `StringMakerBase<true>` and reaches
+//     `filldata<T*>::fill` at :1242, which forwards to
+//     `filldata<const volatile void*>::fill` at :8359. That does
+//     `*stream << in` on a `const volatile void*`, and `std::ostream` has an
+//     insertion for `const void*` but none for the volatile-qualified one, so
+//     the operand converts to `bool` and prints `1`. A null pointer escapes
+//     only because :8360 branches to the literal `"nullptr"`.
+//   - `std::string` satisfies `has_insertion_operator` at :1034, so the same
+//     `StringMakerBase<true>` reaches the GENERIC `filldata<T>::fill` at :1193
+//     and uses the real `operator<<(std::ostream&, const std::string&)`.
+// DO NOT "simplify" this helper away on the strength of a dedicated overload.
+// The two that would make it redundant are both compiled out on the clang/HIP
+// toolchain that runs this gate: `toString(const std::string&)` at :1158 sits
+// inside `#if DOCTEST_MSVC >= DOCTEST_COMPILER(19, 20, 0)` (:1156-1159), and
+// `toString(const char*)` at :1153 sits inside
+// `#ifdef DOCTEST_CONFIG_TREAT_CHAR_STAR_AS_STRING` (:1152-1154), which
+// nothing in this tree defines.
+//
 // Other sites in this file still pass the raw pointer and still print `1`;
 // see ISSUE-LOCAL-01M2A7P3C95W3PBAVT9SC6KKY5.
 std::string DeviceTag(DeviceType t) { return std::string(DeviceName(t)); }
