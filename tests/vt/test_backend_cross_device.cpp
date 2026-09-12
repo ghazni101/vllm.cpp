@@ -2632,8 +2632,8 @@ TEST_CASE("non-grouped keep-quant GEMM (Q8_0/Q4_K/Q5_K/Q6_K) matches the CPU ora
 // integer sum is folded in -- `d * (sumi1 + sumi2)` -- which is the OPPOSITE
 // association from the neighbouring q4_0/Q8_0 kernels. The spec calls that
 // load-bearing. The NMSE gates above cannot see it: reassociating moves the
-// result by about 1e-7 relative, which is four orders of magnitude inside their
-// 5e-4 band, and a fresh review duly mutated `DotIQ4_NL` to
+// result by about 1e-7 relative, which is about 3.7 orders of magnitude inside
+// their 5e-4 band, and a fresh review duly mutated `DotIQ4_NL` to
 // `(d*sumi1) + (d*sumi2)` and watched 47 of 47 cases stay green.
 //
 // This case is built so the two orders DIFFER and so the correct one is

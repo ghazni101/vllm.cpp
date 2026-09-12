@@ -158,7 +158,7 @@ precisely why this is stated as a design decision rather than left to review.
 `DotIQ4_NL` to `(d*sumi1) + (d*sumi2)`, proved the binary changed, and watched
 all 47 cases stay green on `strix:gpu0`. Every gate this row had was an NMSE
 band at `5e-4`; reassociation moves the result by about `1e-7` relative, which
-is four orders of magnitude inside it. The guarantee was claimed and unpinned.
+is about 3.7 orders of magnitude inside it (`5e-4 / 1e-7 = 5e3`). The guarantee was claimed and unpinned.
 
 **It is now pinned BIT-EXACTLY** by
 `tests/vt/test_backend_cross_device.cpp` `IQ4_NL keeps upstream's association
@@ -443,10 +443,22 @@ struck with its reason or moved to `## Owed`; none is quietly dropped.
 
   | Gate | Result |
   |---|---|
-  | `check-pr-size.py --base origin/main --head HEAD --branch row/QUANT-GGUF-IQ4_NL` | `OK: every explicit path class is within its review budget.` (it printed `ERROR: checker change 'scripts/check-gate-commands.py' requires semantic mutation evidence` before this commit, and it exits 0 either way -- the OUTPUT is the result) |
+  | `check-pr-size.py --base origin/main --head HEAD --branch row/QUANT-GGUF-IQ4_NL` | `OK: every explicit path class is within its review budget.` (it printed `ERROR: checker change 'scripts/check-gate-commands.py' requires semantic mutation evidence` before this commit; read the OUTPUT, because it names which class failed) |
   | `tests/scripts/test_check_gate_commands.py` | `70 passed, 4 subtests passed` |
   | `ctest --test-dir build`, CPU | `99% tests passed, 1 tests failed out of 758`; the one failure is `test_rocm_f16_contract`, the pre-existing red G1 above already proved this row does not own; 14 skipped |
   | `strix:gpu0`, job `2d6f8de9-8e2f-412d-a514-f8db5512de0c` | `test_backend_cross_device` `48 cases / 48 passed / 0 failed / 0 skipped`, `84062 assertions / 0 failed`; `test_gguf_keep_quant` `61 cases / 61 passed / 0 failed / 0 skipped`, `12626 assertions / 0 failed`. `--depth 1` clone at `fd2a12310`, `git status --porcelain` 0 bytes, `LD_LIBRARY_PATH=/opt/rocm-7.2.4/lib` |
+
+  **CORRECTION, third review, 2026-09-12: an earlier version of the row above
+  said `check-pr-size.py` "exits 0 either way -- the OUTPUT is the result".
+  That was false.** `scripts/check-pr-size.py` `main()` returns 1 when its
+  `errors` list is non-empty (`scripts/check-pr-size.py:1043-1048`), so the
+  gate exits non-zero on failure like every other gate here. The zero came
+  from reading `$?` after a PIPE, which reports the status of the last stage
+  (`tail`) and not of the checker. Measured again at `547f3318f`: piped into
+  `tail -2` the shell reported `0`; redirected to a file the same command
+  reported `1`. The surviving advice is the other half of that row and it
+  still holds -- read the output, because the exit status alone does not say
+  which path class failed.
 
   **The baseline entry is written down as a mutation, not as a claim.**
   `Iq4nlRunnablePopulationTests` was proved load-bearing by deleting
@@ -515,8 +527,8 @@ struck with its reason or moved to `## Owed`; none is quietly dropped.
   discriminating WITHIN a block, and it is also its limit: a kernel that kept
   `d*(sumi1+sumi2)` inside each block but reassociated the reduction ACROSS
   blocks (`nb > 1`) would pass this case unchanged. That order remains gated
-  only by the NMSE band, which a reassociation of about 1e-7 relative sits four
-  orders of magnitude inside. Closing it needs a multi-block fixture whose
+  only by the NMSE band, which a reassociation of about 1e-7 relative sits
+  about 3.7 orders of magnitude inside (`5e-4 / 1e-7 = 5e3`). Closing it needs a multi-block fixture whose
   per-block partials are themselves chosen so the two reduction orders differ
   in the last bit.
 
