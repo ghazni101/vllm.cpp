@@ -57,6 +57,17 @@ by name. `rocm_backend.hip:313` says as much: "a discrete AMD board never
 installs the tier in the first place" — post-#2511 this APU behaves like one for
 this purpose.
 
+**W1 MEASURED THIS RATHER THAN LEAVING IT ARGUED.** On `strix:gpu0`, with
+`vt::RmsNormGroup`'s ROCm registration neutralised in a scratch copy and the
+kernel itself left in place, a direct call on a ROCm queue throws
+`vt: no kernel for op RmsNormGroup (id 142) on device rocm (type 5), and the
+portable CPU reference tier is NOT eligible: ... this ROCm device reports
+hipDeviceAttributePageableMemoryAccess = 0`. The same call on the unmutated
+tree returns with `GetReferenceTierHits()` unchanged. So the chain above is not
+a reading of four files, it is an observed refusal on the board, and the tier is
+not merely unused there — it cannot be reached. Restored byte-for-byte
+afterwards.
+
 **The coupling is worth stating on its own, because nothing records it:** the
 repair that stopped the gfx1151 GPU hang (#2511), by disabling managed
 allocation, also removed the CPU reference tier on that board. Spec prose
