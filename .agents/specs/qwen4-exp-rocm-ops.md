@@ -4,7 +4,10 @@
 - Row: `MODEL-MM-QWEN4-EXP` (`.agents/model-matrix.md`, `ACTIVE`). Owning
   backend row: `BACKEND-ROCM` ([#41](https://github.com/mudler/vllm.cpp/issues/41)).
 - Claim: `CLAIM-MODEL-MM-QWEN4-EXP` (row-level, already held)
-- Base: `97cb6964b` (`origin/main`, 2026-09-12)
+- Base: `51c248190` (`origin/main`, 2026-09-12). Rebased from `97cb6964b`
+  on 2026-09-12; the three commits that arrived are #2959's Tenstorrent work
+  (`.agents/backend-matrix.md`, `src/vt/tenstorrent/`, the TT spec) and touch
+  nothing this row reads.
 
 ## Contract
 
@@ -16,7 +19,7 @@
 | Port map | Each CUDA kernel -> a `.hip` sibling under `src/vt/rocm/`, mirroring the vLLM file structure as AGENTS.md requires: `cuda_qwen4_exp.cu` -> `rocm_qwen4_exp.hip`, `cuda_qwen4_exp_ple.cu` -> `rocm_qwen4_exp_ple.hip`, `cuda_qwen4_exp_qsa.cu` -> `rocm_qwen4_exp_qsa.hip`, `cuda_rms_norm_group.cu` -> `rocm_rms_norm_group.hip`; `kIndexSelect`/`kIndexCopy` join an existing ROCm TU rather than earning a file. **Transcribe from the CPU bodies where the CUDA one uses a primitive RDNA lacks, and from the CUDA one otherwise** — measured, the four qwen4_exp CUDA files use only `__shfl_down_sync`, `atomicAdd` and bf16/fp16 types, with no `__dp4a` and no CUDA-only intrinsic, so most port directly. Read vLLM's `amd/` Triton kernels for the ALGORITHM where ours and theirs disagree, because that is the mirror source. |
 | Tests to port | vLLM has no C++ test to port. The gate is INHERITED and must not be re-authored: `tests/vt/test_backend_cross_device.cpp` already holds any registered backend to NMSE <= 5e-4 against the CPU oracle, and the sibling cases REQUIRE-prove registration rather than skipping. Each op gains a case there in that shape. The existing `tests/vllm/models/test_qwen4_exp_*_device.cpp` suites are the per-op golden surface. |
 | Gates | G1 per-op cross-device NMSE on `strix:gpu0`. G2 the model LOADS and the forward completes on ROCm with `VT_OP_PROVIDER_STATS=1` showing ZERO reference-tier hits — see D2, on this board a hit is impossible, so a non-zero count means the tier was somehow installed and the run is void. G3 first tokens. G4 token-exactness against an oracle — see `## Owed`, not this row. **No throughput, latency or memory number is admissible until G4.** |
-| Dependencies | The IQ4_NL ROCm GEMM (`QUANT-GGUF-IQ4_NL`, PR #3149) for the `ffn_down_exps`, and #3097's ROCm gather for the n-gram table — the gather has landed; the GEMM is reviewed PASS and awaiting merge. Hardware: `strix:gpu0`, the only AMD fleet device, reachable ONLY through an `rc` lease. No CI lane has an AMD runner, so a green CI is not evidence for any arm here. |
+| Dependencies | The IQ4_NL ROCm GEMM (`QUANT-GGUF-IQ4_NL`, PR #3149) for the `ffn_down_exps`, and #3097's ROCm gather for the n-gram table — BOTH have landed and are in this branch's base: the gather in #3097, the GEMM at `18e2a8c9a` on `origin/main`. Hardware: `strix:gpu0`, the only AMD fleet device, reachable ONLY through an `rc` lease. No CI lane has an AMD runner, so a green CI is not evidence for any arm here. |
 | Work breakdown | `W0` this spec -> `W1` the two elementwise-shaped ops (`kQwen4ExpGatedResidual`, `kQwen4ExpGatedResidualWriteBack`) plus `kRmsNormGroup`, which are the cheapest and prove the file and registration shape -> `W2` `kIndexSelect`/`kIndexCopy` -> `W3` the PLE pair -> `W4` the QSA pair, the hardest, and the one where vLLM's `amd/ops/qsa.py` is the reference rather than the CUDA arm -> `W5` first load and forward on `strix:gpu0` -> `W6` first tokens. Each wave lands with its cross-device case; no wave lands unreached. |
 | Risks/decisions | R1 a missing op HARD-REFUSES on this board rather than degrading (D2), so a partial port is not a slow model, it is the same refusal with a different name. R2 wave size: nine ops in one pull request would be unreviewable, and the waves above exist to keep each reviewable. R3 the QSA pair is a gather consumer and not a mask, so a fixture under 2048 tokens of context cannot distinguish a correct port from one attending pooled keys — that bound is stated in `.agents/specs/qwen4-exp-flash-next.md` and applies here. R4 `strix:gpu0` is a single shared device and every gate here needs it. R5 no AMD runner in CI. |
 
@@ -198,14 +201,42 @@ which puts `sqrt(ms)` at `~1.2e6` and makes the second mutation more than double
 that row. The unmutated arm stays BIT-EXACT against the CPU oracle at both
 polarities with those rows present, so the widening cost no margin.
 
-**One instrument defect was found and repaired alongside.** doctest stringifies
-a `const char*` operand through its `bool` overload, so every W1
-`MESSAGE(... << DeviceName(dt) << ...)` recorded its NMSE beside the text `1`
-and never named the device it measured; `CAPTURE` takes the same path. A
+**One instrument defect was found and repaired alongside.** doctest renders a
+`const char*` operand as `1`, so every W1
+`MESSAGE(... << DeviceName(dt) << ...)` recorded its NMSE beside that text and
+never named the device it measured; `CAPTURE` takes the same path. A
 `DeviceTag()` helper returning `std::string` repairs the three W1 cases, and the
 gate now prints `qwen4_exp mixer NMSE ROCM combine=true mixed = 6.98127e-16`.
 The roughly forty older sites in the same file belong to other rows and are
 owed.
+
+**The MECHANISM this helper depends on was stated wrongly the first time, and a
+later reader could have deleted the helper on that statement.** The comment
+claimed doctest resolves a `const char*` through a `toString(bool)` overload,
+and claimed the `std::string` operand "has its own overload at
+`doctest.h:1158`". That declaration is real but sits inside
+`#if DOCTEST_MSVC >= DOCTEST_COMPILER(19, 20, 0)` at `:1156-1159`, so it does
+not exist on the clang/HIP toolchain that runs this gate; the sibling
+`toString(const char*)` at `:1153` is behind
+`DOCTEST_CONFIG_TREAT_CHAR_STAR_AS_STRING`, which a whole-tree grep finds
+defined nowhere. **A comment that claims a verification and names the wrong
+mechanism is worse than no comment**, because the helper it justifies reads as
+removable.
+
+Both halves were then RUN rather than read, with a standalone probe built from
+this tree's own `third_party/doctest/doctest.h` 2.5.2: it prints `raw=1` and
+`str=ROCM` for the same name. The mechanism is ostream insertion in both
+directions. A pointer satisfies `types::is_pointer` at `:1114-1117`, so
+`StringMaker` inherits `StringMakerBase<true>` and reaches `filldata<T*>::fill`
+at `:1242`, which forwards to `filldata<const volatile void*>::fill` at
+`:8359`; that does `*stream << in` on a `const volatile void*`, and
+`std::ostream` carries an insertion for `const void*` and none for the
+volatile-qualified one, so the operand converts to `bool` and prints `1`. A null
+pointer escapes only because `:8360` branches to the literal `"nullptr"`. A
+`std::string` satisfies `has_insertion_operator` at `:1034` and reaches the
+GENERIC `filldata<T>::fill` at `:1193`, which uses the real `operator<<`. The
+fix was correct throughout; only its justification was wrong, and no fixture
+value or kernel moved when the comment was corrected.
 
 ## Tests
 
@@ -299,8 +330,9 @@ Red first, per op, each failing for the intended reason before the arm exists:
   case is measuring nothing; stop and fix the case before landing the arm.
 - `strix:gpu0` is unavailable or unhealthy. Arms stay `PENDING` on a named
   lease. Never convert an unrun gate into a pass.
-- The dependency PR #3149 does not land. W1 through W4 are unaffected, but G2
-  cannot run, because the `ffn_down_exps` have no device arm without it.
+- ~~The dependency PR #3149 does not land. W1 through W4 are unaffected, but
+  G2 cannot run, because the `ffn_down_exps` have no device arm without it.~~
+  RESOLVED 2026-09-12: it landed at `18e2a8c9a` and is in this branch's base.
 
 ## Now
 
@@ -317,10 +349,22 @@ with no reference tier (D2). Next action is W2, `kIndexSelect` and
 findings are repaired here. The three arms are unchanged; the two fixtures that
 could not fail are widened (D3b), the eps and DIVISION-1 placements are now
 pinned by measurement, and W1's staged, unreached slice is recorded under
-`## Owed` as AGENTS.md requires. Re-measured on `strix:gpu0` at the widened
-fixtures: write-back 0, `rmsnorm_group` 0 at both polarities, mixer injection 0,
-mixer `mixed` 6.98127e-16, full ROCm cross-device suite 50/50 with 84102
-assertions.
+`## Owed` as AGENTS.md requires.
+
+**These are the numbers at the head that LANDS**, re-measured on `strix:gpu0`
+after the rebase onto `51c248190`, `rc` job
+`39b76741-99ee-45da-b323-80c2ec272565`, branch head `adaa830ef`, binary
+sha256 `719715bf..`, a fully cold build (ccache 0 hits of 592 cacheable calls):
+write-back `0`, `rmsnorm_group` `0` at both polarities, mixer injection `0`,
+mixer `mixed` `6.98127e-16` on both `use_combine` arms, full ROCm cross-device
+suite **51 of 51 cases, 84127 assertions, 0 failed**.
+
+**The suite COUNT moved for a reason that is not this row.** An earlier revision
+of this section recorded `50/50` and `84102` assertions; that was measured at the
+pre-rebase base `97cb6964b`, where `tests/vt/test_backend_cross_device.cpp` held
+47 cases. `origin/main` now holds 48 — `QUANT-GGUF-IQ4_NL` added one between the
+two bases — and W1 adds three, which is 51. The three NMSE values did not move,
+so the count is the only thing the rebase changed.
 
 No throughput, latency or memory number is admissible from this row, and W1
 took none.
