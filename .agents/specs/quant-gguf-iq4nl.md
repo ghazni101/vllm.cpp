@@ -16,7 +16,7 @@
 | Scope | IN: the IQ4_NL keep-quant dot and device admission on ROCm; the CUDA Q8_0-activation GEMM variant plus `DotIQ4_NL` and its `IsCudaKeepQuantSupported` arm; the `QUANT-GGUF-IQ4_NL` record repair and the `strix:gpu0` rows in `.agents/environment.md`. OUT: the ROCm quantized GATHER, which #3097 landed on 2026-09-12; every other missing ROCm format (IQ2_XS, IQ1_M, Q5_0, Q4_0, IQ3_S, MXFP4 -- #1940); any tensor-core tile for IQ4_NL; the seven `qwen4_exp` operations with no ROCm arm; every throughput, latency and memory number. |
 | Upstream chain | Numerical authority is the pinned [`llama-cpp`](../oracles/llama-cpp.md) oracle at `10bf611e5` (`b10451`), because vLLM defines no GGUF k-quant dot kernel and therefore has nothing to mirror here: `ggml/src/ggml-cpu/quants.c:1254` `ggml_vec_dot_iq4_nl_q8_0_generic` (the dot), `ggml/src/ggml-common.h:447-452` `block_iq4_nl` (18 B, `QK4_NL = 32`), `ggml/src/ggml-common.h:1120` `kvalues_iq4nl` (the 16-entry codebook), `ggml/src/ggml-cpu/ggml-cpu.c:379-384` (`.vec_dot_type = GGML_TYPE_Q8_0`, the activation pairing, read off upstream and NOT inherited from IQ4_XS which pairs `Q8_K`). |
 | Our baseline | Reader, dequantizer and CPU dot all landed under #1989 and are the transcription source: `gguf_reader.cpp` case 20; `src/vt/cpu/cpu_quant_dequant.cpp:92` `DequantIQ4_NL`; `src/vt/cpu/cpu_quant_dot.cpp:140` `VecDotIQ4_NLQ8_0`; `src/vt/cpu/cpu_quant_blocks.h:62` `BlockIQ4_NL`; traits `src/vt/cpu/cpu_quant_traits.cpp:52` pairing `kIQ4_NL` -> `kQ8_0`. Absent everywhere else: ten `WType` entries in `rocm_quant_dot.hip:580` exclude it, `rocm_grouped_gemm.hip:1783` and `:1855` throw naming it, `IsCudaKeepQuantSupported` omits it, and `kEmbeddingQuant` is registered for `kCPU` and `kCUDA` only. |
-| Port map | `cpu_quant_dot.cpp:140` `VecDotIQ4_NLQ8_0` -> a `DotIQ4_NL` device body in `src/vt/rocm/rocm_quant_dot.hip` (scalar, transcribed from the CPU body and NOT from CUDA, per `rocm_quant_dot.hip:226`: gfx1100 has no `__dp4a` so the CUDA integer-core shapes do not port) and a matching `DotIQ4_NL` in `src/vt/cuda/cuda_quant_dot.cu`. `kvalues_iq4nl` -> the ROCm IQ codebook header #3029 introduces, sealed. `cpu_ops.cpp:4282` `kEmbeddingQuant` registration -> a `kROCM` registration decoding IQ4_NL block rows, mirroring the CUDA codec `cuda_quant_dequant.cuh:156` `DqIQ4_NL`. The ROCm Q8_0 activation quantizer already exists (`rocm_grouped_gemm.hip` `QuantizeQ8_0Kernel`); CUDA needs one. |
+| Port map | `cpu_quant_dot.cpp:140` `VecDotIQ4_NLQ8_0` -> a `DotIQ4_NL` device body in `src/vt/rocm/rocm_grouped_gemm.hip` (scalar, transcribed from the CPU body and NOT from CUDA: gfx1100 has no hardware `__dp4a`, and the codebook lookup is per nibble so there is nothing for a four-way byte dot to multiply until the values are gathered) feeding TWO kernels, `IQ4NLGemmK` (single matrix) and **`GroupedIQ4NLK` (expert towers, the load-bearing one, because the 48 `ffn_down_exps` reach the GROUPED provider)**, plus a matching `DotIQ4_NL` in `src/vt/cuda/cuda_quant_dot.cu`. `kvalues_iq4nl` -> the ROCm IQ codebook header #3029 introduces, sealed. `cpu_ops.cpp:4282` `kEmbeddingQuant` registration -> a `kROCM` registration decoding IQ4_NL block rows, mirroring the CUDA codec `cuda_quant_dequant.cuh:156` `DqIQ4_NL`. The ROCm Q8_0 activation quantizer already exists (`rocm_grouped_gemm.hip` `QuantizeQ8_0Kernel`); CUDA needs one. |
 | Tests to port | vLLM has no test to port here, because it has no GGUF k-quant dot. Goldens come from the pinned oracle's OWN kernel over real `UD-IQ1_S` checkpoint bytes, in the shape `tests/vllm/test_gguf_dequant.cpp:528` already uses for the IQ4_NL dequantizer and `tests/vt/test_ops_quant_dot.cpp:869` uses for the IQ4_XS dot: per block and in total, never a synthetic tensor. Newly authored: the IQ4_NL cases in `tests/vt/test_rocm_quant_dot.cpp`, `tests/vt/test_ops_quant_traits.cpp`, `tests/vllm/test_gguf_keep_quant.cpp`, `tests/vt/test_backend_cross_device.cpp`, and a device gather case. |
 | Gates | See `## Gates`. G1 unit suites on CPU, on `strix:gpu0` for the ROCm arms and on a CUDA box for arm 3; G2 admission of `UD-IQ1_S` with zero reference-tier hits for the IQ4_NL GEMM and gather. NO throughput, latency or memory number is admissible from this row. |
 | Dependencies | **None blocking.** #3029 was recorded as a hard dependency and is not one: #3097 landed `src/vt/rocm/rocm_quant_iq_tables.h` on `main` carrying `d_kvalues_iq4nl[16]` at `:1198`. #3029 remains a CONFLICT surface (eight files, measured by `git merge-tree`), and its two `sanitize-cpu` reds are a repository-wide pre-existing failure in `dots3` tests it does not touch. Hardware: `strix:gpu0` (`gfx1151`), a fleet device reachable only through an `rc` lease. No CI lane has an AMD runner, so a green CI is not evidence for arms 1 and 2. |
@@ -148,13 +148,19 @@ precisely why this is stated as a design decision rather than left to review.
 This is the structural fact that makes arm 3 a variant rather than a table
 entry. The resident device path on both backends quantizes activations to
 `BlockQ8_K` over 256-element super-blocks. IQ4_NL pairs with `BlockQ8_0` over
-32. On ROCm the activation quantizer already exists:
-`rocm_grouped_gemm.hip` carries `QuantizeQ8_0Kernel` beside `QuantizeQ8KKernel`.
-On CUDA it does not, and `cuda_quant_dot.cu:695-698` records the gap in its own
-words, marking `DotMXFP4` `[[maybe_unused]]` because it "awaits the
-Q8_0-activation GEMM variant above". Arm 3 is that variant. Q5_0, Q4_0 and
-MXFP4 all queue behind it, which is this row's leverage and also the reason its
-CUDA half is larger than one kernel.
+32. **The two backends are asymmetric here, and W1 measured the asymmetry rather
+than inheriting this section's first guess.** ROCm turned out to carry a
+COMPLETE Q8_0-activation path already: `QuantizeQ8_0K` beside
+`QuantizeQ8KKernel`, `DotQ8_0(BlockQ8_0*, BlockQ8_0*)`, and both a single-matrix
+and a grouped GEMM consuming `const BlockQ8_0* act`. The ROCm arm is therefore a
+new dot slotted into existing machinery, not new machinery, and it is
+correspondingly small.
+
+CUDA has no such path, and `cuda_quant_dot.cu:695-698` records the gap in its
+own words, marking `DotMXFP4` `[[maybe_unused]]` because it "awaits the
+Q8_0-activation GEMM variant above". The CUDA arm is that variant. Q5_0, Q4_0
+and MXFP4 all queue behind it, which is this row's leverage and also why the
+CUDA half is the larger of the two.
 
 ### D3. The gather and the dot are both required, and they are not the same code
 

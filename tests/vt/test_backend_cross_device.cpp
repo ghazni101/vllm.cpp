@@ -2555,6 +2555,11 @@ TEST_CASE("non-grouped keep-quant GEMM (Q8_0/Q4_K/Q5_K/Q6_K) matches the CPU ora
     {vt::DType::kQ4_K, 144, 0, 2, "q4_K"},
     {vt::DType::kQ6_K, 210, 208, -1, "q6_K"},
     {vt::DType::kQ5_K, 176, 0, 2, "q5_K"},
+    // IQ4_NL: 18-byte, 32-element block, and the ONLY entry here whose
+    // activation encoding is Q8_0 rather than Q8_K. It is what every published
+    // Qwen3.8-Flash-Next quant stores its ffn_down_exps and its n-gram table
+    // in, so a ROCm arm that lacks it cannot multiply those experts at all.
+    {vt::DType::kIQ4_NL, 18, 0, -1, "iq4_nl"},
   };
   const bool rocm_present = OpAvailable(vt::OpId::kMatmulBTQuant, DeviceType::kROCM);
   const bool any_rocm = [&] {
@@ -2569,7 +2574,8 @@ TEST_CASE("non-grouped keep-quant GEMM (Q8_0/Q4_K/Q5_K/Q6_K) matches the CPU ora
   }
   for (const Fmt& f : fmts) {
     CAPTURE(f.name);
-    const int64_t elems_per_block = (f.dt == vt::DType::kQ8_0) ? 32 : 256;
+    const int64_t elems_per_block =
+        (f.dt == vt::DType::kQ8_0 || f.dt == vt::DType::kIQ4_NL) ? 32 : 256;
     const int64_t blocks_per_row = K / elems_per_block;
     const size_t row_bytes = static_cast<size_t>(blocks_per_row) * f.block_bytes;
     const size_t wn = static_cast<size_t>(N) * row_bytes;
@@ -3816,6 +3822,12 @@ TEST_CASE("grouped quant expert GEMM (Q8_0/Q4_K/Q6_K) matches the CPU oracle") {
     {vt::DType::kQ4_K, 144, 0, 2, "q4_K"},   // {d,dmin,sc,qs}     superblocks of 256
     {vt::DType::kQ6_K, 210, 208, -1, "q6_K"},// {ql,qh,scales,d}   superblocks of 256
     {vt::DType::kQ5_K, 176, 0, 2, "q5_K"},   // {d,dmin,sc,qh,qs}  superblocks of 256
+    // IQ4_NL {d; qs[16]} — 32-element block on a Q8_0 activation. THIS is the
+    // arm the shipped Qwen3.8-Flash-Next checkpoints need: all 48
+    // ffn_down_exps are IQ4_NL and an expert tower reaches the GROUPED
+    // provider, so the single-matrix arm alone would still throw at the first
+    // expert forward with the model already resident.
+    {vt::DType::kIQ4_NL, 18, 0, -1, "iq4_nl"},
   };
 
   // REQUIRE-proven registration on ROCm (never a silent skip — review sweep
@@ -3832,7 +3844,8 @@ TEST_CASE("grouped quant expert GEMM (Q8_0/Q4_K/Q6_K) matches the CPU oracle") {
   }
   for (const Fmt& f : fmts) {
     CAPTURE(f.name);
-    const int64_t elems_per_block = (f.dt == vt::DType::kQ8_0) ? 32 : 256;
+    const int64_t elems_per_block =
+        (f.dt == vt::DType::kQ8_0 || f.dt == vt::DType::kIQ4_NL) ? 32 : 256;
     const int64_t blocks_per_row = K / elems_per_block;
     const size_t row_bytes = static_cast<size_t>(blocks_per_row) * f.block_bytes;
     const size_t wn = static_cast<size_t>(E) * N * row_bytes;
@@ -3955,7 +3968,8 @@ TEST_CASE("fused MoE gate+up+SwiGLU grouped GEMM matches the CPU oracle and is N
     // As std::string: doctest stringifies a bare `const char*` as `1`, so the
     // capture in the case above cannot name the format that failed.
     CAPTURE(std::string(f.name));
-    const int64_t elems_per_block = (f.dt == vt::DType::kQ8_0) ? 32 : 256;
+    const int64_t elems_per_block =
+        (f.dt == vt::DType::kQ8_0 || f.dt == vt::DType::kIQ4_NL) ? 32 : 256;
     const int64_t blocks_per_row = K / elems_per_block;
     const size_t row_bytes = static_cast<size_t>(blocks_per_row) * f.block_bytes;
     const size_t wn = static_cast<size_t>(E) * N * row_bytes;
