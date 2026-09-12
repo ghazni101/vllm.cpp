@@ -1,5 +1,5 @@
 ID: ISSUE-LOCAL-01M29ECVDVH5A89TBKA8K72YRD
-Title: IQ4_NL has no native quantized compute on ROCm or CUDA
+Title: IQ4_NL has no native quantized compute on ROCm
 Row: QUANT-GGUF-IQ4_NL
 State: OPEN
 Kind: bug
@@ -60,3 +60,28 @@ recorded: the ROCm codebook header IQ4_NL needs is now on `main` by another
 route. #3029 remains a conflict surface over eight files, and its two
 `sanitize-cpu` reds are a repository-wide pre-existing failure in `dots3`
 tests it does not touch.
+
+## Reconciliation 2026-09-12 (second): the CUDA half was never missing
+
+**The problem statement's CUDA bullet was WRONG when written, not overtaken.**
+Recording that distinction, because the two failures need different fixes.
+
+[#2419](https://github.com/mudler/vllm.cpp/issues/2419) (`593b888b5`,
+`feat(QUANT-CUDA-KEEPQUANT-32B): give IQ4_NL, Q5_0 and Q4_0 a device GEMM
+instead of a host drain`) had already landed. On CUDA:
+
+- `IsCuda32BlockKeepQuantSupported` (`cuda_quant_dot.cu:2060`) admits
+  `kIQ4_NL`, `kQ5_0` and `kQ4_0`;
+- the single-matrix (`:2416`), grouped (`:2533`) and fused gate/up (`:2785`)
+  seams all consult it;
+- `docs/FEATURES.md:111` states it in prose, naming this exact checkpoint.
+
+**How the wrong reading happened, so it does not happen again.** This issue
+read `IsCudaKeepQuantSupported`, saw no IQ4_NL, and generalised to "CUDA has no
+arm". That predicate governs the **256-element Q8_K family** only. IQ4_NL is a
+32-element block on a Q8_0 activation and therefore CANNOT appear in it by
+construction; CUDA keeps a second predicate and a second templated GEMM for
+exactly that class. One predicate is not the backend.
+
+**What remains, and it is now a single arm:** the ROCm IQ4_NL keep-quant dot.
+Nothing else in this issue's original three bullets is still true.

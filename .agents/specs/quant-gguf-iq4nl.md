@@ -51,9 +51,20 @@ Three arms and one record repair, in one change:
    (`gguf_keep_quant.cpp:220`), so it is now true for ROCm and the
    `qwen4_exp_weights.cpp:665` refusal no longer fires on this device. This row
    does not reimplement it.
-3. **CUDA keep-quant dot.** The Q8_0-activation GEMM variant the CUDA file is
-   already written against, plus `DotIQ4_NL` and its entry in
-   `IsCudaKeepQuantSupported`.
+3. ~~**CUDA keep-quant dot.**~~ **ALREADY LANDED, and this spec was WRONG about
+   it. Struck rather than deleted.** #2419 (`593b888b5`,
+   `feat(QUANT-CUDA-KEEPQUANT-32B)`) gave IQ4_NL, Q5_0 and Q4_0 a CUDA device
+   GEMM on a second templated path beside the Q8_K one.
+   `IsCuda32BlockKeepQuantSupported` (`cuda_quant_dot.cu:2060`) admits
+   `kIQ4_NL`, and the single-matrix (`:2416`), grouped (`:2533`) and fused
+   gate/up (`:2785`) seams all consult it.
+
+   **The error is worth naming because it is repeatable.** This spec read
+   `IsCudaKeepQuantSupported`, found no IQ4_NL, and concluded CUDA had none.
+   That predicate is the 256-element **Q8_K family** only; a 32-element
+   Q8_0-activation encoding cannot ever appear in it, and CUDA keeps a second
+   table for exactly those. Reading one predicate and generalising to "the
+   backend" is what produced a wrong scope twice in this row.
 4. **Record reconciliation** of the `QUANT-GGUF-IQ4_NL` row, which understates
    the tree: `R`, `M` and CPU `C` all landed under #1989 while the row still
    read `INVENTORIED` with every stage unset. It moves to `ACTIVE`.
