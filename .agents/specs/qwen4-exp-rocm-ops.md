@@ -148,6 +148,65 @@ recorded here rather than resolved silently:
    device would make the ROCm arm answer a different op. Recorded as a known
    narrowing, owed to whichever wave revisits the op split.
 
+## D3b. Two W1 guarantees were unmeasured, and what it took to measure them
+
+A fresh review mutated the three arms and found TWO guarantees that the kernel
+comments assert and the fixtures could not see. The kernels were correct. The
+fixtures were wrong, and they are recorded here because a fixture that cannot
+fail is indistinguishable from one that passes, and the next reader has no other
+way to learn this axis was once blind.
+
+**The mixer could not see DIVISION 1.** `rocm_qwen4_exp.hip:257-261` says the
+division by `hc_count` sits INSIDE the SiLU and that the placement is
+load-bearing because SiLU is not homogeneous. Deleting it measured NMSE
+`0.000490056` against the `5e-4` bar and PASSED with 2% of margin. The cause was
+the fixture's projection scale, not the tolerance: at `+/-0.2`, `down(normed)`
+landed at `|a| ~ 0.5` inside SiLU's near-linear part, AND `up()` then left
+`sigmoid(gate)` spanning only `0.488..0.512`, so the entire low-rank branch was
+a near-constant `0.5` that could not move the output whatever it computed.
+`mix_down` at `+/-2.0` and `mix_up` at `+/-0.5` put the pre-activation in the
+knee and open the gate to `0.27..0.81`, still nowhere near saturation. The same
+deletion now measures **`0.160672`** on both `use_combine` arms and FAILS — 321x
+the bar, against 0.98x before.
+
+**The MUTATION ITSELF was a false one the first time, exactly as W1's earlier
+registration mutation was.** Writing `const float a = low[i];` drops the last
+use of `hc_f`, and this tree builds HIP with `-Wall -Wextra -Werror`, so
+`rocm_qwen4_exp.hip:262: error: unused parameter 'hc_f' [-Werror,-Wunused-parameter]`
+fails the compile and the STALE binary then passes with the unmutated number.
+The measurement above was taken with
+`const float a = __fmul_rn(low[i], (hc_f > 0.0f) ? 1.0f : 2.0f);`, which deletes
+the division, keeps the parameter live, and multiplies by an exact `1.0f`. The
+binary was sha256-proven changed (`5b6117f8..` against the baseline
+`69a716d6..`) and sha256-proven restored.
+
+**The grouped norm could not see the eps PLACEMENT.** `rocm_rms_norm_group.hip:175-178`
+says eps is inside the rsqrt and is added to the MEAN SQUARE. On `O(1)` data with
+`eps = 1e-6` that is unmeasurable, and both ways of breaking it survived at NMSE
+`2.39943e-12`. The fixture now rescales two rows, and RMS norm returns every row
+to `O(1)` whatever its input scale, so neither row distorts what the others
+contribute:
+
+| Mutation | Before | After (`gemma=false` / `true`) |
+|---|---|---|
+| eps added to the ROOT, `1/(sqrt(ms) + eps)` | 2.39943e-12, PASS | **0.00910165 / 0.0106572**, FAIL |
+| eps added OUTSIDE the reciprocal, `1/sqrt(ms) + eps` | 2.39943e-12, PASS | **0.250049 / 0.292251**, FAIL |
+
+Row 0 is scaled by `1e-3`, which puts its mean square at the same order as eps
+and makes the first mutation shift that row by ~32%. Row 1 is scaled by `1e6`,
+which puts `sqrt(ms)` at `~1.2e6` and makes the second mutation more than double
+that row. The unmutated arm stays BIT-EXACT against the CPU oracle at both
+polarities with those rows present, so the widening cost no margin.
+
+**One instrument defect was found and repaired alongside.** doctest stringifies
+a `const char*` operand through its `bool` overload, so every W1
+`MESSAGE(... << DeviceName(dt) << ...)` recorded its NMSE beside the text `1`
+and never named the device it measured; `CAPTURE` takes the same path. A
+`DeviceTag()` helper returning `std::string` repairs the three W1 cases, and the
+gate now prints `qwen4_exp mixer NMSE ROCM combine=true mixed = 6.98127e-16`.
+The roughly forty older sites in the same file belong to other rows and are
+owed.
+
 ## Tests
 
 Red first, per op, each failing for the intended reason before the arm exists:
@@ -253,6 +312,15 @@ REQUIRE-proves its ROCm registration. Six arms remain owed and the forward
 still refuses on ROCm, because a partial port buys nothing runnable on a board
 with no reference tier (D2). Next action is W2, `kIndexSelect` and
 `kIndexCopy`.
+
+**A fresh review returned FAIL on the GATES, not on the kernels**, and the
+findings are repaired here. The three arms are unchanged; the two fixtures that
+could not fail are widened (D3b), the eps and DIVISION-1 placements are now
+pinned by measurement, and W1's staged, unreached slice is recorded under
+`## Owed` as AGENTS.md requires. Re-measured on `strix:gpu0` at the widened
+fixtures: write-back 0, `rmsnorm_group` 0 at both polarities, mixer injection 0,
+mixer `mixed` 6.98127e-16, full ROCm cross-device suite 50/50 with 84102
+assertions.
 
 No throughput, latency or memory number is admissible from this row, and W1
 took none.
