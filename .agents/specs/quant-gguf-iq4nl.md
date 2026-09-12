@@ -445,7 +445,7 @@ struck with its reason or moved to `## Owed`; none is quietly dropped.
   |---|---|
   | `check-pr-size.py --base origin/main --head HEAD --branch row/QUANT-GGUF-IQ4_NL` | `OK: every explicit path class is within its review budget.` (it printed `ERROR: checker change 'scripts/check-gate-commands.py' requires semantic mutation evidence` before this commit; read the OUTPUT, because it names which class failed) |
   | `tests/scripts/test_check_gate_commands.py` | `70 passed, 4 subtests passed` |
-  | `ctest --test-dir build`, CPU | `99% tests passed, 1 tests failed out of 758`; the one failure is `test_rocm_f16_contract`, the pre-existing red G1 above already proved this row does not own; 14 skipped |
+  | `ctest --test-dir build`, CPU | `99% tests passed, 1 tests failed out of 758`; the one failure is `test_rocm_f16_contract`, the pre-existing red G1 above already proved this row does not own, and which `main` has since repaired in `1d63c604a` (#3154); 14 skipped |
   | `strix:gpu0`, job `2d6f8de9-8e2f-412d-a514-f8db5512de0c` | `test_backend_cross_device` `48 cases / 48 passed / 0 failed / 0 skipped`, `84062 assertions / 0 failed`; `test_gguf_keep_quant` `61 cases / 61 passed / 0 failed / 0 skipped`, `12626 assertions / 0 failed`. `--depth 1` clone at `fd2a12310`, `git status --porcelain` 0 bytes, `LD_LIBRARY_PATH=/opt/rocm-7.2.4/lib` |
 
   **CORRECTION, third review, 2026-09-12: an earlier version of the row above
@@ -480,6 +480,17 @@ struck with its reason or moved to `## Owed`; none is quietly dropped.
   between this row's base and `origin/main`, and this row touches none of them.
   **This is the gate the first wave omitted**, and it is what found the
   `test_gguf_keep_quant` red that the review reported.
+
+  **SUPERSEDED BY `main`, 2026-09-12, and recorded rather than quietly
+  rewritten.** `1d63c604a` (`fix(BACKEND-ROCM-F16-WEIGHTS): correct
+  test_rocm_f16_contract to match the ViewOn contract`, #3154) landed while this
+  row was in review and repairs that test. The paragraph above was true when it
+  was measured and its conclusion is unchanged — the failure never belonged to
+  this row — but a reader running `ctest` at this row's rebased head will not
+  see it, so the count of 740 of 751 describes the earlier base and not this
+  head. The rebase onto `e1097c5e4` is what makes the difference, and it is the
+  reason a gate number is pinned to a SHA in this file rather than left as a
+  bare figure.
 
 - **G1 (CUDA).** Not owed by this row: arm 3 was already landed by #2419.
 - **G2 (admission).** `UD-IQ1_S` opens and its IQ4_NL tensors keep their blocks
