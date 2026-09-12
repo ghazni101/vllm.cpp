@@ -5306,7 +5306,13 @@ TEST_CASE("qwen4_exp gated-residual write-back matches the CPU oracle and is NAT
     vt::Qwen4ExpGatedResidualWriteBack(q, th, tb, ti, args);
     dev.Synchronize(q);
     CHECK(vt::GetReferenceTierHits() == hits_before);
-    CHECK(Nmse(ref, dh.Download()) <= kNmseTol);
+    // The measured value, not only the verdict. doctest prints an expression's
+    // operands only when it FAILS, so a passing gate records nothing about how
+    // much margin it had; a wave that reports "green" and cannot say how green
+    // has measured a bar and not an arm.
+    const double nmse = Nmse(ref, dh.Download());
+    MESSAGE("qwen4_exp write-back NMSE " << DeviceName(dt) << " = " << nmse);
+    CHECK(nmse <= kNmseTol);
     dev.DestroyQueue(q);
   }
 }
@@ -5382,7 +5388,9 @@ TEST_CASE("grouped RMS norm matches the CPU oracle and is NATIVE on ROCm") {
       vt::RmsNormGroup(q, tout, tx, tw, args);
       dev.Synchronize(q);
       CHECK(vt::GetReferenceTierHits() == hits_before);
-      CHECK(Nmse(ref, dout.Download()) <= kNmseTol);
+      const double nmse = Nmse(ref, dout.Download());
+      MESSAGE("rmsnorm_group NMSE " << DeviceName(dt) << " gemma=" << gemma << " = " << nmse);
+      CHECK(nmse <= kNmseTol);
       dev.DestroyQueue(q);
     }
   }
@@ -5492,8 +5500,15 @@ TEST_CASE("qwen4_exp gated-residual MIXER matches the CPU oracle and is NATIVE o
                                 combine ? &tbi : nullptr, args);
       dev.Synchronize(q);
       CHECK(vt::GetReferenceTierHits() == hits_before);
-      CHECK(Nmse(ref_mixed, dmixed.Download()) <= kNmseTol);
-      if (combine) CHECK(Nmse(ref_inj, dinj.Download()) <= kNmseTol);
+      const double nmse_mixed = Nmse(ref_mixed, dmixed.Download());
+      MESSAGE("qwen4_exp mixer NMSE " << DeviceName(dt) << " combine=" << combine
+                                      << " mixed = " << nmse_mixed);
+      CHECK(nmse_mixed <= kNmseTol);
+      if (combine) {
+        const double nmse_inj = Nmse(ref_inj, dinj.Download());
+        MESSAGE("qwen4_exp mixer NMSE " << DeviceName(dt) << " injection = " << nmse_inj);
+        CHECK(nmse_inj <= kNmseTol);
+      }
       dev.DestroyQueue(q);
     }
   }
