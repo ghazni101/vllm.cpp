@@ -408,23 +408,6 @@ void ReorderVRows(std::vector<T>& buf, int64_t cols, int64_t row_off,
   }
   std::memcpy(base, seg.data(), seg.size() * sizeof(T));
 }
-// Pointer-based overload for OwnedBytes (T=uint8_t, sizeof(T)=1).
-void ReorderVRows(uint8_t* buf, int64_t cols, int64_t row_off,
-                  int64_t num_k, int64_t num_v_per_k, int64_t head_rows) {
-  const int64_t num_v = num_k * num_v_per_k;
-  const int64_t head_stride = head_rows * cols;
-  std::vector<uint8_t> seg(static_cast<size_t>(num_v) * head_stride);
-  uint8_t* base = buf + row_off * cols;
-  for (int64_t k = 0; k < num_k; ++k) {
-    for (int64_t r = 0; r < num_v_per_k; ++r) {
-      const int64_t g = k * num_v_per_k + r;
-      const int64_t t = r * num_k + k;
-      std::memcpy(seg.data() + g * head_stride, base + t * head_stride,
-                  static_cast<size_t>(head_stride));
-    }
-  }
-  std::memcpy(base, seg.data(), seg.size());
-}
 
 
 
