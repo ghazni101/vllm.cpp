@@ -51,6 +51,63 @@ inline int mindiv(int N, int div1, int div2) {
   return 0;
 }
 
+// gfx1151 detection (RDNA3.5) - matches vLLM's on_gfx1151()
+__device__ __forceinline__ bool on_gfx1151() {
+#if defined(__GFX11__)
+  // Runtime detection via hipDeviceGetAttribute
+  int arch = 0;
+  hipDeviceGetAttribute(&arch, hipDeviceAttributeGcnArch, 0);
+  // gfx1151 = 115100
+  return (arch >= 115100 && arch < 115200);
+#else
+  return false;
+#endif
+}
+
+// Donor's persistent-workgroup splitter (host-side in skinny_gemms.cu:1169).
+inline int mindiv(int N, int div1, int div2) {
+  int nPrRnd = div1 * div2;
+  int rnds[13];
+  for (int i = 0; i < 13; i++) {
+    rnds[i] = (N + nPrRnd - 1) / nPrRnd;
+    nPrRnd -= div1;
+  }
+  for (int i = 12; i >= 0; i--)
+    if (rnds[0] == rnds[i]) return (div2 - i);
+  return 0;
+}
+
+// gfx1151-specific dispatch config (mirrors vLLM's WVSPLIT_TILE logic)
+// Returns {YTILE, UNRL} pair based on K, N, and LDS fit
+struct YtileUnrl { int ytile; int unrl; };
+inline YtileUnrl SelectYtileUnrl(int K, int N, int M, int CuCount, bool fit_lds) {
+  // sYT = ceil(M / (CuCount * 4))
+  int sYT = (M + CuCount * 4 - 1) / (CuCount * 4);
+  
+  if (on_gfx1151()) {
+    // gfx1151-specific tuning (vLLM skinny_gemms.cu:1240-1258)
+    if (sYT <= 1) {
+      return {1, 4};
+    } else if ((K % 1024 == 512) && K >= 1536 && (sYT >= 40 || K >= 4096)) {
+      return {4, 1};
+    } else if (K < 1024) {
+      return {2, 4};
+    } else if (K <= 2048 && (N >= 2 || sYT <= 26)) {
+      return {1, 4};
+    } else if (N >= 2 && !fit_lds) {
+      return {1, 4};
+    } else if (N == 1) {
+      return {1, 2};
+    } else {
+      return {1, 1};
+    }
+  } else {
+    // Generic gfx1x fallback (YTILE=2, UNRL=2 as before)
+    return {2, 2};
+  }
+}
+
+
 // A (activation) fits LDS. N = decode batch (our M). bf16, f32 accum.
 // Output-store polymorphism: the adopted bf16 decode arm rounds the f32
 // accumulator to bf16; lever B2 (evidence 15.1) serves the Qwen3.5 GDN BA
@@ -69,7 +126,7 @@ __device__ __forceinline__ float WvStoreCast<float>(float v) {
 
 // A (activation) fits LDS. N = decode batch (our M). bf16 in, OutT out,
 // f32 accum.
-template <int N, int YT, class OutT = __hip_bfloat16>
+template <int N, int YT, int UNRL, class OutT = __hip_bfloat16>
 __global__ void __launch_bounds__(kWvPrGrp * kThrds)
     wvSplitKSml(const int K, const int Kbp, const int Kap, const int M,
                 const __hip_bfloat16* __restrict__ B, const __hip_bfloat16* __restrict__ A,
@@ -90,11 +147,11 @@ __global__ void __launch_bounds__(kWvPrGrp * kThrds)
 
   while (m < static_cast<uint32_t>(M)) {
     float sum[N][YT] = {};
-    for (uint32_t k1 = 0; k1 < static_cast<uint32_t>(K); k1 += kThrds * kAChunk * kUnrl) {
-      bigType bigA[N][kUnrl] = {};
-      bigType bigB[YT][kUnrl];
+    for (uint32_t k1 = 0; k1 < static_cast<uint32_t>(K); k1 += kThrds * kAChunk * UNRL) {
+      bigType bigA[N][UNRL] = {};
+      bigType bigB[YT][UNRL];
 #pragma unroll
-      for (uint32_t k2 = 0; k2 < kUnrl; k2++) {
+      for (uint32_t k2 = 0; k2 < UNRL; k2++) {
         uint32_t k = k1 + k2 * kThrds * kAChunk;
         uint32_t k_ = k + threadIdx.x * kAChunk;
         const __hip_bfloat16* B_ = &B[min__(k_, K - kAChunk)];
@@ -103,14 +160,14 @@ __global__ void __launch_bounds__(kWvPrGrp * kThrds)
               (const scalar8*)(&B_[min__(y + m, M - 1) * Kbp]));
       }
 #pragma unroll
-      for (uint32_t k2 = 0; k2 < kUnrl; k2++) {
+      for (uint32_t k2 = 0; k2 < UNRL; k2++) {
         uint32_t k = k1 + k2 * kThrds * kAChunk;
         uint32_t k_ = k + threadIdx.x * kAChunk;
         if (k_ >= static_cast<uint32_t>(K)) break;
         for (int n = 0; n < N; n++) bigA[n][k2] = *((const bigType*)(&(s[k_ + Kap * n])));
       }
       // Interleaved MAC; bf16 pairs unpacked to f32 (donor DOT2C bf16 branch).
-      for (uint32_t k2 = 0; k2 < kUnrl; k2++) {
+      for (uint32_t k2 = 0; k2 < UNRL; k2++) {
         for (int n = 0; n < N; n++) {
           for (int y = 0; y < YT; y++) {
 #pragma unroll
@@ -195,30 +252,30 @@ void WvSplitKBTDispatch(hipStream_t s, void* out, const void* a, const void* b,
   switch (M) {
     case 1:
       switch (yt) {
-        case 1: wvSplitKSml<1, 1, OutT><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu); break;
-        case 2: wvSplitKSml<1, 2, OutT><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu); break;
-        default: wvSplitKSml<1, 4, OutT><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu); break;
+        case 1: wvSplitKSml<1, 1, kUnrl, OutT><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu); break;
+        case 2: wvSplitKSml<1, 2, kUnrl, OutT><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu); break;
+        default: wvSplitKSml<1, 4, kUnrl, OutT><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu); break;
       }
       break;
     case 2:
       switch (yt) {
-        case 1: wvSplitKSml<2, 1, OutT><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu); break;
-        case 2: wvSplitKSml<2, 2, OutT><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu); break;
-        default: wvSplitKSml<2, 4, OutT><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu); break;
+        case 1: wvSplitKSml<2, 1, kUnrl, OutT><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu); break;
+        case 2: wvSplitKSml<2, 2, kUnrl, OutT><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu); break;
+        default: wvSplitKSml<2, 4, kUnrl, OutT><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu); break;
       }
       break;
     case 3:
       switch (yt) {
-        case 1: wvSplitKSml<3, 1, OutT><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu); break;
-        case 2: wvSplitKSml<3, 2, OutT><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu); break;
-        default: wvSplitKSml<3, 4, OutT><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu); break;
+        case 1: wvSplitKSml<3, 1, kUnrl, OutT><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu); break;
+        case 2: wvSplitKSml<3, 2, kUnrl, OutT><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu); break;
+        default: wvSplitKSml<3, 4, kUnrl, OutT><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu); break;
       }
       break;
     case 4:
       switch (yt) {
-        case 1: wvSplitKSml<4, 1, OutT><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu); break;
-        case 2: wvSplitKSml<4, 2, OutT><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu); break;
-        default: wvSplitKSml<4, 4, OutT><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu); break;
+        case 1: wvSplitKSml<4, 1, kUnrl, OutT><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu); break;
+        case 2: wvSplitKSml<4, 2, kUnrl, OutT><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu); break;
+        default: wvSplitKSml<4, 4, kUnrl, OutT><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu); break;
       }
       break;
     default:
@@ -243,10 +300,10 @@ void WvSplitKBTLaunch(hipStream_t s, void* out, const void* a, const void* b,
       auto* A = static_cast<const __hip_bfloat16*>(a);
       auto* B = static_cast<const __hip_bfloat16*>(b);
       switch (M) {
-        case 1: wvSplitKSml<1, kYtile, OutT><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu); break;
-        case 2: wvSplitKSml<2, kYtile, OutT><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu); break;
-        case 3: wvSplitKSml<3, kYtile, OutT><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu); break;
-        default: wvSplitKSml<4, kYtile, OutT><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu); break;
+        case 1: wvSplitKSml<1, kYtile, kUnrl, OutT><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu); break;
+        case 2: wvSplitKSml<2, kYtile, kUnrl, OutT><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu); break;
+        case 3: wvSplitKSml<3, kYtile, kUnrl, OutT><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu); break;
+        default: wvSplitKSml<4, kYtile, kUnrl, OutT><<<grid, block, 0, s>>>(K, K, K, N, B, A, C, wvPrGrp, cu); break;
       }
       return;
     }
