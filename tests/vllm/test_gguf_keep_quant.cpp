@@ -334,7 +334,10 @@ TEST_CASE("keep-quant routing on TENSTORRENT admits exactly the registered decod
   // histogram: token_embd Q6_K, attn_qkv/ssm_out Q5_K, ssm_alpha/ssm_beta
   // Q8_0) and the arm widens to exactly those four IN THE SAME CHANGE — the
   // routing test still reds any widening PAST the registered set: kQ4_0 has
-  // no TT arm at all, and kQ2_K/kQ3_K stay owed. Admitting an encoding
+  // no TT arm at all, and kQ2_K stays owed. QUANT-GGUF-IQ-TENSTORRENT
+  // wave 1 adds kIQ3_XXS (the int8-dot arm's enc_sel 4) in the same change as
+  // its kernel; wave 2 adds kIQ2_XXS/kIQ2_S (enc_sel 5/6); wave 3 adds kQ3_K
+  // (enc_sel 7). Admitting an encoding
   // without its kernel throws at first forward with the model resident, the
   // exact failure this predicate exists to prevent.
   const std::vector<int64_t> shape = {4, 256};  // [out, in]: whole blocks
@@ -348,9 +351,18 @@ TEST_CASE("keep-quant routing on TENSTORRENT admits exactly the registered decod
   CHECK(route(kQ8_0) == GgufResidency::kKeepQuant);  // W3 decode set
   CHECK(route(kQ5_K) == GgufResidency::kKeepQuant);  // W3 decode set
   CHECK(route(kQ6_K) == GgufResidency::kKeepQuant);  // W3 decode set
+  CHECK(route(kIQ3_XXS) == GgufResidency::kKeepQuant);  // IQ3_XXS int8-dot arm
+  // QUANT-GGUF-IQ-TENSTORRENT wave 2: IQ2_XXS (enc_sel 5) and IQ2_S
+  // (enc_sel 6) join the int8-dot set in the same change as their kernels.
+  CHECK(route(kIQ2_XXS) == GgufResidency::kKeepQuant);
+  CHECK(route(kIQ2_S) == GgufResidency::kKeepQuant);
   CHECK(route(kQ4_0) == GgufResidency::kExpandBf16);  // no TT arm at all
   CHECK(route(kQ2_K) == GgufResidency::kExpandBf16);
-  CHECK(route(kQ3_K) == GgufResidency::kExpandBf16);
+  // QUANT-GGUF-IQ-TENSTORRENT wave 3: Q3_K (enc_sel 7, the min-term
+  // K-quant) joins the int8-dot set in the same change as its kernel
+  // kq_vec_dot_q3_k_q8_K — this check flipped FROM kExpandBf16 and redded
+  // before the predicate widened.
+  CHECK(route(kQ3_K) == GgufResidency::kKeepQuant);
   // The loader boolean flips only when the op is registered, so a host with a
   // P150 resolves keep-quant on by default; without the card the default arm
   // stays false and the load is unchanged.
@@ -656,11 +668,19 @@ TEST_CASE("routing table is TOTAL: every role x every encoding is explicit") {
             type == kIQ2_S || type == kIQ4_XS ||
             type == kMXFP4 || type == kIQ1_XXXS;
         const bool rocm = kRouteDev == vt::DeviceType::kROCM;
+        // QUANT-GGUF-IQ4_NL adds kIQ4_NL to the ROCm set. It is the one entry
+        // here whose activation encoding is Q8_0 rather than Q8_K, and it is
+        // served on BOTH device arms by `DotIQ4_NL` through `IQ4NLGemmK`
+        // (single matrix) and `GroupedIQ4NLK` (expert towers). The grouped arm
+        // is the load-bearing one: the shipped Qwen3.8-Flash-Next checkpoints
+        // store all 48 `ffn_down_exps` in IQ4_NL, and an expert tower reaches
+        // the GROUPED provider, so this row is what stops those experts from
+        // expanding to bf16 on a ROCm box.
         const bool device_capable =
             !rocm || type == kQ8_0 || type == kQ2_K || type == kQ3_K ||
             type == kQ4_K || type == kQ5_K || type == kQ6_K ||
             type == kIQ2_XXS || type == kIQ3_XXS || type == kIQ2_S ||
-            type == kIQ1_S || type == kIQ1_XXXS;
+            type == kIQ1_S || type == kIQ1_XXXS || type == kIQ4_NL;
         const bool block_capable = cpu_capable && device_capable;
         const int64_t blk = (type == kQ4_0 || type == kQ5_0 || type == kQ8_0 ||
                              type == kMXFP4 || type == kIQ4_NL)
@@ -749,7 +769,7 @@ TEST_CASE("routing table is TOTAL: every role x every encoding is explicit") {
   // Both outcomes are actually exercised (a table that never keeps anything
   // would pass every assertion above vacuously). The kept count is
   // device-dependent (review #523): 17 block-capable encodings x 2 keep-capable
-  // GEMM roles where the device covers the CPU list; 11 x 2 on ROCm. The
+  // GEMM roles where the device covers the CPU list; 12 x 2 on ROCm. The
   // GATHER role adds 19 more (the 17, plus Q8_K and IQ3_S) on a device that
   // REGISTERS the block
   // gather, and nothing on a device that does not. Written as named terms
@@ -776,7 +796,12 @@ TEST_CASE("routing table is TOTAL: every role x every encoding is explicit") {
   // was, the same decode-only shape #2240 had. That asymmetry IS the row's
   // per-tier result: IQ3_S stays compressed in a gather table and expands to
   // bf16 in a GEMM, on every device.
-  const int gemm_kept = kRouteDev == vt::DeviceType::kROCM ? 22 : 34;
+  //
+  // QUANT-GGUF-IQ4_NL moves the ROCm GEMM term 22 -> 24 and leaves the CPU/CUDA
+  // term at 34, because IQ4_NL was already in the CPU list and only the DEVICE
+  // set was narrower. That is the shape of a device-arm port: one encoding, two
+  // keep-capable GEMM roles, and no change to either gather term.
+  const int gemm_kept = kRouteDev == vt::DeviceType::kROCM ? 24 : 34;
   const int gather_kept =
       vt::OpRegistered(vt::OpId::kEmbeddingQuant, kRouteDev) ? 19 : 0;
   CHECK(kept == gemm_kept + gather_kept);
@@ -3169,3 +3194,84 @@ TEST_CASE("ROCm F16 production registered forward reaches retained embedding and
   vllm_test::UnsetEnv("VT_GGUF_KEEP_F16");
 }
 #endif
+
+// W4d W4 (#3042, spec tenstorrent-27b-gdn-keepquant.md): the byte-level
+// packed V-row reorder must be EXACTLY the element-level reorder seen
+// through the row dequantizer — bit-for-bit, per row, for every encoding
+// the GDN family carries. RED until ReorderVPackedForTest existed: the
+// function did not, and the loader dequantized+reordered elements instead,
+// which is what forced the 9.7 GiB of bf16 GDN projections onto the P150.
+namespace {
+
+std::vector<float> ReorderVRowsRef(const std::vector<float>& in,
+                                   int64_t cols, int64_t row_off,
+                                   int64_t num_k, int64_t num_v_per_k,
+                                   int64_t head_rows) {
+  const int64_t cs = head_rows * cols;
+  std::vector<float> out = in;
+  for (int64_t k = 0; k < num_k; ++k) {
+    for (int64_t r = 0; r < num_v_per_k; ++r) {
+      const int64_t g = k * num_v_per_k + r;
+      const int64_t t = r * num_k + k;
+      std::memcpy(out.data() + (row_off + g * head_rows) * cols,
+                  in.data() + (row_off + t * head_rows) * cols,
+                  static_cast<size_t>(cs) * sizeof(float));
+    }
+  }
+  return out;
+}
+
+}  // namespace
+
+TEST_CASE("packed V-row reorder equals the element-level reorder (W4d W4)") {
+  // Geometry: K=512 (2 blocks/row, whole blocks per row), 15 weight rows =
+  // row_off(3, non-V) + 6 heads x head_rows(2). q6_K row 420 B, q4_K 288 B.
+  struct Enc {
+    const char* name;
+    uint32_t ggml_type;
+    int64_t block_bytes;
+  };
+  const Enc encs[] = {{"q6_K", 14, 210}, {"q4_K", 12, 144}};
+  const int64_t K = 512, row_off = 3, num_k = 2, rpk = 3, head_rows = 2;
+  const int64_t rows = row_off + num_k * rpk * head_rows;  // 15
+
+  std::mt19937 rng(20260912u);
+  for (const Enc& e : encs) {
+    const int64_t row_bytes = K / 256 * e.block_bytes;
+    std::vector<uint8_t> packed(static_cast<size_t>(rows * row_bytes));
+    for (size_t b = 0; b < packed.size(); b += e.block_bytes) {
+      // pin the block's scale/min bits to valid f16 payloads; randomize the
+      // quant elements (a random f16 scale can be inf/NaN and NaN != NaN).
+      const uint16_t d = vt::F32ToF16(0.05f + 0.01f * static_cast<float>(b % 97));
+      const uint16_t s = vt::F32ToF16(0.004f + 0.001f * static_cast<float>(b % 31));
+      std::memcpy(packed.data() + b, &d, 2);
+      if (e.block_bytes > 2) std::memcpy(packed.data() + b + 2, &s, 2);
+      for (int64_t i = 4; i < e.block_bytes; ++i)
+        packed[b + i] = static_cast<uint8_t>(rng() & 0xFF);
+    }
+
+    // candidate: reorder the packed bytes, then dequant per row
+    std::vector<uint8_t> pb = packed;
+    vllm::ReorderVPackedForTest(pb, row_bytes, row_off, num_k, rpk, head_rows);
+    std::vector<float> fb(static_cast<size_t>(rows * K));
+    for (int64_t r = 0; r < rows; ++r) {
+      auto row = vllm::DequantGgufRowToF32(
+          e.ggml_type, pb.data() + r * row_bytes, K);
+      REQUIRE(row.size() == static_cast<size_t>(K));
+      std::memcpy(fb.data() + r * K, row.data(), static_cast<size_t>(K) * 4);
+    }
+
+    // reference: dequant per row, then the independent element reorder
+    std::vector<float> fa(static_cast<size_t>(rows * K));
+    for (int64_t r = 0; r < rows; ++r) {
+      auto row = vllm::DequantGgufRowToF32(
+          e.ggml_type, packed.data() + r * row_bytes, K);
+      std::memcpy(fa.data() + r * K, row.data(), static_cast<size_t>(K) * 4);
+    }
+    fa = ReorderVRowsRef(fa, K, row_off, num_k, rpk, head_rows);
+
+    // NaN != NaN under float operator==, so compare raw bytes.
+    CHECK(std::memcmp(fa.data(), fb.data(),
+                      fa.size() * sizeof(float)) == 0);
+  }
+}
