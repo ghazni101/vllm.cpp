@@ -392,6 +392,29 @@ to make a failure pass.
   `neartie_gap_mnats_tenstorrent_capture.npy`): 51/256 near-tie divergences,
   max gap 0.1875 nats — all inside the 500 mnats band (kNearTieMnats,
   test_qwen35_paged_engine.cpp:83).
+- Re-capture 2026-09-12, after the tt-metal rebase: the fresh capture
+  differs from the committed anchor at 83/256 cells (gross re-roll at ULP
+  level; net anchor-vs-oracle divergence grows 44→84; p15t0 and p9t2 are
+  exact bf16 ties in our logits, and the engine picks the first occurrence
+  while the committed capture held the oracle's token). Pinned-recipe
+  verification: 84/256 cells off oracle greedy, max gap 250 mnats (worst
+  p2t2, also p9t2), 0 cells above the 500-mnat band — every re-rolled cell
+  is a near-tie and the fresh capture is no farther from the oracle than
+  the committed one (375). The band is unchanged; no tt-metal numerics
+  regression.
+- Off-recipe incident (2026-09-12), recorded so the class is recognizable: an
+  ad-hoc gap re-derivation wrote f32-grain values (62/313/562/625/875/1000
+  mnats — impossible under the pinned bf16 recipe, whose gaps sit on the
+  62.5-mnat bf16 logit grid) that manufactured four fake band violations and
+  nearly drove a band widening. Provenance proof that closed it: the pinned
+  script rerun on the COMMITTED anchor reproduces the committed gap golden
+  bit-for-bit, and on the fresh ids yields max gap 250. The canonical
+  re-derivation path is now `scripts/qwen35-q4km-neartie-gap.sh`, which
+  asserts the pinned oracle env (python 3.12, torch 2.7.1+cpu,
+  transformers 5.8.1), refuses any other, warns on off-grid values, and
+  prints the dequant artifact hash (this capture:
+  `946f72d34d8ac6e68429c50d88b61c55499c5c6c7fcd3197e842618f9c0f50a5`;
+  input GGUF pin below).
 - READY adjudication: 147/147 assertions; 16/16 prompts PASS — 11/16 STRICT
   token-exact vs oracle per-prompt greedy, 5/16 near-tie-band only, max gap
   0.188 nats, 0 forward-divergent; backend proof 16/16 ops selections>0 with
@@ -1083,3 +1106,25 @@ sweeps 4/4 (515/515), backend suite 71/71 (524,439 assertions), 0.8B
 vehicle gate 16/16 with 0 forward-divergent. W3 — the 27B e2e gate
 rerun — is the remaining W4d wave. The row stays `ACTIVE`.
 The row stays `ACTIVE`: W4d is the open scope.
+AMENDED 2026-09-13 (fifteenth): W4d is complete and landed on `main`
+(e61f2b106, #3183, with #3161 and #3165). The 27B e2e gate is GREEN:
+16/16 prompts greedy-exact on the P150 (gfx1151), 0 forward-divergent,
+max logit gap 0.062 nats inside the near-tie band (500), backend proof
+device type 6, 0 declines, captured decode, knob-free at run time
+(`VT_TT_KEEPQUANT_INT8DOT=1` is the recorded recipe lever and stays
+default-off; `max_model_len=1024` is gate-wired). Three root-caused
+waves carried it: the placement probe (the empty TT `ResidencyPolicy`
+silently landed every qwen3.8 checkpoint on CPU, #3165), the packed
+GDN byte reorder (V-head reorder permutes the packed bytes and decodes
+via keep-quant words; slot residency 23.8 → 7.7 GiB), and the W6
+int8-dot captured decode (all captured keep-quant matmuls, bf16-out
+arms via an explicit f32→bf16 cast; word shadows stage at load; the
+per-request logits gather is vLLM semantics). Neither fix alone
+sufficed; the pair does. The W5 premise was falsified: the 606 MiB ask
+was the lm_head weight-dequant chunk, not a logits plane (amended in
+`tenstorrent-27b-decode-shape-capture.md`); the eager arm is not a
+system (40–70 s/token, an 8-hour bootstrap died at SIGTERM), W6 is the
+designed answer and landed. Still owed on this row: the 27B throughput
+benchmark on the P150 (in flight), the int8-dot e2e anchor on the 0.8B,
+the embed-table dequantizing gather, and the `ssm_out` block-safe
+column permutation. The row stays `ACTIVE`.
