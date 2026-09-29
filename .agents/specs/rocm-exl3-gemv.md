@@ -94,4 +94,32 @@ capture-safety rules). Instantiated for the same (bits, cb) set as the CUDA arm.
 
 ## Outcome
 
-(filled at DONE)
+Landed 2026-09-30 on row/BACKEND-ROCM at base ee622a899.
+
+Gates 1, 2, 3, 5: PASS on gfx1101. test_exl3_rocm_gemv — all eight instantiated
+arms at rel RMS 6.5e-4..7.2e-4 vs the f64 reference (bound 6.0e-3), sibling
+arms >100x, force_gemv=0 byte-equal to the CPU arm, unforced mode-1 dispatch
+reaches the GEMV. test_exl3_rocm — byte gate preserved under force_gemv=0.
+test_exl3_rocm_recon — nine arms at m=256 plus m=145 and m=1024 cases at rel
+RMS ~3.1e-4 (bound 1.0e-3). The only defect the tier-3c gate caught: the
+4-bit funnel window was built with operands swapped
+(`__funnelshift_r(a, b, 20)` for the donor's `fshift(b, a, 20)`); every 4-bit
+arm measured ~0.89 relative RMS until it was fixed to `fshift(b, a, 20)`.
+
+Gate 4: PARTIAL. Serving Qwen3.5-9B-EXL3-4.00bpw on :8420 measured 3.30 /
+12.27 / 21.93 tok/s aggregate at c=1/4/8 against the recorded 1.75 / 5.90 /
+8.91 baseline (1.9x / 2.1x / 2.5x) — but this required fixing the container:
+the compose service named `render` in group_add while the host render GID is
+992, so /dev/kfd was unreachable, the engine had silently fallen back to CPU,
+and the stored baseline was CPU-side. Token correctness held (greedy decode
+coherent across 128 tokens). rocprofv3 on the fixed stack shows Exl3GemvK
+dispatching in production decode (896 calls, ~0.14s) but Exl3GemmK still at
+90.35% of kernel time (2.11s over 712 calls) — the <10% projection did NOT
+hold on this checkpoint. Attribution: the checkpoint is mixed-bitwidth
+(lm_head at 6bpw is uninstantiated → always Exl3GemmK, n=248320) and the
+decode-batch + GDN/mid-m shapes decline the arm; the residual is a new
+candidate gap, not a defect in the landed arm.
+
+Rejected: WMMA stays evaluation-only behind VT_ROCM_EXL3_WMMA (spec default);
+the fused M>=1024 reconstruct arm was not ported — the unfused chain covers
+all m with no measurable loss at this row's serving scale.
