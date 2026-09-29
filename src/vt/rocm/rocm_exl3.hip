@@ -67,8 +67,27 @@
 #include "vt/ops.h"
 #include "vt/rocm/rocm_device_bind.h"
 #include "vt/rocm/rocm_f16_codec.h"
+#include "vt/rocm/rocm_exl3_decode.h"
 
 namespace vt::rocm {
+// The m<=8 GEMV arm lives in rocm_exl3_gemv.hip (spec
+// .agents/specs/rocm-exl3-gemv.md): upstream's own `exl3_gemv_kernel.cuh`
+// geometry, ROCm-ported via exllamav3-rocm. It writes the same f32 `raw`
+// scratch, so step 3 below is unchanged whichever arm runs step 2. A false
+// return is a DECLINE — the same contract the CUDA arm's `Exl3GemvTryLaunch`
+// carries — and the call falls through to `Exl3GemmK`.
+bool Exl3GemvTryLaunchRocm(hipStream_t st, const Tensor& a_had, const Tensor& trellis,
+                           float* raw, int size_m, int size_k, int size_n, int device,
+                           const Exl3GemmArgs& args);
+
+// The had_r_128 stages, callable by the reconstruct+GEMM arm in
+// rocm_exl3_recon.hip, which runs the same transform before and after its
+// hipBLAS GEMM. `half_in`/`half_out` select among the four instantiations the
+// fused path uses; anything else is refused rather than silently widened.
+void Exl3LaunchHadRocm(hipStream_t st, void* out, const void* in, const uint16_t* pre,
+                       const uint16_t* post, float r_scale, int64_t rows, int64_t cols,
+                       bool half_in, bool half_out);
+
 namespace {
 
 inline void Check(hipError_t err, const char* what) {
@@ -98,95 +117,12 @@ __device__ inline float NegBySignBit(float v) {
 __device__ inline uint16_t MulF16(uint16_t a, uint16_t b) {
   return DF32ToF16(DF16ToF32(a) * DF16ToF32(b));
 }
+// ─── the trellis decode lives in rocm_exl3_decode.h ─────────────────────────
+// Exl3TileCodeword / Exl3DecodeCodeword / Exl3TileRowMajorIndex, shared with
+// rocm_exl3_recon.hip (the reconstruct+GEMM arm) so the two ops an EXL3
+// checkpoint decodes through read identical codebooks rather than two
+// drifting copies.
 
-// cpu_exl3_dequant.cpp RoundHalf.
-__device__ inline float RoundHalf(float v) { return DF16ToF32(DF32ToF16(v)); }
-
-// ─── the trellis decode (cpu_exl3_dequant.cpp) ───────────────────────────────
-
-// The tile's uint32 view (exl3_dq.cuh:25-26), assembled by hand so the trellis
-// may sit at any alignment inside the loaded buffer.
-__device__ inline uint32_t TileWord32(const uint16_t* tile, int index) {
-  return static_cast<uint32_t>(tile[2 * index]) |
-         (static_cast<uint32_t>(tile[2 * index + 1]) << 16);
-}
-
-// Exl3TileCodeword, verbatim. `+ 256*bits` keeps the tail-biting wrap
-// non-negative; the `% words32` on the word index is the wrap itself.
-__device__ inline uint16_t TileCodeword(const uint16_t* tile, int bits, int t) {
-  const int words32 = bits * 256 / 32;
-  const int b0 = t * bits + bits - 16 + 256 * bits;
-  const int b1 = b0 + 16;
-  const int i0 = b0 / 32;
-  const int i1 = (b1 - 1) / 32;
-  const int s0 = (i1 + 1) * 32 - b1;
-  const uint32_t a = TileWord32(tile, i0 % words32);
-  const uint32_t b = TileWord32(tile, i1 % words32);
-  const uint64_t merged = (static_cast<uint64_t>(a) << 32) | b;
-  return static_cast<uint16_t>((merged >> s0) & 0xffffu);
-}
-
-// Exl3DecodeCodeword (codebook.cuh:56-90). All THREE codebooks, because an AMD
-// box has no reason to see fewer artifacts than an NVIDIA one:
-//   cb 0  3INST, the DEFAULT — a checkpoint that ships neither an `mcg` nor a
-//         `mul1` marker lands here, which is every stock turboderp/*-exl3
-//   cb 1  MCG, which the SparkInfer DeepSeek-V4 artifact marks
-//   cb 2  mul1, a DIFFERENT SHAPE and not a third multiplier: the product's four
-//         UNSIGNED BYTES are summed into a fixed accumulator, the sum is
-//         REINTERPRETED as an fp16 bit pattern, and an fp16 affine map turns it
-//         into the codebook value
-// `codebook` is validated on the host before launch, so there is no fall-off arm
-// here; a device VT_CHECK does not exist and a silent wrong decode is exactly
-// the failure this family documents (right distribution, no correlation).
-__device__ inline float DecodeCodeword(uint16_t codeword, int codebook) {
-  uint32_t x = static_cast<uint32_t>(codeword);
-  if (codebook == 2) {
-    x *= 0x83DCD12Du;
-    // `__dp4a(x, 0x01010101u, acc)` == acc + the four UNSIGNED bytes of x.
-    // Scalar here for the same reason rocm_grouped_gemm.hip's Dp4a is scalar:
-    // integer arithmetic is exact either way, and v_dot4 is a perf lever, not a
-    // correctness requirement.
-    const uint32_t byte_sum = (x & 0xffu) + ((x >> 8) & 0xffu) + ((x >> 16) & 0xffu) +
-                              ((x >> 24) & 0xffu);
-    // 0x6400 is chosen so the reinterpretation is EXACT: the fp16 binade
-    // [1024, 2048) has an ULP of exactly 1.0 and the byte sum is at most 1020,
-    // so the pattern never leaves that binade.
-    const uint32_t sum = 0x6400u + byte_sum;
-    const float h = DF16ToF32(static_cast<uint16_t>(sum));
-    // BIT PATTERNS, not the rounded decimals upstream's comments carry: 0x1eee
-    // is 887/131072 and 0xc931 is -1329/128.
-    const float k_inv = DF16ToF32(static_cast<uint16_t>(0x1eeeu));
-    const float k_bias = DF16ToF32(static_cast<uint16_t>(0xc931u));
-    // Upstream ends in __hfma, ONE rounding. Evaluating the product and the sum
-    // separately in f32 reproduces it exactly (the CPU arm proves why over all
-    // 1021 reachable sums), and -ffp-contract=off keeps the compiler from
-    // fusing them into a different single rounding.
-    return RoundHalf(h * k_inv + k_bias);
-  }
-  if (codebook == 0) {
-    x *= 89226354u;
-    x += 64248484u;
-  } else {
-    x *= 0xCBAC1FEDu;
-  }
-  x = (x & 0x8fff8fffu) ^ 0x3b603b60u;
-  const float lo = DF16ToF32(static_cast<uint16_t>(x & 0xffffu));
-  const float hi = DF16ToF32(static_cast<uint16_t>(x >> 16));
-  return RoundHalf(lo + hi);  // __hadd: the sum is taken in fp16
-}
-
-// Exl3TileRowMajorIndex (quantize.py:28-42). `t / 8` is the tensor-core lane,
-// `t % 8` its eight fragment slots. The host's kRowOffset[8] = {0,1,8,9,0,1,8,9}
-// is written as arithmetic here so no constant array lands in scratch.
-__device__ inline int TileRowMajorIndex(int t) {
-  const int lane = t >> 3;
-  const int sub = t & 7;
-  const int q = sub & 3;
-  const int row_offset = q < 2 ? q : q + 6;  // 0,1,8,9
-  const int r = (lane % 4) * 2 + row_offset;
-  const int c = lane / 4 + (sub < 4 ? 0 : 8);
-  return r * 16 + c;
-}
 
 // ─── step 1 and step 3: had_r_128 ────────────────────────────────────────────
 //
@@ -333,7 +269,8 @@ __global__ void Exl3GemmK(float* __restrict__ raw, const uint16_t* __restrict__ 
   for (int64_t ti = 0; ti < k / 16; ++ti) {
     const uint16_t* tp = trellis + (ti * tiles_n + tj) * tile_words;
     __syncthreads();  // the previous iteration's readers are done with `tile`
-    tile[TileRowMajorIndex(tid)] = DecodeCodeword(TileCodeword(tp, bits, tid), codebook);
+    tile[Exl3TileRowMajorIndex(tid)] =
+        Exl3DecodeCodeword(Exl3TileCodeword(tp, bits, tid), codebook);
     __syncthreads();
     if (live) {
       const uint16_t* arow = ah + row * k + ti * 16;
@@ -381,6 +318,22 @@ float* EnsureRawScratch(size_t need, hipStream_t s) {
 
 }  // namespace
 
+void Exl3LaunchHadRocm(hipStream_t st, void* out, const void* in, const uint16_t* pre,
+                       const uint16_t* post, float r_scale, int64_t rows, int64_t cols,
+                       bool half_in, bool half_out) {
+  if (half_in && half_out) {
+    LaunchHad<true, true>(out, in, pre, post, r_scale, rows, cols, st);
+  } else if (!half_in && half_out) {
+    LaunchHad<false, true>(out, in, pre, post, r_scale, rows, cols, st);
+  } else if (!half_in && !half_out) {
+    LaunchHad<false, false>(out, in, pre, post, r_scale, rows, cols, st);
+  } else {
+    throw std::runtime_error(
+        "vt rocm exl3: had_r_128 has no f16-in/f32-out arm; the three instantiated "
+        "pairs are (f16,f16), (f32,f32) and (f32,f16)");
+  }
+}
+
 // The fused chain, step for step as Exl3GemmKernelCpu runs it:
 //   1. A_had = had_r_128(A, pre_scale = suh)
 //   2. C_raw = A_had @ reconstruct(trellis)        [f32 accumulation]
@@ -412,15 +365,31 @@ void Exl3GemmKernelRocm(Queue& q, Tensor& c, const Tensor& a, const Tensor& trel
   LaunchHad<true, true>(a_had.data, a.data, suh.Ptr<uint16_t>(), nullptr, kInvSqrt128, m, k,
                         st);
 
-  // 2. the matmul against the decoded trellis, f32 accumulators.
+  // 2. the matmul against the decoded trellis. The m<=8 GEMV arm is tried
+  // first — the same order Exl3GemmKernelCuda runs its Exl3GemvTryLaunch —
+  // and a decline falls through to the byte-exact transcription below. Both
+  // arms write `raw` in f32, so step 3 is identical whichever ran step 2.
   float* raw = EnsureRawScratch(static_cast<size_t>(m) * static_cast<size_t>(n) * sizeof(float),
                                 st);
-  const unsigned gx = static_cast<unsigned>(n / 16);
-  const unsigned gy = static_cast<unsigned>((m + 15) / 16);
-  Exl3GemmK<<<dim3(gx, gy), 256, 0, st>>>(raw, a_had.Ptr<uint16_t>(),
-                                          trellis.Ptr<uint16_t>(), m, k, n, args.bits,
-                                          args.codebook);
-  Check(hipGetLastError(), "exl3_gemm");
+  const bool gemv =
+      Exl3GemvTryLaunchRocm(st, a_had, trellis, raw, static_cast<int>(m),
+                            static_cast<int>(k), static_cast<int>(n), q.device.index, args);
+  if (!gemv && args.force_gemv > 0) {
+    throw std::runtime_error(
+        "vt rocm exl3: exl3_gemm was asked to force the m<=8 GEMV arm (force_gemv=1) but "
+        "the arm declined: bits " + std::to_string(args.bits) + " codebook " +
+        std::to_string(args.codebook) + " m " + std::to_string(m) + " k " +
+        std::to_string(k) + " n " + std::to_string(n) +
+        ". Upstream's own direct entry point refuses the same way (exl3_gemv.cu:238).");
+  }
+  if (!gemv) {
+    const unsigned gx = static_cast<unsigned>(n / 16);
+    const unsigned gy = static_cast<unsigned>((m + 15) / 16);
+    Exl3GemmK<<<dim3(gx, gy), 256, 0, st>>>(raw, a_had.Ptr<uint16_t>(),
+                                           trellis.Ptr<uint16_t>(), m, k, n, args.bits,
+                                           args.codebook);
+    Check(hipGetLastError(), "exl3_gemm");
+  }
 
   // 3. the output transform — had_ff for an f32 C, had_fh for an fp16 one, the
   // same two arms the CPU reference picks between off `c.dtype`.

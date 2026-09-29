@@ -3103,6 +3103,13 @@ vllm_cpp_add_test(test_exl3_moe vt/test_exl3_moe.cpp)
 # only under VLLM_CPP_HIP -- its cases skip when no ROCm backend is registered,
 # and a suite that only a HIP build compiles is a suite CI never reads.
 vllm_cpp_add_test(test_exl3_rocm vt/test_exl3_rocm.cpp)
+# BACKEND-ROCM (rocm-exl3-gemv spec): the m<=8 GEMV arm and its dispatch on
+# ROCm. Same always-built rule as its sibling above -- cases skip without a
+# ROCm backend.
+vllm_cpp_add_test(test_exl3_rocm_gemv vt/test_exl3_rocm_gemv.cpp)
+# Same spec, slice B: the reconstruct+hipBLAS arm (the M>144 dispatch) on ROCm.
+# The always-built rule applies again -- it skips without a ROCm backend.
+vllm_cpp_add_test(test_exl3_rocm_recon vt/test_exl3_rocm_recon.cpp)
 # BACKEND-VULKAN-EXL3 (#2530): the Vulkan arms of the same two ops. Built in
 # EVERY configuration for the same reason as the ROCm sibling above -- its cases
 # skip when no Vulkan backend is registered. UNLIKE that sibling this suite needs
