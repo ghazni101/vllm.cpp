@@ -80,6 +80,27 @@ bool Exl3GemvTryLaunchRocm(hipStream_t st, const Tensor& a_had, const Tensor& tr
                            float* raw, int size_m, int size_k, int size_n, int device,
                            const Exl3GemmArgs& args);
 
+// Spec rocm-exl3-gemv-residual: the dot arm (rocm_exl3_dot.hip) — a fused
+// decode+dot kernel at every width 1..8, for shapes the upstream GEMV
+// envelope declines (bits > 4 included) and for mid-m through 8-row chunks.
+bool Exl3DotTryLaunchRocm(hipStream_t st, const Tensor& a_had, const Tensor& trellis,
+                          float* raw, int size_m, int size_k, int size_n, int device,
+                          const Exl3GemmArgs& args);
+bool Exl3DotChunkedTryLaunchRocm(hipStream_t st, const Tensor& a_had,
+                                 const Tensor& trellis, float* raw, int size_m,
+                                 int size_k, int size_n, int device,
+                                 const Exl3GemmArgs& args);
+
+// The reconstruct+hipBLAS arm (rocm_exl3_recon.hip), registered as
+// kExl3ReconstructGemm and reused here for shapes the fused path cannot
+// accelerate: bits > 4 (the 6 bpw lm_head) and mid-m prefill. An EMPTY
+// w_scratch selects its persistent per-stream scratch, matching the contract
+// include/vt/ops.h documents for the registered entry.
+void Exl3ReconstructGemmKernelRocm(Queue& q, Tensor& c, const Tensor& a,
+                                   const Tensor& trellis, const Tensor& suh,
+                                   const Tensor& svh, Tensor& a_had,
+                                   Tensor& w_scratch, const Exl3GemmArgs& args);
+
 // The had_r_128 stages, callable by the reconstruct+GEMM arm in
 // rocm_exl3_recon.hip, which runs the same transform before and after its
 // hipBLAS GEMM. `half_in`/`half_out` select among the four instantiations the
@@ -361,19 +382,72 @@ void Exl3GemmKernelRocm(Queue& q, Tensor& c, const Tensor& a, const Tensor& trel
 
   hipStream_t st = AsStream(q);
 
+  // Spec rocm-exl3-gemv-residual, R2/R3: shapes the fused path cannot run
+  // fast delegate BEFORE the input transform, because the reconstruct arm
+  // runs Hadamard stages of its own. All of them honour VT_EXL3_GEMV=0 (and
+  // force_gemv=0 via the ops layer): mode 0 means the byte-exact
+  // transcription for EVERY shape on this backend.
+  const bool fast_paths = args.force_gemv != 0 &&
+                          (Exl3GemvMode() != 0 || args.force_gemv > 0);
+  // R3: shapes upstream's GEMV envelope cannot express — this checkpoint's
+  // 6 bpw lm_head, uninstantiated (bits, cb) — take the dot arm (fused
+  // decode+dot, capture-safe, all widths) instead of the transcription.
+  // The reconstruct arm stays for mid-m above the chunk cap; routing
+  // m<=8+chunks to recon was tried first and measured ~40 ms/token on the
+  // lm_head (decode to fp16 scratch + hipBLAS is 2.5x the trellis traffic).
+  const bool dot_shape = (k % 128 == 0) && (n % 128 == 0);
+  const bool want_recon =
+      fast_paths && args.force_gemv <= 0 && m > 32 && dot_shape;
+  if (want_recon) {
+    // Mid-m above the chunked cap: B would be re-read per 8-row chunk, so
+    // past 32 rows the one-pass decode + hipBLAS GEMM wins.
+    Tensor w_scratch;  // empty: the arm's persistent per-stream scratch
+    Exl3ReconstructGemmKernelRocm(q, c, a, trellis, suh, svh, a_had, w_scratch, args);
+    return;
+  }
+
   // 1. the input transform, into the caller's scratch (which may alias A).
   LaunchHad<true, true>(a_had.data, a.data, suh.Ptr<uint16_t>(), nullptr, kInvSqrt128, m, k,
                         st);
 
   // 2. the matmul against the decoded trellis. The m<=8 GEMV arm is tried
   // first — the same order Exl3GemmKernelCuda runs its Exl3GemvTryLaunch —
-  // and a decline falls through to the byte-exact transcription below. Both
-  // arms write `raw` in f32, so step 3 is identical whichever ran step 2.
+  // then the dot arm for shapes outside its envelope, then the 8-row
+  // chunked variants for 8 < m <= 32 (spec R2a); a decline falls through
+  // to the byte-exact transcription below. All of them write `raw` in f32,
+  // so step 3 is identical whichever ran step 2.
   float* raw = EnsureRawScratch(static_cast<size_t>(m) * static_cast<size_t>(n) * sizeof(float),
                                 st);
-  const bool gemv =
-      Exl3GemvTryLaunchRocm(st, a_had, trellis, raw, static_cast<int>(m),
-                            static_cast<int>(k), static_cast<int>(n), q.device.index, args);
+  bool gemv = false;
+  // VT_EXL3_DOT_FIRST=1 is an A/B lever, not a contract: it asks for the dot
+  // kernel BEFORE the m<=8 GEMV so its own numbers (it reads each trellis
+  // word once and carries no prefetch-ring bookkeeping) can be compared
+  // against the emulated-fragment arm on real serving. Default keeps
+  // upstream's order.
+  static const bool kDotFirstEnv = [] {
+    const char* env = std::getenv("VT_EXL3_DOT_FIRST");
+    return env && std::atoi(env) != 0;
+  }();
+  const bool dot_first = fast_paths && kDotFirstEnv;
+
+  if (m <= kExl3GemvMaxM) {
+    if (dot_first && dot_shape)
+      gemv = Exl3DotTryLaunchRocm(st, a_had, trellis, raw, static_cast<int>(m),
+                                  static_cast<int>(k), static_cast<int>(n),
+                                  q.device.index, args);
+    if (!gemv)
+      gemv = Exl3GemvTryLaunchRocm(st, a_had, trellis, raw, static_cast<int>(m),
+                                   static_cast<int>(k), static_cast<int>(n),
+                                   q.device.index, args);
+    if (!gemv && fast_paths && dot_shape)
+      gemv = Exl3DotTryLaunchRocm(st, a_had, trellis, raw, static_cast<int>(m),
+                                  static_cast<int>(k), static_cast<int>(n),
+                                  q.device.index, args);
+  } else if (fast_paths && dot_shape && m <= 32) {
+    gemv = Exl3DotChunkedTryLaunchRocm(st, a_had, trellis, raw, static_cast<int>(m),
+                                       static_cast<int>(k), static_cast<int>(n),
+                                       q.device.index, args);
+  }
   if (!gemv && args.force_gemv > 0) {
     throw std::runtime_error(
         "vt rocm exl3: exl3_gemm was asked to force the m<=8 GEMV arm (force_gemv=1) but "

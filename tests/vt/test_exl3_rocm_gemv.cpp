@@ -264,3 +264,152 @@ TEST_CASE("exl3 rocm gemv: the default dispatch reaches the GEMV at mode 1") {
           " outputs byte-equal to the forced launch");
   CHECK(same == unforced.size());
 }
+
+// ─── spec rocm-exl3-gemv-residual: the three residual shapes ────────────────
+//
+// The rocprofv3 trace that filed ISSUE-LOCAL-01M3RM2TM98FY569AZ6CEASBD3 found
+// Exl3GemmK still owned 91% of decode kernel time on this checkpoint because
+// (a) the upstream selector declines k=4096/n=4096/cb1 at 4 bpw, (b) the 6 bpw
+// lm_head is outside the GEMV envelope, and (c) m in (8, 144] had no arm at
+// all. These cases pin each fix against a DETECTABLE wrong arm: on this
+// backend the transcription is byte-equal to the CPU arm, so a GEMV or recon
+// result that differs from it proves the fast path ran, and equality to the
+// forced launch proves WHICH fast path ran.
+
+TEST_CASE("exl3 rocm gemv: upstream-declined (4,1) shape takes the forced cfg") {
+  if (!HasRocmExl3()) {
+    CHECK_FALSE(vt::OpRegistered(vt::OpId::kExl3Gemm, vt::DeviceType::kROCM));
+    return;
+  }
+  vt::Backend& be = vt::GetBackend(vt::DeviceType::kROCM);
+  vt::Queue hq = vt::GetBackend(vt::DeviceType::kCPU).CreateQueue();
+
+  // The exact decline the trace recorded: k=4096 n=4096 (4,1) falls through
+  // every branch of Exl3GemvSelectConfig at mode 1 (size_n/32=128 >
+  // narrow_coresident, size_n < 8192) — upstream returns -1 and the CUDA arm
+  // would run its tensor-core GEMM. Assert the selector STILL returns -1 (the
+  // function is kept upstream-verbatim) and that the unforced launch now
+  // lands the GEMV arm anyway, byte-equal to the forced one.
+  CHECK(vt::Exl3GemvSelectConfig(vt::Exl3Cc::kAda, 1, 4096, 4096, 4, 1,
+                                 /*mode=*/1, /*narrow_coresident=*/0) == -1);
+
+  Exl3Fixture f = MakeFixture(4096, 4096, 4, 0x9EEDEDu);
+  const int64_t m = 1;
+  std::vector<uint16_t> a(static_cast<size_t>(m * f.k));
+  Rng rng;
+  for (auto& v : a) v = vt::F32ToF16(rng.next(1.0f));
+
+  const std::vector<uint16_t> ref = CpuArm(f, hq, a, m, /*codebook=*/1);
+  const std::vector<uint16_t> scalar = RocmArm(be, f, a, m, 1, /*force_gemv=*/0);
+  const std::vector<uint16_t> unforced = RocmArm(be, f, a, m, 1, /*force_gemv=*/-1);
+  const std::vector<uint16_t> forced = RocmArm(be, f, a, m, 1, /*force_gemv=*/1);
+
+  size_t scalar_eq = 0, unf_eq_forced = 0;
+  for (size_t i = 0; i < ref.size(); ++i) {
+    if (scalar[i] == ref[i]) ++scalar_eq;
+    if (unforced[i] == forced[i]) ++unf_eq_forced;
+  }
+  MESSAGE("(4,1) k=4096 n=4096: scalar byte-equal to CPU ", scalar_eq, " of ", ref.size(),
+          "; unforced == forced at ", unf_eq_forced);
+  CHECK(scalar_eq == ref.size());      // the transcription is still byte-exact
+  CHECK(unf_eq_forced == ref.size());  // the fallback cfg reached the GEMV arm
+
+  vt::GetBackend(vt::DeviceType::kCPU).DestroyQueue(hq);
+}
+
+TEST_CASE("exl3 rocm gemv: mid-m chunked GEMV meets tier 3c") {
+  if (!HasRocmExl3()) {
+    CHECK_FALSE(vt::OpRegistered(vt::OpId::kExl3Gemm, vt::DeviceType::kROCM));
+    return;
+  }
+  vt::Backend& be = vt::GetBackend(vt::DeviceType::kROCM);
+  vt::Queue hq = vt::GetBackend(vt::DeviceType::kCPU).CreateQueue();
+
+  // m in (8, 32] exercises the 8-row chunk loop — 9 is the smallest mid-m,
+  // 21 the recorded prefill shape, 32 the cap's edge. m=33 routes to the
+  // reconstruct arm and is asserted NOT byte-equal to the transcription the
+  // same way (recon's own suite holds its 1.0e-3 bound).
+  for (const int64_t m : {9, 21, 32, 33}) {
+    CAPTURE(m);
+    Exl3Fixture f = MakeFixture(2048, 4096, 4, 0x51CE00u + static_cast<uint32_t>(m));
+    std::vector<uint16_t> a(static_cast<size_t>(m * f.k));
+    Rng rng;
+    for (auto& v : a) v = vt::F32ToF16(rng.next(1.0f));
+
+    const std::vector<uint16_t> ref = CpuArm(f, hq, a, m, /*codebook=*/1);
+    const std::vector<uint16_t> scalar = RocmArm(be, f, a, m, 1, /*force_gemv=*/0);
+    const std::vector<uint16_t> got = RocmArm(be, f, a, m, 1, /*force_gemv=*/-1);
+
+    size_t scalar_eq = 0, fast_diff = 0;
+    double sq = 0.0, rq = 0.0;
+    for (size_t i = 0; i < ref.size(); ++i) {
+      if (scalar[i] == ref[i]) ++scalar_eq;
+      if (got[i] != scalar[i]) ++fast_diff;
+      const double r = vt::F16ToF32(ref[i]);
+      const double g = vt::F16ToF32(got[i]);
+      sq += (g - r) * (g - r);
+      rq += r * r;
+    }
+    const double rel =
+        std::sqrt(sq / static_cast<double>(ref.size())) /
+        std::sqrt(rq / static_cast<double>(ref.size()));
+    MESSAGE("m=", m, " (4,1): rel RMS ", rel,
+            ", fast arm differs from the transcription at ", fast_diff, " of ",
+            ref.size());
+    CHECK(scalar_eq == ref.size());               // force_gemv=0 is still the byte arm
+    CHECK(rel <= (m <= 32 ? 6.0e-3 : 1.0e-2));    // chunked dot / recon bound
+    // The dot arm accumulates in f32, so it is byte-NEARER the transcription
+    // than the fp16-fragment GEMV — a handful of differing outputs, not half
+    // of them, is what proves a fast arm ran.
+    CHECK(fast_diff > 0);
+  }
+
+  vt::GetBackend(vt::DeviceType::kCPU).DestroyQueue(hq);
+}
+
+TEST_CASE("exl3 rocm gemv: 6 bpw takes the reconstruct arm at every m") {
+  if (!HasRocmExl3()) {
+    CHECK_FALSE(vt::OpRegistered(vt::OpId::kExl3Gemm, vt::DeviceType::kROCM));
+    return;
+  }
+  vt::Backend& be = vt::GetBackend(vt::DeviceType::kROCM);
+  vt::Queue hq = vt::GetBackend(vt::DeviceType::kCPU).CreateQueue();
+
+  // The checkpoint's lm_head is 6 bpw cb 1 — outside upstream's GEMV envelope
+  // entirely. The residual spec routes it to the reconstruct+hipBLAS arm
+  // inside Exl3GemmKernelRocm, whose bound is 1.0e-3 rel RMS; m=1 is decode,
+  // m=8 the GEMV boundary, m=21 the recorded prefill shape.
+  for (const int64_t m : {1, 8, 21}) {
+    CAPTURE(m);
+    Exl3Fixture f = MakeFixture(256, 4096, 6, 0x6EAD0u + static_cast<uint32_t>(m));
+    std::vector<uint16_t> a(static_cast<size_t>(m * f.k));
+    Rng rng;
+    for (auto& v : a) v = vt::F32ToF16(rng.next(1.0f));
+
+    const std::vector<uint16_t> ref = CpuArm(f, hq, a, m, /*codebook=*/1);
+    const std::vector<uint16_t> scalar = RocmArm(be, f, a, m, 1, /*force_gemv=*/0);
+    const std::vector<uint16_t> got = RocmArm(be, f, a, m, 1, /*force_gemv=*/-1);
+
+    size_t scalar_eq = 0, fast_diff = 0;
+    double sq = 0.0, rq = 0.0;
+    for (size_t i = 0; i < ref.size(); ++i) {
+      if (scalar[i] == ref[i]) ++scalar_eq;
+      if (got[i] != scalar[i]) ++fast_diff;
+      const double r = vt::F16ToF32(ref[i]);
+      const double g = vt::F16ToF32(got[i]);
+      sq += (g - r) * (g - r);
+      rq += r * r;
+    }
+    const double rel =
+        std::sqrt(sq / static_cast<double>(ref.size())) /
+        std::sqrt(rq / static_cast<double>(ref.size()));
+    MESSAGE("bits=6 cb=1 m=", m, ": rel RMS ", rel,
+            ", dot arm differs from the transcription at ", fast_diff, " of ",
+            ref.size());
+    CHECK(scalar_eq == ref.size());  // bits 6 is still byte-exact off the fast path
+    CHECK(rel <= 1.0e-2);            // f32 accumulation, well inside tier 3
+    CHECK(fast_diff > 0);
+  }
+
+  vt::GetBackend(vt::DeviceType::kCPU).DestroyQueue(hq);
+}
