@@ -8,7 +8,7 @@
 | Host | `dgx:gpu0`, one GB10 with 128 GB unified memory, through an `rc` lease |
 | Branch | `row/BENCH-QWEN38-TENSORFOLD-GAP`, base `d15b1cc095694df69d8014ea6597582882e1bc1c` |
 | Integration | One pull request. The spec commit precedes implementation commits. |
-| Status | `SPIKE`; this document contains no locally measured TensorFold number yet |
+| Status | `BLOCKED_MISSING_ARTIFACTS`; the 2026-09-29 leased discovery produced no benchmark number |
 
 ## Scope
 
@@ -501,14 +501,54 @@ Implementation and evidence follow as separately reviewable commits. A fresh
 review is required before landing. No merge or push authority is inferred from
 approval to implement.
 
+## Outcome
+
+Task 4 / W1 stopped at its declared artifact prerequisite on 2026-09-29.
+A fresh successful lease executed the committed bounded discovery script on
+`dgx:gpu0`. Sanitized evidence retains only its SHA-256 lease fingerprint and
+raw marker receipt. The two documented staging paths were absent, and bounded
+`/workspace` searches to depth 3 found zero matches for the committed
+TensorFold/MiaAI/Vontra and MLX-MTP/Flash-Next-MTP patterns. This is not a claim
+of exhaustive host-wide absence. Required artifacts/source were not found in
+that retained scope, so the runner prerequisites could not be populated and
+measurement did not start.
+
+The outcome is `BLOCKED_MISSING_ARTIFACTS`, not a failed benchmark. No server,
+correctness gate, timed ladder, clock window, memory series, or profile ran; no
+number or ratio is admissible. Production vLLM remains the named denominator
+and is `NOT_RUN`: blocked discovery did not stage or inspect a runnable
+production-vLLM denominator.
+TensorFold publisher figures remain unverified. The independent GGUF artifact
+verdict is `BLOCKED_NO_MTP_WEIGHTS`: the committed 1,224-entry real-header
+manifest has only trunk blocks 0 through 47 and no name matching `mtp`, `nextn`,
+`draft`, `eh_proj`, `enorm`, or `hnorm`.
+
+Task 5/W2 is `NO_PORT_DECISION`: no incremental-QSA product edit is justified.
+Task 6/W3 is `BLOCKED_NO_MTP_WEIGHTS`. W4-W5 are `SKIPPED_NO_PROFILE`.
+Task 7/W6 completed synthesis as
+`SYNTHESIS_COMPLETED_NO_PRODUCT_OPTIMIZATION`, publishing these outcomes without
+a product optimization. Evidence:
+`.agents/evidence/bench-qwen38-tensorfold-gap/20260929T180547Z/`; public record:
+`docs/benchmarks/qwen38-tensorfold-gap.md`.
+
+## Now
+
+`BLOCKED_MISSING_ARTIFACTS`. Resume W1 only after the runner prerequisites are
+available in the documented/configured staging scope. Re-run
+executable correctness before any timing; do not reuse this blocker as profile
+evidence.
+
 ## Owed
 
-- W0 owes the TensorFold comparator record, row adoption, harness, and
-  fake-server tests, plus checker evidence if a new comparator surface is
-  required.
-- W1 owes the local denominator, profiles, and the measured target for W2 onward.
-- W2 through W6 are conditional on profiles and must record a refusal when their
-  premise is false.
-- The final wave owes `## Outcome` with defaults, rejected candidates, public
-  benchmark records, and either a valid matched-arm residual gap or an explicit
-  refusal to compute one.
+- W0 is delivered: comparator pin, ownership, endpoint harness, and launch/capture
+  runner are committed and focused tests pass.
+- W1 is blocked until required artifacts/source are available in the retained
+  documented/configured staging scope. Its 2026-09-29 attempt owes no number; on resume it
+  still owes correctness, ladders, clock windows, memory capture, and profiles.
+- Task 5 / W2 records `NO_PORT_DECISION`; no QSA product edit is justified
+  without the profile premise.
+- Task 6 / W3 is `BLOCKED_NO_MTP_WEIGHTS` for the selected GGUF.
+- W4-W5 are `SKIPPED_NO_PROFILE`.
+- Task 7 / W6 completed synthesis as
+  `SYNTHESIS_COMPLETED_NO_PRODUCT_OPTIMIZATION`: the public and agent benchmark
+  records carry the outcomes without a product optimization or cross-engine ratio.
