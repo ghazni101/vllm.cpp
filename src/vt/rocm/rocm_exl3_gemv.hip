@@ -538,8 +538,12 @@ __global__ __launch_bounds__(CFG == 0 ? 512 : 256) void Exl3GemvK(
   const int kslices = size_k / 16;
   const int num_groups = size_n / COLS;
 
-  const int chunk = (kslices + WK - 1) / WK;
-  const int ks0 = warp * chunk;
+  // Grid-level k-split: blockIdx.y owns slice blockIdx.y of gridDim.y k
+  // slices, and the warps split THAT sub-range. The C writeout becomes an
+  // atomicAdd whenever more than one block produces a partial per (m,col).
+  const int ksplit = gridDim.y;
+  const int chunk = (kslices + WK * ksplit - 1) / (WK * ksplit);
+  const int ks0 = (blockIdx.y * WK + warp) * chunk;
   const int myn = max(0, min(chunk, kslices - ks0));
 
   const uint32_t* B32 = reinterpret_cast<const uint32_t*>(B);
@@ -707,7 +711,180 @@ __global__ __launch_bounds__(CFG == 0 ? 512 : 256) void Exl3GemvK(
 #pragma unroll
       for (int j = 0; j < WK; ++j) sum += sh_red[j][r][c];
       const int col = group * COLS + c;
-      C[(size_t)r * size_n + col] = sum;
+      if (ksplit > 1)
+        atomicAdd(C + (size_t)r * size_n + col, sum);
+      else
+        C[(size_t)r * size_n + col] = sum;
+    }
+    __syncthreads();
+  }
+}
+
+// ─── the m=1 direct form (RDNA-specific, spec rocm-exl3-gemv-residual) ──────
+//
+// dq8's output already lands on the layout a one-token decode wants: lane l
+// decodes the four codewords of column l>>2 AND of column l>>2+8, at the k
+// quarter t = l&3. Upstream's fragment machinery then gathers every lane's
+// data to every other lane because the CUDA MMA's operand layout demands it —
+// for m=1 that machinery reduces to a dot product per (column, k quarter),
+// which v_dot2_f32_f16 does in one instruction per pair. Per warp-tile this
+// arm issues ~60 instructions where the fragment form issues ~350 (measured
+// SASS: 296 ds_bpermute + 256 pk_fma + 156 mov_b16 + 124 and per 4-slice),
+// and accumulates in f32 instead of the fragment's f16 — strictly nearer the
+// CPU reference, not looser.
+template <int bits, int cb>
+__global__ __launch_bounds__(512) void Exl3GemvM1K(
+    const half* __restrict__ A, const uint16_t* __restrict__ B, float* __restrict__ C,
+    int size_m, int size_k, int size_n) {
+  (void)size_m;  // m==1 is a launch-time fact; keeping the same arg list as
+                 // Exl3GemvK so the launcher shares one kargs block.
+  constexpr int WK = 16;   // k-split (warps per block)
+  constexpr int WNT = 2;   // adjacent n-tiles per warp
+  constexpr int PF = 4;    // prefetch ring depth
+  constexpr int COLS = WNT * 16;
+
+  constexpr int TWORDS = 8 * bits;                  // uint32 per 16x16 tile
+  constexpr int LOADS = bits == 2 ? WNT / 2 : WNT;  // warp loads per k-slice
+  constexpr int LSTRIDE = bits == 3 ? 24 : 32;      // uint32 per load
+  static_assert(bits != 2 || WNT % 2 == 0, "2 bpw packs two tiles per warp load");
+
+  const int warp = threadIdx.x / 32;
+  const int lane = threadIdx.x % 32;
+
+  const int ntiles = size_n / 16;
+  const int kslices = size_k / 16;
+  const int num_groups = size_n / COLS;
+
+  const int ksplit = gridDim.y;
+  const int chunk = (kslices + WK * ksplit - 1) / (WK * ksplit);
+  const int ks0 = (blockIdx.y * WK + warp) * chunk;
+  const int myn = max(0, min(chunk, kslices - ks0));
+
+  const uint32_t* B32 = reinterpret_cast<const uint32_t*>(B);
+  const size_t slice_stride = (size_t)ntiles * TWORDS;
+  const half2* A2 = reinterpret_cast<const half2*>(A);
+
+  // Per-lane extraction constants — the same formulas the fragment arm uses
+  // (dq8_aligned_2bits / dq8<3, cb, 4> in exl3_dq.cuh).
+  [[maybe_unused]] int x_src_a = 0, x_src_b = 0, x_s2 = 0;
+  if constexpr (bits == 2) {
+    int i1 = lane >> 1;
+    x_src_b = i1;
+    x_src_a = (i1 + 15) & 15;
+  }
+  if constexpr (bits == 3) {
+    int t_offset = lane << 3;
+    int b1 = (t_offset + 257) * 3;
+    int b2 = b1 + 21;
+    int i0 = (b1 - 16) / 32;
+    int i2 = (b2 - 1) / 32;
+    x_s2 = (i2 + 1) * 32 - b2;
+    x_src_a = i0 % 24;
+    x_src_b = i2 % 24;
+  }
+
+  __shared__ float sh_red[WK][COLS];
+
+  for (int group = blockIdx.x; group < num_groups; group += gridDim.x) {
+    const uint32_t* bp = B32 + (size_t)ks0 * slice_stride + group * WNT * TWORDS + lane;
+
+    auto ld_b = [&](int i, int l) -> uint32_t {
+      if constexpr (bits == 3)
+        return lane < 24 ? __builtin_nontemporal_load(bp + (size_t)i * slice_stride +
+                                                          l * LSTRIDE)
+                         : 0;
+      else
+        return __builtin_nontemporal_load(bp + (size_t)i * slice_stride + l * LSTRIDE);
+    };
+
+    uint32_t pf[PF][LOADS];
+#pragma unroll
+    for (int d = 0; d < PF; ++d)
+      if (d < myn)
+#pragma unroll
+        for (int l = 0; l < LOADS; ++l) pf[d][l] = ld_b(d, l);
+
+    // Two accumulators: acc0 for column l>>2, acc1 for column l>>2 + 8.
+    float acc0[WNT] = {}, acc1[WNT] = {};
+
+    for (int ib = 0; ib < myn; ib += PF) {
+#pragma unroll
+      for (int d = 0; d < PF; ++d) {
+        const int i = ib + d;
+        if (i >= myn) break;
+
+        uint32_t bw[LOADS];
+#pragma unroll
+        for (int l = 0; l < LOADS; ++l) bw[l] = pf[d][l];
+
+        if (i + PF < myn) {
+#pragma unroll
+          for (int l = 0; l < LOADS; ++l) pf[d][l] = ld_b(i + PF, l);
+        }
+
+        // A row 0's two half2s at this lane's k quarter — the same pair the
+        // fragment arm loads into a01/a23.
+        const size_t a_col = (size_t)(ks0 + i) * 8 + (lane & 3);
+        const half2 a01 = A2[a_col];
+        const half2 a23 = A2[a_col + 4];
+
+#pragma unroll
+        for (int t = 0; t < WNT; ++t) {
+          FragB f0, f1;
+          if constexpr (bits == 4) {
+            uint32_t aw = __shfl_sync(0xffffffffffffffffULL, bw[t], (lane + 31) & 31);
+            dq8_regs_4bits<cb>(aw, bw[t], f0, f1);
+          } else if constexpr (bits == 2) {
+            const uint32_t w = bw[t >> 1];
+            const int base = (t & 1) << 4;
+            uint32_t bwv = __shfl_sync(0xffffffffffffffffULL, w, base + x_src_b);
+            uint32_t awv = __shfl_sync(0xffffffffffffffffULL, w, base + x_src_a);
+            dq8_regs_2bits<cb>(awv, bwv, lane << 3, f0, f1);
+          } else {  // bits == 3
+            uint32_t awv = __shfl_sync(0xffffffffffffffffULL, bw[t], x_src_a);
+            uint32_t bwv = __shfl_sync(0xffffffffffffffffULL, bw[t], x_src_b);
+            dq8_regs_3bits<cb>(awv, bwv, x_s2, f0, f1);
+          }
+
+          // f0 -> column l>>2 (k pairs 2t/2t+1 and 2t+8/2t+9), f1 -> column
+          // l>>2+8, same k quarter. f32 accumulate via v_dot2_f32_f16.
+
+
+          acc0[t] = amd_mixed_dot(f0[0], a01, acc0[t], false);
+          acc0[t] = amd_mixed_dot(f0[1], a23, acc0[t], false);
+          acc1[t] = amd_mixed_dot(f1[0], a01, acc1[t], false);
+          acc1[t] = amd_mixed_dot(f1[1], a23, acc1[t], false);
+        }
+      }
+    }
+
+    // Fold the four lanes of each column (t bits of the lane id) and drop the
+    // pair into the block-level k reduction, which is the same shared-memory
+    // shape the fragment arm uses.
+    const int c0 = lane >> 2;
+#pragma unroll
+    for (int t = 0; t < WNT; ++t) {
+      float v0 = acc0[t], v1 = acc1[t];
+      v0 += __shfl_xor_sync(0xffffffffffffffffULL, v0, 1);
+      v0 += __shfl_xor_sync(0xffffffffffffffffULL, v0, 2);
+      v1 += __shfl_xor_sync(0xffffffffffffffffULL, v1, 1);
+      v1 += __shfl_xor_sync(0xffffffffffffffffULL, v1, 2);
+      if ((lane & 3) == 0) {
+        sh_red[warp][t * 16 + c0] = v0;
+        sh_red[warp][t * 16 + c0 + 8] = v1;
+      }
+    }
+    __syncthreads();
+
+    for (int idx = threadIdx.x; idx < COLS; idx += WK * 32) {
+      float sum = 0.0f;
+#pragma unroll
+      for (int j = 0; j < WK; ++j) sum += sh_red[j][idx];
+      const int col = group * COLS + idx;
+      if (ksplit > 1)
+        atomicAdd(C + col, sum);
+      else
+        C[col] = sum;
     }
     __syncthreads();
   }
@@ -721,6 +898,19 @@ constexpr bool GemvArmInstantiated(int bits, int cb) {
   // cb 1/2 only (cb 0 at those widths is refused upstream, exl3_gemv.cu:113).
   return (bits == 4 && (cb == 0 || cb == 1 || cb == 2)) ||
          ((bits == 2 || bits == 3) && (cb == 1 || cb == 2));
+}
+
+const void* GemvM1KernelFor(int bits, int cb) {
+  // The direct m=1 arm's instantiation set is the non-WMMA half of upstream's
+  // selector table minus its smem rows (this kernel stages nothing).
+#define VT_GEMV_M1(bits_, cb_)                                              \
+  if (bits == bits_ && cb == cb_)                                           \
+    return reinterpret_cast<const void*>(&Exl3GemvM1K<bits_, cb_>);
+  VT_GEMV_M1(4, 0) VT_GEMV_M1(4, 1) VT_GEMV_M1(4, 2)
+  VT_GEMV_M1(2, 1) VT_GEMV_M1(2, 2)
+  VT_GEMV_M1(3, 1) VT_GEMV_M1(3, 2)
+#undef VT_GEMV_M1
+  return nullptr;
 }
 
 const void* GemvKernelFor(int bits, int cb, int mmode, int cfg, bool smem, bool wmma) {
@@ -844,16 +1034,43 @@ bool Exl3GemvTryLaunchRocm(hipStream_t st, const Tensor& a_had, const Tensor& tr
   const int cfg = kCfgEnv >= 0 ? kCfgEnv
                                : (cfg0 >= 0 ? cfg0 : (size_n <= 8192 ? 0 : 1));
 
-  const void* kernel =
-      cfg == 0 ? narrow : GemvKernelFor(args.bits, args.codebook, mmode, cfg, smem, wmma);
+  // m=1 decode takes the direct arm: same launch geometry as cfg 0 but the
+  // fragment gather + fp16-fragment MMA replaced by four v_dot2_f32_f16 per
+  // lane-pair — ~6x fewer issued instructions per tile (SASS-measured), and
+  // f32 accumulation where the fragment arm used f16 pairs. The WMMA env
+  // still selects the WMMA evaluation arm for A/B completeness.
+  const void* kernel;
+  int block_dim, cols;
+  if (mmode == 0 && !wmma && kCfgEnv < 0) {
+    kernel = GemvM1KernelFor(args.bits, args.codebook);
+    block_dim = 512;
+    cols = 32;
+  } else {
+    kernel = cfg == 0 ? narrow
+                      : GemvKernelFor(args.bits, args.codebook, mmode, cfg, smem,
+                                      wmma);
+    block_dim = cfg == 0 ? 512 : 256;
+    cols = cfg == 0 ? 32 : 64;
+  }
   if (kernel == nullptr) return false;
 
-  const int block_dim = cfg == 0 ? 512 : 256;
-  const int cols = cfg == 0 ? 32 : 64;
   const int max_blocks = GemvOccupancyRocm(kernel, block_dim) * num_sms;
   const int grid = size_n / cols < max_blocks ? size_n / cols : max_blocks;
   if (grid < 1) return false;
 
+  // Grid-level k-split (the kernel halves its per-warp serial k-chain per
+  // extra blockIdx.y) is a bench lever first: VT_EXL3_GEMV_KSPLIT=N raises
+  // grid.y to N and pays one f32 atomicAdd per (m, stripe col) per slice.
+  // It stays OFF by default until serving measurements pick a value.
+  static const int kKsplitEnv = [] {
+    const char* e = std::getenv("VT_EXL3_GEMV_KSPLIT");
+    return e ? std::atoi(e) : 1;
+  }();
+  const int ksplit = std::max(
+      1, std::min(kKsplitEnv, (size_k / 16) / 16));
+  if (ksplit > 1)
+    CheckG(hipMemsetAsync(raw, 0, (size_t)size_m * size_n * sizeof(float), st),
+           "exl3_gemv ksplit zero");
   const half* a_ptr = a_had.Ptr<half>();
   const uint16_t* b_ptr = trellis.Ptr<uint16_t>();
   // Normal launch, not hipLaunchCooperativeKernel — adaptation 1. The kernel
@@ -861,7 +1078,9 @@ bool Exl3GemvTryLaunchRocm(hipStream_t st, const Tensor& a_had, const Tensor& tr
   void* kargs[] = {static_cast<void*>(&a_ptr),  static_cast<void*>(&b_ptr),
                    static_cast<void*>(&raw),    static_cast<void*>(&size_m),
                    static_cast<void*>(&size_k), static_cast<void*>(&size_n)};
-  CheckG(hipLaunchKernel(kernel, dim3(static_cast<unsigned>(grid)),
+  CheckG(hipLaunchKernel(kernel,
+                         dim3(static_cast<unsigned>(grid),
+                              static_cast<unsigned>(ksplit)),
                          dim3(static_cast<unsigned>(block_dim)), kargs, 0, st),
          "exl3_gemv launch");
   CheckG(hipGetLastError(), "exl3_gemv launch");
