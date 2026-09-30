@@ -150,11 +150,15 @@ __device__ __forceinline__ uint32_t LoadH2(const half* p) {
 // BITS is a template parameter: the checkpoint's 4 and 6 bpw decode with
 // compile-time shifts, and the generic arm (BITS==0) keeps runtime `bits`
 // for every width the templated instantiations do not cover.
-// Block = 512 threads (16 warps): each warp owns one 16-column tile of the
-// 16-tile group — double the GEMV arm's narrow block, which hides the same
-// L2 latency DotK pays per tile load.
+// Block = 256 threads (8 warps), ONE 16-column tile per block: the eight
+// warps split the tile's k-range 8 ways — the k-parallelism the GEMV arm
+// gets from its 16 warps is what this rebalances to, and it is what
+// measured the difference between ~60 and ~200 GB/s on the lm_head. Every
+// warp owns the SAME tile and a disjoint k-slice; the epilogue folds the
+// eight warp partials through LDS (a plain store when the host k-split is
+// 1, atomicAdd when several blocks each produced a partial).
 template <int BITS>
-__global__ __launch_bounds__(512) void Exl3DotK(
+__global__ __launch_bounds__(256) void Exl3DotK(
     const half* __restrict__ A, const uint16_t* __restrict__ B,
     float* __restrict__ C, int size_m, int size_k, int size_n, int bits_rt, int cb,
     int ksplit) {
@@ -164,13 +168,14 @@ __global__ __launch_bounds__(512) void Exl3DotK(
   const int ntiles = size_n >> 4;   // n/16 tile columns
   const int ktiles = size_k >> 4;   // k/16 tile rows
   const int words32 = bits * 8;     // u32 words per 16x16 tile
-  const int groups = (ntiles + 15) >> 4;
-  const int group = blockIdx.x % groups;
-  const int kslice = blockIdx.x / groups;
+  const int tile = blockIdx.x % ntiles;
+  const int kslice = blockIdx.x / ntiles;
 
-  // this block's k-tile range
-  const int chunk = (ktiles + ksplit - 1) / ksplit;
-  const int kt0 = kslice * chunk;
+  // This warp's k-tile range: host k-split slices sit inside the 8-way
+  // warp split — kslice*8+warp picks this warp's slice of
+  // ceil(ktiles / (ksplit*8)) tiles.
+  const int chunk = (ktiles + ksplit * 8 - 1) / (ksplit * 8);
+  const int kt0 = (kslice * 8 + warp) * chunk;
   const int kt1 = min(ktiles, kt0 + chunk);
 
   // per-lane codeword span (tail-biting, modulo words32)
@@ -179,10 +184,9 @@ __global__ __launch_bounds__(512) void Exl3DotK(
   const int i00 = (8 * lane * bits + bits - 16 + 256 * bits) >> 5;
   const int e0 = (8 * lane * bits + bits - 16 + 256 * bits) & 31;
   const uint32_t* B32 = reinterpret_cast<const uint32_t*>(B);
-  __shared__ float sh[16][8][16];  // [warp][m][col within tile]
+  __shared__ float sh[8][8][16];  // [warp][m][col within tile]
 
-  for (int tg = group * 16; tg < ntiles; tg += groups * 16) {
-    const int tile = tg + warp;
+  {
     float acc[8][2] = {};  // acc[m][col-half]: c = l/4 (+8)
     const int r0 = (lane & 3) * 2;
 
@@ -228,30 +232,30 @@ __global__ __launch_bounds__(512) void Exl3DotK(
               cw = Exl3SpanCodeword6(w, lane, s);
             wv[s] = Exl3DecodeCodeword(cw, cb);
           }
+          // Decoded weights are f16-exact (Exl3DecodeCodeword returns an
+          // fp16-rounded value), so the dot pairs run as PACKED f16 through
+          // amd_mixed_dot — v_dot2_f32_f16, which is a VOPD dual-issue
+          // candidate (V_DUAL_DOT2ACC_F32_F16): two pair-dots per issue
+          // slot, and half the FMA count of the scalar form.
+          half2 wv2[4];
+#pragma unroll
+          for (int q = 0; q < 4; ++q)
+            wv2[q] = __floats2half2_rn(wv[2 * q], wv[2 * q + 1]);
 
           const int kbase = kt * 16 + r0;
-          // r0+{0,1} and r0+{8,9} are adjacent fp16 pairs: two u32 loads
-          // per (tile, m) instead of eight scalar reads.
+          // r0+{0,1} and r0+{8,9} are adjacent fp16 pairs — one u32 load
+          // per pair, reinterpreted as half2 for the dot.
 #pragma unroll
           for (int mm = 0; mm < 8; ++mm) {
             if (mm >= size_m) break;
             const half* arow = A + (size_t)mm * size_k + kbase;
-            const uint32_t p01 = LoadH2(arow);
-            const uint32_t p89 = LoadH2(arow + 8);
-            const float av[4] = {
-                __half2float(__ushort_as_half(static_cast<uint16_t>(p01))),
-                __half2float(__ushort_as_half(static_cast<uint16_t>(p01 >> 16))),
-                __half2float(__ushort_as_half(static_cast<uint16_t>(p89))),
-                __half2float(__ushort_as_half(static_cast<uint16_t>(p89 >> 16)))};
+            const half2 a01 = __builtin_bit_cast(half2, LoadH2(arow));
+            const half2 a89 = __builtin_bit_cast(half2, LoadH2(arow + 8));
             // s<4 -> rows r0+q (q=s), col c0; s>=4 -> same rows, col c0+8.
-            acc[mm][0] = fmaf(wv[0], av[0], acc[mm][0]);
-            acc[mm][0] = fmaf(wv[1], av[1], acc[mm][0]);
-            acc[mm][0] = fmaf(wv[2], av[2], acc[mm][0]);
-            acc[mm][0] = fmaf(wv[3], av[3], acc[mm][0]);
-            acc[mm][1] = fmaf(wv[4], av[0], acc[mm][1]);
-            acc[mm][1] = fmaf(wv[5], av[1], acc[mm][1]);
-            acc[mm][1] = fmaf(wv[6], av[2], acc[mm][1]);
-            acc[mm][1] = fmaf(wv[7], av[3], acc[mm][1]);
+            acc[mm][0] = amd_mixed_dot(wv2[0], a01, acc[mm][0], false);
+            acc[mm][0] = amd_mixed_dot(wv2[1], a89, acc[mm][0], false);
+            acc[mm][1] = amd_mixed_dot(wv2[2], a01, acc[mm][1], false);
+            acc[mm][1] = amd_mixed_dot(wv2[3], a89, acc[mm][1], false);
           }
         }
       } else {
@@ -281,25 +285,20 @@ __global__ __launch_bounds__(512) void Exl3DotK(
             wv[s] = Exl3DecodeCodeword(Exl3SpanCodeword(w, e0, s, bits), cb);
 
           const int kbase = kt * 16 + r0;
+          half2 wv2[4];
+#pragma unroll
+          for (int q = 0; q < 4; ++q)
+            wv2[q] = __floats2half2_rn(wv[2 * q], wv[2 * q + 1]);
 #pragma unroll
           for (int mm = 0; mm < 8; ++mm) {
             if (mm >= size_m) break;
             const half* arow = A + (size_t)mm * size_k + kbase;
-            const uint32_t p01 = LoadH2(arow);
-            const uint32_t p89 = LoadH2(arow + 8);
-            const float av[4] = {
-                __half2float(__ushort_as_half(static_cast<uint16_t>(p01))),
-                __half2float(__ushort_as_half(static_cast<uint16_t>(p01 >> 16))),
-                __half2float(__ushort_as_half(static_cast<uint16_t>(p89))),
-                __half2float(__ushort_as_half(static_cast<uint16_t>(p89 >> 16)))};
-            acc[mm][0] = fmaf(wv[0], av[0], acc[mm][0]);
-            acc[mm][0] = fmaf(wv[1], av[1], acc[mm][0]);
-            acc[mm][0] = fmaf(wv[2], av[2], acc[mm][0]);
-            acc[mm][0] = fmaf(wv[3], av[3], acc[mm][0]);
-            acc[mm][1] = fmaf(wv[4], av[0], acc[mm][1]);
-            acc[mm][1] = fmaf(wv[5], av[1], acc[mm][1]);
-            acc[mm][1] = fmaf(wv[6], av[2], acc[mm][1]);
-            acc[mm][1] = fmaf(wv[7], av[3], acc[mm][1]);
+            const half2 a01 = __builtin_bit_cast(half2, LoadH2(arow));
+            const half2 a89 = __builtin_bit_cast(half2, LoadH2(arow + 8));
+            acc[mm][0] = amd_mixed_dot(wv2[0], a01, acc[mm][0], false);
+            acc[mm][0] = amd_mixed_dot(wv2[1], a89, acc[mm][0], false);
+            acc[mm][1] = amd_mixed_dot(wv2[2], a01, acc[mm][1], false);
+            acc[mm][1] = amd_mixed_dot(wv2[3], a89, acc[mm][1], false);
           }
         }
       }
@@ -312,34 +311,30 @@ __global__ __launch_bounds__(512) void Exl3DotK(
 #pragma unroll
       for (int h = 0; h < 2; ++h) {
         float v = acc[mm][h];
-          v += __shfl_xor_sync(0xffffffffffffffffULL, v, 1);
-          v += __shfl_xor_sync(0xffffffffffffffffULL, v, 2);
+        v += __shfl_xor_sync(0xffffffffffffffffULL, v, 1);
+        v += __shfl_xor_sync(0xffffffffffffffffULL, v, 2);
         if ((lane & 3) == 0) sh[warp][mm][(lane >> 2) + 8 * h] = v;
       }
     }
     __syncthreads();
 
-    // Warps 0 and 1 each write eight tiles of the 16-tile group — each
-    // (m, col) is still the sum over the warp that owned the tile, so the
-    // read IS the fold. Splitting the writeout halves the tail.
-    if (warp < 2) {
-      for (int wt = warp * 8; wt < warp * 8 + 8; ++wt) {
-        const int t = tg + wt;
-        if (t >= ntiles) break;
-        const int col0 = t * 16;
-        for (int i = lane; i < size_m * 16; i += 32) {
-          const int mm = i >> 4;
-          const int c = i & 15;
-          const float sum = sh[wt][mm][c];
-          const size_t off = (size_t)mm * size_n + col0 + c;
-          if (ksplit > 1)
-            atomicAdd(C + off, sum);
-          else
-            C[off] = sum;
-        }
+    // Fold the eight warps' partials for this one tile: every (m, col) sums
+    // sh[w][m][c] over w — the warp-split k-slices. Warp 0 owns the fold and
+    // the writeout; m*16 cells / 32 lanes is 4 passes at m=8.
+    if (warp == 0) {
+      const int col0 = tile * 16;
+      for (int i = lane; i < size_m * 16; i += 32) {
+        const int mm = i >> 4;
+        const int c = i & 15;
+        float sum = sh[0][mm][c] + sh[1][mm][c] + sh[2][mm][c] + sh[3][mm][c] +
+                    sh[4][mm][c] + sh[5][mm][c] + sh[6][mm][c] + sh[7][mm][c];
+        const size_t off = (size_t)mm * size_n + col0 + c;
+        if (ksplit > 1)
+          atomicAdd(C + off, sum);
+        else
+          C[off] = sum;
       }
     }
-    __syncthreads();
   }
 }
 
@@ -364,12 +359,12 @@ bool Exl3DotTryLaunchRocm(hipStream_t st, const Tensor& a_had, const Tensor& tre
   if (warp_size != 32) return false;  // the lane/col mapping is wave32
 
   const int ntiles = size_n / 16;
-  const int groups = (ntiles + 15) / 16;  // 16 warps per block own 16 tiles
-  // k-split keeps small-n shapes parallel enough to fill 40 WGPs: one group
-  // per ~128 blocks first, then split k. The atomic tail needs a zeroed C,
-  // which is why raw scratch zeroing happens here and not in the kernel.
+  // One block per 16-column tile (each block's eight warps split k 8 ways),
+  // ksplit block-level slices for deeper parallelism on narrow shapes. The
+  // atomic tail needs a zeroed C, which is why raw scratch zeroing happens
+  // here and not in the kernel.
   int ksplit = 1;
-  while (groups * ksplit < 128 && (size_k / 16) / (ksplit * 2) >= 8) ksplit <<= 1;
+  while (ntiles * ksplit < 128 && (size_k / 16) / (ksplit * 2) >= 8) ksplit <<= 1;
   if (ksplit > 1)
     CheckD(hipMemsetAsync(raw, 0, (size_t)size_m * size_n * sizeof(float), st),
            "exl3_dot zero");
@@ -390,8 +385,8 @@ bool Exl3DotTryLaunchRocm(hipStream_t st, const Tensor& a_had, const Tensor& tre
                 : bits == 6 ? reinterpret_cast<const void*>(&Exl3DotK<6>)
                             : reinterpret_cast<const void*>(&Exl3DotK<0>);
   CheckD(hipLaunchKernel(kernel,
-                         dim3(static_cast<unsigned>(groups * ksplit)),
-                         dim3(512), kargs, 0, st),
+                         dim3(static_cast<unsigned>(ntiles * ksplit)),
+                         dim3(256), kargs, 0, st),
          "exl3_dot launch");
   return true;
 }
