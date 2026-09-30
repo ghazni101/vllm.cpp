@@ -1,0 +1,420 @@
+// EXL3 dot-product decode arm — ROCm. Row BACKEND-ROCM, spec
+// .agents/specs/rocm-exl3-gemv-residual.md (R4), issue
+// .agents/issues/BACKEND-ROCM/ISSUE-LOCAL-01M3RM2TM98FY569AZ6CEASBD3.md.
+//
+// WHY A THIRD ARM. The rocprofv3 trace on gfx1101 serving
+// Qwen3.5-9B-EXL3-4.00bpw shows the ported exl3_gemv arm ALU-bound at
+// ~100 GB/s: its emulated m16n8k16 MMA gathers each lane's A rows and B
+// columns with 32 in-warp shuffles per 16x16 tile, and the gfx11 WMMA arm
+// pays the same cost in fragment conversion (measured ~5.8x SLOWER end to
+// end — VT_ROCM_EXL3_WMMA stays evaluation-only). The decoded weights are
+// only ever multiplied against a handful of activation rows (m <= 8), so
+// the MMA fragment machinery is overhead this hardware cannot amortize.
+//
+// This kernel is the OTHER shape of the same math: consume codewords where
+// they land. Lane l of a warp owns the eight codewords t = 8*l..8*l+7 of one
+// 16x16 tile, which RowMajorIndex places at rows (l%4)*2 + {0,1,8,9} and
+// columns l/4 and l/4+8. A lane needs NO shuffle to consume what it decodes:
+// it reads its codeword span straight from global, decodes with the shared
+// helpers, and multiplies into two column accumulators. Two xor-shuffles
+// over the four lanes sharing a column finish the tile. Accumulation is
+// f32 scalar — strictly tighter than the GEMV arm's fp16 fragments — and B
+// traffic is invariant in m, which is why this arm also serves mid-m
+// chunking and the 6 bpw lm_head that upstream's GEMV envelope (bits 2..4
+// only) cannot.
+//
+// The bit-window extraction is Exl3TileCodeword's own arithmetic (the
+// tail-biting 16-bit window, `+ 256*bits` wrap), lifted to a per-lane
+// 4-word register span so each lane touches each tile once.
+#include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
+
+#include <algorithm>
+#include <cstdint>
+#include <stdexcept>
+#include <string>
+
+#include "vt/ops.h"
+#include "vt/rocm/rocm_device_bind.h"
+#include "vt/rocm/rocm_exl3_decode.h"
+
+namespace vt::rocm {
+namespace {
+
+inline void CheckD(hipError_t err, const char* what) {
+  if (err != hipSuccess)
+    throw std::runtime_error(std::string("vt rocm exl3 dot: ") + what + ": " +
+                             hipGetErrorString(err));
+}
+
+// Lane l owns codewords 8*l..8*l+7. Exl3TileCodeword reads each codeword's
+// tail-biting 16-bit window as (word32[i0]<<32 | word32[i1]) >> s0 where i0
+// and i1 are VIRTUAL word indices in the +256*bits-shifted stream and only
+// their residues modulo words32 map back into the tile. The per-lane span
+// therefore starts at i00 = (8*l*bits + bits - 16 + 256*bits) / 32 — the
+// virtual index of codeword 8*l's first word — and five u32 words cover
+// i0..i1 of all eight codewords (spread 7*bits+47 bits at worst; verified
+// codeword-for-codeword against Exl3TileCodeword for every width 1..8 on
+// random tiles).
+constexpr int kDotSpanWords = 5;
+
+// Codeword s of a lane's span: the virtual-index arithmetic in
+// Exl3TileCodeword collapses once the span base i00 is subtracted —
+// codeword s's window sits at span bit e0 + s*bits (e0 = i00's bit
+// residue), so its two words are w[eb>>5] and w[(eb+15)>>5] and the
+// merged shift is (i1+1)*32 - b1 spelled in span terms: 48 - (eb&31). And
+// (a<<32|b)>>s is ONE instruction on gfx11 — __funnelshift_r lowers to
+// v_fshr/v_alignbit — so the whole extraction is a shift, two register
+// selects, and the funnel shift itself. Verified codeword-for-codeword
+// against Exl3TileCodeword for every width 1..8 on random tiles.
+__device__ __forceinline__ uint16_t Exl3SpanCodeword(
+    const uint32_t w[kDotSpanWords], int e0, int s, int bits) {
+  const int eb = e0 + s * bits;
+  return static_cast<uint16_t>(
+      __funnelshift_r(w[(eb + 15) >> 5], w[eb >> 5], 48 - (eb & 31)));
+}
+
+
+// bits==4: e0 = (32*l + 1012) & 31 = 20 for EVERY lane — each window starts
+// at compile-time span bit 20+4s, so the funnel-shift operands resolve to
+// registers at compile time.
+__device__ __forceinline__ uint16_t Exl3SpanCodeword4(
+    const uint32_t w[kDotSpanWords], int s) {
+  const int eb = 20 + s * 4;
+  return static_cast<uint16_t>(
+      __funnelshift_r(w[(eb + 15) >> 5], w[eb >> 5], 48 - (eb & 31)));
+}
+
+// bits==6: e0 = (48*l + 1526) & 31 = 22 (even lane) or 6 (odd lane) — two
+// compile-time residue patterns selected on lane parity.
+__device__ __forceinline__ uint16_t Exl3SpanCodeword6(
+    const uint32_t w[kDotSpanWords], int lane, int s) {
+  const int e0 = 22 - 16 * (lane & 1);
+  const int eb = e0 + s * 6;
+  return static_cast<uint16_t>(
+      __funnelshift_r(w[(eb + 15) >> 5], w[eb >> 5], 48 - (eb & 31)));
+}
+
+// Coalesced tile fetch for the templated arms: lane l loads tile word l
+// (bits==4: 32 words = exactly one lane per word; bits==6: 48 words, lanes
+// 0..15 load a second). The lane's codeword span is then assembled from
+// in-warp shuffles of the words its neighbours hold — every tile byte is
+// fetched exactly once, unlike the per-lane span load which reads each
+// shared word four or five times.
+template <int BITS>
+struct DotTileWords {
+  // For BITS==4: w[j] for j in 0..2 fetched by shuffling tile word
+  // (i00+j) & 31 from lane (i00+j)&31 — i.e. the lane that loaded it.
+  // For BITS==6: word index w spans 0..47; lanes 0..15 also hold w+16.
+};
+
+// Fetch tile word `word` (a runtime index into the tile) from whichever
+// lane loaded it. BITS==4: word is already < 32, so one shuffle. BITS==6:
+// word < 48; lanes j hold tile word j and (j<16 ? j+16 : none), so the
+// fetch is two shuffles + one select. Span assembly needs at most three
+// words (eb <= 87), so three of these calls per lane per tile.
+template <int BITS>
+__device__ __forceinline__ uint32_t DotFetchWord(uint32_t w0, uint32_t w1,
+                                                 int word) {
+  if constexpr (BITS == 4) {
+    return __shfl_sync(0xffffffffffffffffULL, w0, word & 31);
+  } else {
+    const uint32_t lo = __shfl_sync(0xffffffffffffffffULL, w0, word & 31);
+    const uint32_t hi = __shfl_sync(0xffffffffffffffffULL, w1, word & 31);
+    return word < 32 ? lo : hi;
+  }
+}
+
+// Two adjacent fp16 activations as one u32 load. RowMajorIndex places each
+// lane's k-rows at r0+{0,1} and r0+{8,9}, both adjacent pairs — so the m-loop
+// reads two u32 words per (tile, m) instead of eight scalar f16 loads.
+__device__ __forceinline__ uint32_t LoadH2(const half* p) {
+  uint32_t v;
+  __builtin_memcpy(&v, p, sizeof(v));
+  return v;
+}
+
+
+// The m<=8 fused decode+dot kernel. Grid = 8-tile column groups times a
+// host-chosen k-split; block 256 = 8 warps; each warp owns one 16-column
+// tile per group and walks its k-range. Per warp per k-tile: 4 streaming
+// u32 loads (the lane's codeword span), 8 window extracts + codebook
+// decodes, and 8*size_m f32 FMAs. The two xor-shuffles merge the four lanes
+// that share a column, lanes l%4==0 write the warp's 16 f32 partials into
+// block LDS, and warp 0 flushes the group — a plain store when the k-split
+// is 1, an atomicAdd when several blocks each produced a partial.
+//
+// A is read straight from global: a row is at most 8*size_k*2 bytes and
+// stays L1/L2-resident across the n loop, so the per-tile activation reads
+// are hits, not traffic.
+// BITS is a template parameter: the checkpoint's 4 and 6 bpw decode with
+// compile-time shifts, and the generic arm (BITS==0) keeps runtime `bits`
+// for every width the templated instantiations do not cover.
+// Block = 512 threads (16 warps): each warp owns one 16-column tile of the
+// 16-tile group — double the GEMV arm's narrow block, which hides the same
+// L2 latency DotK pays per tile load.
+template <int BITS>
+__global__ __launch_bounds__(512) void Exl3DotK(
+    const half* __restrict__ A, const uint16_t* __restrict__ B,
+    float* __restrict__ C, int size_m, int size_k, int size_n, int bits_rt, int cb,
+    int ksplit) {
+  const int bits = BITS > 0 ? BITS : bits_rt;
+  const int warp = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const int ntiles = size_n >> 4;   // n/16 tile columns
+  const int ktiles = size_k >> 4;   // k/16 tile rows
+  const int words32 = bits * 8;     // u32 words per 16x16 tile
+  const int groups = (ntiles + 15) >> 4;
+  const int group = blockIdx.x % groups;
+  const int kslice = blockIdx.x / groups;
+
+  // this block's k-tile range
+  const int chunk = (ktiles + ksplit - 1) / ksplit;
+  const int kt0 = kslice * chunk;
+  const int kt1 = min(ktiles, kt0 + chunk);
+
+  // per-lane codeword span (tail-biting, modulo words32)
+  // the virtual word index where this lane's span starts (see the helper
+  // above): residues modulo words32 select tile words.
+  const int i00 = (8 * lane * bits + bits - 16 + 256 * bits) >> 5;
+  const int e0 = (8 * lane * bits + bits - 16 + 256 * bits) & 31;
+  const uint32_t* B32 = reinterpret_cast<const uint32_t*>(B);
+  __shared__ float sh[16][8][16];  // [warp][m][col within tile]
+
+  for (int tg = group * 16; tg < ntiles; tg += groups * 16) {
+    const int tile = tg + warp;
+    float acc[8][2] = {};  // acc[m][col-half]: c = l/4 (+8)
+    const int r0 = (lane & 3) * 2;
+
+    if (tile < ntiles) {
+      if constexpr (BITS == 4 || BITS == 6) {
+        // Coalesced fetch: the warp reads the tile's words32 u32s exactly
+        // once — lane l holds word l, plus word 32+l for bits==6 — and the
+        // lane's codeword span is assembled by shuffling its neighbours'
+        // words back. This replaces the per-lane span load, which re-read
+        // every shared word four or five times.
+        uint32_t t0 = 0, t1 = 0, pf_t0 = 0, pf_t1 = 0;
+        auto ld_tile = [&](int kt, uint32_t& o0, uint32_t& o1) {
+          const uint32_t* tp =
+              B32 + ((size_t)kt * ntiles + tile) * words32;
+          o0 = tp[lane];
+          if constexpr (BITS == 6)
+            o1 = (lane < 16) ? tp[lane + 32] : 0u;
+        };
+        if (kt0 < kt1) ld_tile(kt0, pf_t0, pf_t1);
+        if (kt0 + 1 < kt1) ld_tile(kt0 + 1, t0, t1);
+
+        for (int kt = kt0; kt < kt1; ++kt) {
+          // rotate: current = pf, prefetch next
+          uint32_t c0 = pf_t0, c1 = pf_t1;
+          pf_t0 = t0;
+          pf_t1 = t1;
+          if (kt + 2 < kt1) ld_tile(kt + 2, t0, t1);
+
+          // Assemble the lane's three-word span from the warp's words.
+          const int i0v = i00 % words32;  // span word 0's tile index
+          uint32_t w[3];
+          w[0] = DotFetchWord<BITS>(c0, c1, i0v);
+          w[1] = DotFetchWord<BITS>(c0, c1, (i0v + 1) % words32);
+          w[2] = DotFetchWord<BITS>(c0, c1, (i0v + 2) % words32);
+
+          float wv[8];
+#pragma unroll
+          for (int s = 0; s < 8; ++s) {
+            uint16_t cw;
+            if constexpr (BITS == 4)
+              cw = Exl3SpanCodeword4(w, s);
+            else
+              cw = Exl3SpanCodeword6(w, lane, s);
+            wv[s] = Exl3DecodeCodeword(cw, cb);
+          }
+
+          const int kbase = kt * 16 + r0;
+          // r0+{0,1} and r0+{8,9} are adjacent fp16 pairs: two u32 loads
+          // per (tile, m) instead of eight scalar reads.
+#pragma unroll
+          for (int mm = 0; mm < 8; ++mm) {
+            if (mm >= size_m) break;
+            const half* arow = A + (size_t)mm * size_k + kbase;
+            const uint32_t p01 = LoadH2(arow);
+            const uint32_t p89 = LoadH2(arow + 8);
+            const float av[4] = {
+                __half2float(__ushort_as_half(static_cast<uint16_t>(p01))),
+                __half2float(__ushort_as_half(static_cast<uint16_t>(p01 >> 16))),
+                __half2float(__ushort_as_half(static_cast<uint16_t>(p89))),
+                __half2float(__ushort_as_half(static_cast<uint16_t>(p89 >> 16)))};
+            // s<4 -> rows r0+q (q=s), col c0; s>=4 -> same rows, col c0+8.
+            acc[mm][0] = fmaf(wv[0], av[0], acc[mm][0]);
+            acc[mm][0] = fmaf(wv[1], av[1], acc[mm][0]);
+            acc[mm][0] = fmaf(wv[2], av[2], acc[mm][0]);
+            acc[mm][0] = fmaf(wv[3], av[3], acc[mm][0]);
+            acc[mm][1] = fmaf(wv[4], av[0], acc[mm][1]);
+            acc[mm][1] = fmaf(wv[5], av[1], acc[mm][1]);
+            acc[mm][1] = fmaf(wv[6], av[2], acc[mm][1]);
+            acc[mm][1] = fmaf(wv[7], av[3], acc[mm][1]);
+          }
+        }
+      } else {
+        // Generic arm (runtime bits): the per-lane span load.
+        uint32_t pf0[kDotSpanWords], pf1[kDotSpanWords];
+        auto ld_span = [&](int kt, uint32_t* w) {
+          const uint32_t* tp =
+              B32 + ((size_t)kt * ntiles + tile) * words32;
+#pragma unroll
+          for (int j = 0; j < kDotSpanWords; ++j)
+            w[j] = tp[(i00 + j) % words32];
+        };
+        if (kt0 < kt1) ld_span(kt0, pf0);
+        if (kt0 + 1 < kt1) ld_span(kt0 + 1, pf1);
+
+        for (int kt = kt0; kt < kt1; ++kt) {
+          uint32_t w[kDotSpanWords];
+#pragma unroll
+          for (int j = 0; j < kDotSpanWords; ++j) w[j] = pf0[j];
+#pragma unroll
+          for (int j = 0; j < kDotSpanWords; ++j) pf0[j] = pf1[j];
+          if (kt + 2 < kt1) ld_span(kt + 2, pf1);
+
+          float wv[8];
+#pragma unroll
+          for (int s = 0; s < 8; ++s)
+            wv[s] = Exl3DecodeCodeword(Exl3SpanCodeword(w, e0, s, bits), cb);
+
+          const int kbase = kt * 16 + r0;
+#pragma unroll
+          for (int mm = 0; mm < 8; ++mm) {
+            if (mm >= size_m) break;
+            const half* arow = A + (size_t)mm * size_k + kbase;
+            const uint32_t p01 = LoadH2(arow);
+            const uint32_t p89 = LoadH2(arow + 8);
+            const float av[4] = {
+                __half2float(__ushort_as_half(static_cast<uint16_t>(p01))),
+                __half2float(__ushort_as_half(static_cast<uint16_t>(p01 >> 16))),
+                __half2float(__ushort_as_half(static_cast<uint16_t>(p89))),
+                __half2float(__ushort_as_half(static_cast<uint16_t>(p89 >> 16)))};
+            acc[mm][0] = fmaf(wv[0], av[0], acc[mm][0]);
+            acc[mm][0] = fmaf(wv[1], av[1], acc[mm][0]);
+            acc[mm][0] = fmaf(wv[2], av[2], acc[mm][0]);
+            acc[mm][0] = fmaf(wv[3], av[3], acc[mm][0]);
+            acc[mm][1] = fmaf(wv[4], av[0], acc[mm][1]);
+            acc[mm][1] = fmaf(wv[5], av[1], acc[mm][1]);
+            acc[mm][1] = fmaf(wv[6], av[2], acc[mm][1]);
+            acc[mm][1] = fmaf(wv[7], av[3], acc[mm][1]);
+          }
+        }
+      }
+    }
+
+    // Reduce the four lanes sharing each column (l, l^1, l^2). Empty
+    // k-ranges still write zeros: ksplit>1 slices accumulate through
+    // atomicAdd, so a stale LDS value would corrupt the result.
+    for (int mm = 0; mm < size_m; ++mm) {
+#pragma unroll
+      for (int h = 0; h < 2; ++h) {
+        float v = acc[mm][h];
+          v += __shfl_xor_sync(0xffffffffffffffffULL, v, 1);
+          v += __shfl_xor_sync(0xffffffffffffffffULL, v, 2);
+        if ((lane & 3) == 0) sh[warp][mm][(lane >> 2) + 8 * h] = v;
+      }
+    }
+    __syncthreads();
+
+    // Warps 0 and 1 each write eight tiles of the 16-tile group — each
+    // (m, col) is still the sum over the warp that owned the tile, so the
+    // read IS the fold. Splitting the writeout halves the tail.
+    if (warp < 2) {
+      for (int wt = warp * 8; wt < warp * 8 + 8; ++wt) {
+        const int t = tg + wt;
+        if (t >= ntiles) break;
+        const int col0 = t * 16;
+        for (int i = lane; i < size_m * 16; i += 32) {
+          const int mm = i >> 4;
+          const int c = i & 15;
+          const float sum = sh[wt][mm][c];
+          const size_t off = (size_t)mm * size_n + col0 + c;
+          if (ksplit > 1)
+            atomicAdd(C + off, sum);
+          else
+            C[off] = sum;
+        }
+      }
+    }
+    __syncthreads();
+  }
+}
+
+}  // namespace
+
+// The dot arm's launch contract. Serves every shape the GEMV arm's envelope
+// declines — all bit widths 1..8 (upstream's GEMV caps at 4), all three
+// codebooks — plus m<=8 shapes the host wants on the lighter ALU profile.
+// Returns false on the preconditions the op layer does not already
+// guarantee; a false is a decline, never a failure.
+bool Exl3DotTryLaunchRocm(hipStream_t st, const Tensor& a_had, const Tensor& trellis,
+                          float* raw, int size_m, int size_k, int size_n, int device,
+                          const Exl3GemmArgs& args) {
+  if (size_m < 1 || size_m > 8) return false;
+  if (size_k % 128 != 0 || size_n % 128 != 0) return false;
+  if (args.bits < 1 || args.bits > 8) return false;
+  if (args.codebook < 0 || args.codebook > 2) return false;
+
+  int warp_size = 0;
+  CheckD(hipDeviceGetAttribute(&warp_size, hipDeviceAttributeWarpSize, device),
+         "warp size query");
+  if (warp_size != 32) return false;  // the lane/col mapping is wave32
+
+  const int ntiles = size_n / 16;
+  const int groups = (ntiles + 15) / 16;  // 16 warps per block own 16 tiles
+  // k-split keeps small-n shapes parallel enough to fill 40 WGPs: one group
+  // per ~128 blocks first, then split k. The atomic tail needs a zeroed C,
+  // which is why raw scratch zeroing happens here and not in the kernel.
+  int ksplit = 1;
+  while (groups * ksplit < 128 && (size_k / 16) / (ksplit * 2) >= 8) ksplit <<= 1;
+  if (ksplit > 1)
+    CheckD(hipMemsetAsync(raw, 0, (size_t)size_m * size_n * sizeof(float), st),
+           "exl3_dot zero");
+
+  const half* a_ptr = a_had.Ptr<half>();
+  const uint16_t* b_ptr = trellis.Ptr<uint16_t>();
+  int bits = args.bits, cb = args.codebook;
+  void* kargs[] = {static_cast<void*>(&a_ptr),  static_cast<void*>(&b_ptr),
+                   static_cast<void*>(&raw),    static_cast<void*>(&size_m),
+                   static_cast<void*>(&size_k), static_cast<void*>(&size_n),
+                   static_cast<void*>(&bits),   static_cast<void*>(&cb),
+                   static_cast<void*>(&ksplit)};
+  // The templated instantiations fold bits into the type: the checkpoint's
+  // 4 and 6 bpw decode with compile-time shifts; every other width launches
+  // Exl3DotK<0>, the runtime-bits arm.
+  const void* kernel =
+      bits == 4 ? reinterpret_cast<const void*>(&Exl3DotK<4>)
+                : bits == 6 ? reinterpret_cast<const void*>(&Exl3DotK<6>)
+                            : reinterpret_cast<const void*>(&Exl3DotK<0>);
+  CheckD(hipLaunchKernel(kernel,
+                         dim3(static_cast<unsigned>(groups * ksplit)),
+                         dim3(512), kargs, 0, st),
+         "exl3_dot launch");
+  return true;
+}
+
+// The chunked variant for 8 < m <= 32 (spec R2a, dot flavour): the same
+// 8-row slicing the GEMV chunker uses. Each chunk re-reads B — upstream's
+// own trade-off for the narrow arm — and past 32 rows the reconstruct arm
+// is the right shape.
+bool Exl3DotChunkedTryLaunchRocm(hipStream_t st, const Tensor& a_had,
+                                 const Tensor& trellis, float* raw, int size_m,
+                                 int size_k, int size_n, int device,
+                                 const Exl3GemmArgs& args) {
+  for (int base = 0; base < size_m; base += 8) {
+    const int rows = std::min(8, size_m - base);
+    Tensor a_slice = a_had;
+    a_slice.data = static_cast<char*>(a_had.data) +
+                   static_cast<size_t>(base) * static_cast<size_t>(size_k) * sizeof(half);
+    float* raw_slice = raw + static_cast<size_t>(base) * static_cast<size_t>(size_n);
+    if (!Exl3DotTryLaunchRocm(st, a_slice, trellis, raw_slice, rows, size_k, size_n,
+                              device, args))
+      return false;
+  }
+  return true;
+}
+
+}  // namespace vt::rocm
