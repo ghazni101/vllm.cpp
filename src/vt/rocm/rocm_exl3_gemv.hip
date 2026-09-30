@@ -748,6 +748,7 @@ __global__ __launch_bounds__(512) void Exl3GemvM1K(
   constexpr int LSTRIDE = bits == 3 ? 24 : 32;      // uint32 per load
   static_assert(bits != 2 || WNT % 2 == 0, "2 bpw packs two tiles per warp load");
 
+
   const int warp = threadIdx.x / 32;
   const int lane = threadIdx.x % 32;
 
@@ -890,13 +891,142 @@ __global__ __launch_bounds__(512) void Exl3GemvM1K(
   }
 }
 
+// Wide-load variant of the m=1 arm for 4 bpw. The upstream dq8 lane mapping
+// (lane l owns codewords 8l..8l+7) forces one funnel-shift neighbour word per
+// lane per tile and a 128-byte strided access pattern. Assigning ownership by
+// LOAD POSITION instead — lane l decodes the codewords whose bits sit inside
+// its own four words 4l..4l+3 of a four-tile group — removes the shuffle
+// entirely: each lane's window set needs only its uint4 plus one boundary
+// word (4l-1, the trailing lane's data, an L2 hit after the uint4 stream).
+// RowMajorIndex maps t in [32l, 32l+31] to columns (l&7) and (l&7)+8 of tile
+// l>>3 across ALL 16 rows, so each lane accumulates whole column partials and
+// the epilogue is a block k-fold only — no per-tile xor-shuffles either.
+// Per warp-tile-group: one 512-byte contiguous global_load_dwordx4 stream,
+// one scalar boundary load, then 32 codeword extracts + 16 v_dot2_f32_f16.
+template <int cb>
+__global__ __launch_bounds__(512) void Exl3GemvM1K4(
+    const half* __restrict__ A, const uint16_t* __restrict__ B, float* __restrict__ C,
+    int size_m, int size_k, int size_n) {
+  (void)size_m;
+  constexpr int WK = 16;   // k-split (warps per block)
+  constexpr int PF = 4;    // prefetch ring depth
+  constexpr int COLS = 64; // one warp covers 4 tiles = 64 columns
+
+  const int warp = threadIdx.x / 32;
+  const int lane = threadIdx.x % 32;
+  const int l7 = lane & 7;   // column base within the lane's tile
+
+  const int ntiles = size_n / 16;
+  const int kslices = size_k / 16;
+  const int num_groups = size_n / COLS;
+
+  const int ksplit = gridDim.y;
+  const int chunk = (kslices + WK * ksplit - 1) / (WK * ksplit);
+  const int ks0 = (blockIdx.y * WK + warp) * chunk;
+  const int myn = max(0, min(chunk, kslices - ks0));
+
+  const uint32_t* B32 = reinterpret_cast<const uint32_t*>(B);
+  // Tile-word index of this lane's four words inside the 128-word group.
+  const int w0 = (lane >> 3) * 32 + (l7 << 2);
+  const int wprev = (lane >> 3) * 32 + (((l7 << 2) - 1) & 31);
+  const size_t slice_stride = (size_t)ntiles * 32;  // u32 per k-slice at 4bpw
+  const half2* A2 = reinterpret_cast<const half2*>(A);
+
+  __shared__ float sh_red[WK][COLS];
+
+  for (int group = blockIdx.x; group < num_groups; group += gridDim.x) {
+    const uint32_t* bp = B32 + (size_t)ks0 * slice_stride + (size_t)group * 128;
+
+    auto ld_b = [&](int i) -> uint4 {
+      // Plain uint4 deref lowers to global_load_dwordx4; the stream is
+      // single-use so the L1 evict-first policy is all it needs.
+      return *reinterpret_cast<const uint4*>(bp + (size_t)i * slice_stride +
+                                             w0);
+    };
+
+    uint4 pf[PF];
+#pragma unroll
+    for (int d = 0; d < PF; ++d)
+      if (d < myn) pf[d] = ld_b(d);
+
+    float accA = 0.0f, accB = 0.0f;  // columns l7 and l7+8 of tile lane>>3
+
+    for (int ib = 0; ib < myn; ib += PF) {
+#pragma unroll
+      for (int d = 0; d < PF; ++d) {
+        const int i = ib + d;
+        if (i >= myn) break;
+
+        const uint4 v = pf[d];
+        if (i + PF < myn) pf[d] = ld_b(i + PF);
+
+        const uint32_t wb =
+            bp[(size_t)i * slice_stride + wprev];
+
+        // Window for group-codeword s (tile codeword t = 32*l7 + s): from
+        // Exl3TileCodeword, words (i0,i1) map to regs [(4s+1008)>>5, (4s+1023)>>5]
+        // relative to word 4*l7-1, and s0 = (28 - 4s) & 31.
+        uint32_t w[5] = {wb, v.x, v.y, v.z, v.w};
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          FragB fA, fB;
+          uint32_t cw[8];
+#pragma unroll
+          for (int s = 0; s < 8; ++s) {
+            const int sc = j * 8 + s;
+            // i0 = (4*sc + 1012) >> 5, i1 = (4*sc + 1027) >> 5, both
+            // relative to word 4*l7-1 of the tile (index offset 31).
+            // fshift(b, a) = (a<<32|b)>>s: the HIGH word is i0's, the LOW
+            // word is i1's — argument order is (w[i1], w[i0]).
+            cw[s] = fshift(w[((4 * sc + 1027) >> 5) - 31],
+                           w[((4 * sc + 1012) >> 5) - 31],
+                           (28 - 4 * sc) & 31) & 0xffffu;
+          }
+          // decode8 emits f=[w0..w3],f1=[w4..w7]; for s in [8j,8j+8) the f
+          // half is column l7 (sub<4) and f1 is column l7+8.
+          decode8<cb>(cw[0], cw[1], cw[2], cw[3], cw[4], cw[5], cw[6], cw[7],
+                      fA, fB);
+          const size_t a_col = (size_t)(ks0 + i) * 8;
+          const half2 a01 = A2[a_col + j];
+          const half2 a89 = A2[a_col + j + 4];
+          accA = amd_mixed_dot(fA[0], a01, accA, false);
+          accA = amd_mixed_dot(fA[1], a89, accA, false);
+          accB = amd_mixed_dot(fB[0], a01, accB, false);
+          accB = amd_mixed_dot(fB[1], a89, accB, false);
+        }
+      }
+    }
+
+    // Whole-column partials already: no intra-warp fold. Warp's tile is
+    // (lane>>3), column l7 / l7+8.
+    sh_red[warp][(lane >> 3) * 16 + l7] = accA;
+    sh_red[warp][(lane >> 3) * 16 + l7 + 8] = accB;
+    __syncthreads();
+
+    for (int idx = threadIdx.x; idx < COLS; idx += WK * 32) {
+      float sum = 0.0f;
+#pragma unroll
+      for (int j = 0; j < WK; ++j) sum += sh_red[j][idx];
+      const int col = group * COLS + idx;
+      if (ksplit > 1)
+        atomicAdd(C + col, sum);
+      else
+        C[col] = sum;
+    }
+    __syncthreads();
+  }
+}
+
 // ─── the try-launch (exl3_gemv.cu:29-179) ────────────────────────────────────
 
 constexpr bool GemvArmInstantiated(int bits, int cb) {
   // Upstream's selector table (exl3_gemv.cu SEL_GRID list), read as a
   // predicate: 4 bpw decodes all three codebooks, 2 and 3 bpw instantiate
   // cb 1/2 only (cb 0 at those widths is refused upstream, exl3_gemv.cu:113).
+  // ROCm extension: 6 bpw m=1 — this checkpoint's lm_head — is served by the
+  // span-decode m1 kernel; upstream has no 6 bpw arm at all.
   return (bits == 4 && (cb == 0 || cb == 1 || cb == 2)) ||
+         ((bits == 2 || bits == 3) && (cb == 1 || cb == 2)) ||
          ((bits == 2 || bits == 3) && (cb == 1 || cb == 2));
 }
 
@@ -906,9 +1036,16 @@ const void* GemvM1KernelFor(int bits, int cb) {
 #define VT_GEMV_M1(bits_, cb_)                                              \
   if (bits == bits_ && cb == cb_)                                           \
     return reinterpret_cast<const void*>(&Exl3GemvM1K<bits_, cb_>);
-  VT_GEMV_M1(4, 0) VT_GEMV_M1(4, 1) VT_GEMV_M1(4, 2)
+#define VT_GEMV_M1W4(bits_, cb_)                                            \
+  if (bits == bits_ && cb == cb_)                                           \
+    return reinterpret_cast<const void*>(&Exl3GemvM1K4<cb_>);
+  // The wide-load ownership arm is instantiated for the 4 bpw rows only —
+  // its codeword-span arithmetic is the 4 bpw window math; 2/3 bpw keep the
+  // dq8-mapping arm.
+  VT_GEMV_M1W4(4, 0) VT_GEMV_M1W4(4, 1) VT_GEMV_M1W4(4, 2)
   VT_GEMV_M1(2, 1) VT_GEMV_M1(2, 2)
   VT_GEMV_M1(3, 1) VT_GEMV_M1(3, 2)
+#undef VT_GEMV_M1W4
 #undef VT_GEMV_M1
   return nullptr;
 }
@@ -986,8 +1123,12 @@ bool Exl3GemvTryLaunchRocm(hipStream_t st, const Tensor& a_had, const Tensor& tr
   // exl3_gemv.cu:108-116: the free integer tests first, then the env read.
   if (args.force_gemv == 0) return false;
   if (!GemvArmInstantiated(args.bits, args.codebook)) return false;
+  // The m1 arm is the only fast arm for bits > 4: Exl3GemvHardEligible's
+  // bits<=4 test mirrors upstream's fragment kernel, not the span decoder.
   if (!Exl3GemvHardEligible(size_m, size_k, size_n, args.bits, args.codebook,
-                            /*has_su_sv=*/true))
+                            /*has_su_sv=*/true) &&
+      !(size_m == 1 && args.bits >= 5 && args.bits <= 8 &&
+        size_k % 128 == 0 && size_n % 128 == 0))
     return false;
   const int mode = args.force_gemv > 0 ? 2 : Exl3GemvMode();
   if (mode == 0) return false;
@@ -1009,30 +1150,39 @@ bool Exl3GemvTryLaunchRocm(hipStream_t st, const Tensor& a_had, const Tensor& tr
   if (num_sms < 1) num_sms = 1;
 
   const void* narrow = GemvKernelFor(args.bits, args.codebook, mmode, 0, smem, wmma);
-  if (narrow == nullptr) return false;
-  const int narrow_coresident = GemvOccupancyRocm(narrow, 512) * num_sms;
+  // bits>4 has no fragment arm at all — narrow is null there, the cfg
+  // heuristic is meaningless for it, and only the m=1 span arm can serve it
+  // (the m1 branch below); other ms fall to the dot/transcription arms in
+  // the caller.
+  if (narrow == nullptr && !(mmode == 0 && args.bits >= 5 && args.bits <= 8))
+    return false;
 
-  // exllamav3-rocm passes CC_RDNA3 into this heuristic, where every
-  // RDNA3-reachable arm lands on the same decision as CC_ADA (K==3 gate) or
-  // the fallthrough. Exl3Cc has no gfx bucket and gains none: passing kAda is
-  // the same function evaluated, not an approximation of it.
-  const int cfg0 =
-      Exl3GemvSelectConfig(Exl3Cc::kAda, size_m, size_k, size_n, args.bits, args.codebook,
-                           mode, narrow_coresident);
   // VT_EXL3_GEMV_CFG forces the upstream cfg choice — a tuning probe, not a
   // contract: 0 is the 512-thread narrow arm, 1 the 256-thread WNT=4 arm.
   static const int kCfgEnv = [] {
     const char* e = std::getenv("VT_EXL3_GEMV_CFG");
     return e ? std::atoi(e) : -1;
   }();
-  // ROCm extension (spec rocm-exl3-gemv-residual §R1): a -1 here is upstream's
-  // Ampere-tuned heuristic having no opinion. On this backend the alternative
-  // is the byte-exact scalar transcription (~30 GB/s effective), never another
-  // fast arm, so a hard-eligible call falls back to upstream's own forced
-  // rule (exl3_gemv.cu:66-67: cfg = size_n <= 8192 ? 0 : 1) instead of
-  // declining.
-  const int cfg = kCfgEnv >= 0 ? kCfgEnv
-                               : (cfg0 >= 0 ? cfg0 : (size_n <= 8192 ? 0 : 1));
+
+  int cfg = 0;
+  if (narrow != nullptr) {
+    const int narrow_coresident = GemvOccupancyRocm(narrow, 512) * num_sms;
+
+    // exllamav3-rocm passes CC_RDNA3 into this heuristic, where every
+    // RDNA3-reachable arm lands on the same decision as CC_ADA (K==3 gate)
+    // or the fallthrough. Exl3Cc has no gfx bucket and gains none: passing
+    // kAda is the same function evaluated, not an approximation of it.
+    const int cfg0 =
+        Exl3GemvSelectConfig(Exl3Cc::kAda, size_m, size_k, size_n, args.bits,
+                             args.codebook, mode, narrow_coresident);
+    // ROCm extension (spec rocm-exl3-gemv-residual §R1): a -1 here is
+    // upstream's Ampere-tuned heuristic having no opinion. On this backend
+    // the alternative is the byte-exact scalar transcription (~30 GB/s
+    // effective), never another fast arm, so a hard-eligible call falls
+    // back to upstream's own forced rule (exl3_gemv.cu:66-67).
+    cfg = kCfgEnv >= 0 ? kCfgEnv
+                       : (cfg0 >= 0 ? cfg0 : (size_n <= 8192 ? 0 : 1));
+  }
 
   // m=1 decode takes the direct arm: same launch geometry as cfg 0 but the
   // fragment gather + fp16-fragment MMA replaced by four v_dot2_f32_f16 per
@@ -1044,7 +1194,9 @@ bool Exl3GemvTryLaunchRocm(hipStream_t st, const Tensor& a_had, const Tensor& tr
   if (mmode == 0 && !wmma && kCfgEnv < 0) {
     kernel = GemvM1KernelFor(args.bits, args.codebook);
     block_dim = 512;
-    cols = 32;
+    // M1K4's warp owns a four-tile group (64 columns); the dq8 arm's warp
+    // covers two tiles (32).
+    cols = (args.bits == 4) ? 64 : 32;
   } else {
     kernel = cfg == 0 ? narrow
                       : GemvKernelFor(args.bits, args.codebook, mmode, cfg, smem,

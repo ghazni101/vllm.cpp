@@ -87,9 +87,12 @@ __device__ inline float Exl3DecodeCodeword(uint16_t codeword, int codebook) {
     x *= 0xCBAC1FEDu;
   }
   x = (x & 0x8fff8fffu) ^ 0x3b603b60u;
-  const float lo = DF16ToF32(static_cast<uint16_t>(x & 0xffffu));
-  const float hi = DF16ToF32(static_cast<uint16_t>(x >> 16));
-  return Exl3RoundHalf(lo + hi);  // __hadd: the sum is taken in fp16
+  // The halves of x are the two f16 codebook contributions; their f16 sum
+  // is the weight. f32-add of two f16-exact values is exact in f32, so RN
+  // back to f16 equals __hadd — one V_ADD_F16 replaces both DF16ToF32
+  // converts, the f32 add, and Exl3RoundHalf.
+  const half2 pair = __builtin_bit_cast(half2, x);
+  return __hadd(__low2half(pair), __high2half(pair));
 }
 
 // Exl3TileRowMajorIndex (quantize.py:28-42). `t / 8` is the tensor-core lane,
