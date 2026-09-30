@@ -686,14 +686,16 @@ std::pair<std::string, std::string> ConfigSpecialTokenNames(
            "): " + e.what());
     }
     if (!cfg.is_object()) continue;
-    // tokenizer_config.json is read SECOND so it wins over
-    // special_tokens_map.json, the order transformers' from_pretrained merges
-    // them.
-    if (bos_name.empty()) {
-      bos_name = SpecialTokenNameOf(cfg.value("bos_token", json()));
+    // tokenizer_config.json is read SECOND and wins when it DECLARES the
+    // key: transformers' from_pretrained applies the config's init kwargs
+    // after the map file has already been consumed. contains() gates the
+    // overwrite because value() cannot distinguish "absent" from an explicit
+    // null.
+    if (cfg.contains("bos_token")) {
+      bos_name = SpecialTokenNameOf(cfg.at("bos_token"));
     }
-    if (eos_name.empty()) {
-      eos_name = SpecialTokenNameOf(cfg.value("eos_token", json()));
+    if (cfg.contains("eos_token")) {
+      eos_name = SpecialTokenNameOf(cfg.at("eos_token"));
     }
   }
   return {bos_name, eos_name};

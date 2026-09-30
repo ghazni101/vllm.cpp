@@ -1199,6 +1199,19 @@ TEST_CASE("tokenizer_config.json eos_token/bos_token NAMES resolve when the "
     CHECK(t.EosId() == 19);
   }
 
+  SUBCASE("tokenizer_config.json overrides special_tokens_map.json") {
+    // HF from_pretrained applies the config file's kwargs AFTER the map file
+    // has been consumed, so the config name must win when both declare eos.
+    // Map says <|missing|> (unresolvable); config says <|end|> (19).
+    const TempTokenizerDir d(kTinyJson, R"json({"eos_token": "<|end|>"})json");
+    std::filesystem::path dir =
+        std::filesystem::path(d.tokenizer_path()).parent_path();
+    std::ofstream(dir / "special_tokens_map.json", std::ios::binary)
+        << R"json({"eos_token": "<|missing|>"})json";
+    const Tokenizer t = Tokenizer::FromHfJson(d.tokenizer_path());
+    CHECK(t.EosId() == 19);
+  }
+
   SUBCASE("a post_processor id keeps precedence over the config name") {
     // Same OPT shape as the pin above, mirrored on eos: TemplateProcessing
     // says <tool> (20), the config says <|end|> (19); the post_processor wins.
