@@ -286,6 +286,57 @@ __device__ __forceinline__ void mma_m16n8k16_f16_emu(const FragA& frag_a, const 
                                      __hadd(__low2half(acc11), __high2half(acc11))));
 }
 
+// MMODE==0 form of the emulated pair: rows 8..15 of the fragment are provably
+// zero (a[1]/a[3] are hzero at the call site), so the second row half of the
+// gather — and its 16 hfma2 — is dead work. Keeping the hot decode path off
+// them is measured at ~30% of the MMA loop's issue slots.
+__device__ __forceinline__ void mma_m16n8k16_f16_emu_m1(const FragA& frag_a,
+                                                        const FragB& frag_b,
+                                                        FragC_h& frag_c) {
+  int lane = threadIdx.x & 31;
+  int g = lane >> 2, t = lane & 3;
+
+  // Only row g's eight k pairs: frag_a[0] (k pairs 0..3) and frag_a[2]
+  // (4..7) live in lanes 4g+i — the a[1]/a[3] half never loads.
+  half2 a_row[8], b_cols[2][8];
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    a_row[i] = shfl_h2(frag_a[0], 4 * g + i);
+    a_row[4 + i] = shfl_h2(frag_a[2], 4 * g + i);
+    b_cols[0][i] = shfl_h2(frag_b[0], 8 * t + i);
+    b_cols[0][4 + i] = shfl_h2(frag_b[1], 8 * t + i);
+    b_cols[1][i] = shfl_h2(frag_b[0], 8 * t + 4 + i);
+    b_cols[1][4 + i] = shfl_h2(frag_b[1], 8 * t + 4 + i);
+  }
+
+  half2* c = reinterpret_cast<half2*>(&frag_c);
+  half2 acc00 = __float2half2_rn(0.0f), acc01 = acc00;
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    acc00 = __hfma2(a_row[i], b_cols[0][i], acc00);
+    acc01 = __hfma2(a_row[i], b_cols[1][i], acc01);
+  }
+  // Same fold order as the full form: acc00 folds into c[0], acc01's
+  // contribution is what c[0] would carry — and the c[1] accumulate the full
+  // form does adds only zeros under m1, so it is skipped outright.
+  c[0] = __hadd2(c[0], __halves2half2(__hadd(__low2half(acc00), __high2half(acc00)),
+                                     __hadd(__low2half(acc01), __high2half(acc01))));
+}
+
+template <bool WMMA>
+__device__ __forceinline__ void gemv_mma_16x16_m1(const FragA& a, const FragB& f0,
+                                                  const FragB& f1, FragC_h& c0,
+                                                  FragC_h& c1) {
+  // WMMA has no dead-work to cut: the instruction runs the same 16x16 tile
+  // either way, so the WMMA arm keeps the shared path.
+  if constexpr (WMMA) {
+    gemv_mma_16x16<WMMA>(a, f0, f1, c0, c1);
+    return;
+  }
+  mma_m16n8k16_f16_emu_m1(a, f0, c0);
+  mma_m16n8k16_f16_emu_m1(a, f1, c1);
+}
+
 // ─── gfx11 WMMA converters (hip_compat_hip.cuh:540-780) ──────────────────────
 // EVALUATION ONLY — see the file header and the spec. Instantiated for the
 // 4 bpw arms; the default launch never selects it.
@@ -610,7 +661,10 @@ __global__ __launch_bounds__(CFG == 0 ? 512 : 256) void Exl3GemvK(
           a[1] = a01[1];
           a[2] = a23[0];
           a[3] = a23[1];
-          gemv_mma_16x16<WMMA>(a, f0, f1, ch[t][0], ch[t][1]);
+          if constexpr (MMODE == 0)
+            gemv_mma_16x16_m1<WMMA>(a, f0, f1, ch[t][0], ch[t][1]);
+          else
+            gemv_mma_16x16<WMMA>(a, f0, f1, ch[t][0], ch[t][1]);
         }
 
         if ((d + 1) % FOLD == 0 || i + 1 == myn) {
