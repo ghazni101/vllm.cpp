@@ -171,6 +171,20 @@ remaining gap is kernel time, not launch overhead. The host GPU measures
 bandwidth-only ceiling at ~80 tok/s and 50 tok/s within reach of a kernel
 that holds ~250 GB/s effective.
 
+Round 2 (this branch, `acf3e96ad`/`8b8ebdbaf`): the dot arm was rebuilt once
+more — one 16-column tile per 256-thread block with eight-way in-block
+k-split (matching the GEMV arm's warp-level k-parallelism), plus a
+`amd_mixed_dot` (v_dot2_f32_f16, a VOPD dual-issue candidate on gfx11) inner
+loop on the fp16-exact decoded weights. The emulated-MMA GEMV arm gained an
+MMODE==0 specialization that drops the provably-zero rows-8..15 gather and
+its half of the hfma2 chain. Serving still measures ~21.2 tok/s; dot-first
+re-measured 10.4-13.4 tok/s even k-balanced, so the GEMV arm stays first for
+m<=8. PF=8 prefetch rings REGRESSED (20.0 tok/s — VGPR pressure beats the
+latency cover) and are not carried. `VT_EXL3_GEMV_CFG=1` was observed to
+stall generation entirely under the serving driver (GPU idle, requests
+queued) while the unit test passes under the same env — recorded as a
+cfg-1-specific defect, not diagnosed further in this round.
+
 Verified: `ctest -R test_exl3_rocm` 3/3 pass on gfx1101 (all eight
 instantiated arms at rel RMS ~7e-4 vs f64; the chunked-dot arm at ~2e-5;
 bits==6 m=1..21 at ~1e-5). The test's per-shape divergence CHECK was relaxed
