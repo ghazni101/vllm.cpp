@@ -185,6 +185,11 @@ __global__ __launch_bounds__(256) void Exl3DotK(
   const int e0 = (8 * lane * bits + bits - 16 + 256 * bits) & 31;
   const uint32_t* B32 = reinterpret_cast<const uint32_t*>(B);
   __shared__ float sh[8][8][16];  // [warp][m][col within tile]
+  // bits==6 only: the warp's tile words staged through LDS. Cross-lane
+  // fetch via __shfl costs ~30 cycles of dependent latency per word and
+  // dominates the m=1 chain; ds_read is ~4 cycles and banks are conflict-
+  // free here because lanes' 5-word spans overlap but never share a bank.
+  [[maybe_unused]] __shared__ uint32_t sh_tile[8][96];  // 48 u32 × 2 tiles
 
   {
     float acc[8][2] = {};  // acc[m][col-half]: c = l/4 (+8)
@@ -197,65 +202,186 @@ __global__ __launch_bounds__(256) void Exl3DotK(
         // lane's codeword span is assembled by shuffling its neighbours'
         // words back. This replaces the per-lane span load, which re-read
         // every shared word four or five times.
-        uint32_t t0 = 0, t1 = 0, pf_t0 = 0, pf_t1 = 0;
-        auto ld_tile = [&](int kt, uint32_t& o0, uint32_t& o1) {
+        uint32_t ring[4][2] = {};
+        uint32_t aring[4][2] = {};  // A pairs (a01, a89) for the same slot
+        uint32_t adump0, adump1;
+        auto ld_tile = [&](int kt, uint32_t& o0, uint32_t& o1,
+                           uint32_t& a0, uint32_t& a1) {
           const uint32_t* tp =
               B32 + ((size_t)kt * ntiles + tile) * words32;
           o0 = tp[lane];
           if constexpr (BITS == 6)
             o1 = (lane < 16) ? tp[lane + 32] : 0u;
-        };
-        if (kt0 < kt1) ld_tile(kt0, pf_t0, pf_t1);
-        if (kt0 + 1 < kt1) ld_tile(kt0 + 1, t0, t1);
-
-        for (int kt = kt0; kt < kt1; ++kt) {
-          // rotate: current = pf, prefetch next
-          uint32_t c0 = pf_t0, c1 = pf_t1;
-          pf_t0 = t0;
-          pf_t1 = t1;
-          if (kt + 2 < kt1) ld_tile(kt + 2, t0, t1);
-
-          // Assemble the lane's three-word span from the warp's words.
-          const int i0v = i00 % words32;  // span word 0's tile index
-          uint32_t w[3];
-          w[0] = DotFetchWord<BITS>(c0, c1, i0v);
-          w[1] = DotFetchWord<BITS>(c0, c1, (i0v + 1) % words32);
-          w[2] = DotFetchWord<BITS>(c0, c1, (i0v + 2) % words32);
-
-          float wv[8];
-#pragma unroll
-          for (int s = 0; s < 8; ++s) {
-            uint16_t cw;
-            if constexpr (BITS == 4)
-              cw = Exl3SpanCodeword4(w, s);
-            else
-              cw = Exl3SpanCodeword6(w, lane, s);
-            wv[s] = Exl3DecodeCodeword(cw, cb);
+          if (size_m == 1 && BITS == 6) {
+            a0 = LoadH2(A + kt * 16 + r0);
+            a1 = LoadH2(A + kt * 16 + r0 + 8);
           }
-          // Decoded weights are f16-exact (Exl3DecodeCodeword returns an
-          // fp16-rounded value), so the dot pairs run as PACKED f16 through
-          // amd_mixed_dot — v_dot2_f32_f16, which is a VOPD dual-issue
-          // candidate (V_DUAL_DOT2ACC_F32_F16): two pair-dots per issue
-          // slot, and half the FMA count of the scalar form.
-          half2 wv2[4];
+        };
+        auto ld_tile3 = [&](int kt, uint32_t& o0, uint32_t& o1) {
+          ld_tile(kt, o0, o1, adump0, adump1);
+        };
 #pragma unroll
-          for (int q = 0; q < 4; ++q)
-            wv2[q] = __floats2half2_rn(wv[2 * q], wv[2 * q + 1]);
+        for (int d = 0; d < 4; ++d)
+          if (kt0 + d < kt1)
+            ld_tile(kt0 + d, ring[d][0], ring[d][1], aring[d][0], aring[d][1]);
 
-          const int kbase = kt * 16 + r0;
-          // r0+{0,1} and r0+{8,9} are adjacent fp16 pairs — one u32 load
-          // per pair, reinterpreted as half2 for the dot.
+        if (size_m == 1 && BITS == 6) {
+          // m=1 (the lm_head): decode is a per-lane serial chain — 8 codewords
+          // per tile through funnel-shift + Exl3DecodeCodeword — so one tile
+          // per loop iteration leaves the warp issue-idle on ALU latency.
+          // Two tiles per iteration give the scheduler two independent
+          // chains; the ring already covers their loads.
+          int kt = kt0;
+          for (; kt + 1 < kt1; kt += 2) {
+            uint32_t c0a = ring[0][0], c1a = ring[0][1];
+            uint32_t c0b = ring[1][0], c1b = ring[1][1];
 #pragma unroll
-          for (int mm = 0; mm < 8; ++mm) {
-            if (mm >= size_m) break;
-            const half* arow = A + (size_t)mm * size_k + kbase;
-            const half2 a01 = __builtin_bit_cast(half2, LoadH2(arow));
-            const half2 a89 = __builtin_bit_cast(half2, LoadH2(arow + 8));
-            // s<4 -> rows r0+q (q=s), col c0; s>=4 -> same rows, col c0+8.
-            acc[mm][0] = amd_mixed_dot(wv2[0], a01, acc[mm][0], false);
-            acc[mm][0] = amd_mixed_dot(wv2[1], a89, acc[mm][0], false);
-            acc[mm][1] = amd_mixed_dot(wv2[2], a01, acc[mm][1], false);
-            acc[mm][1] = amd_mixed_dot(wv2[3], a89, acc[mm][1], false);
+            for (int d = 0; d < 2; ++d) {
+              ring[d][0] = ring[d + 2][0];
+              ring[d][1] = ring[d + 2][1];
+            }
+            uint32_t a0a = aring[0][0], a1a = aring[0][1];
+            uint32_t a0b = aring[1][0], a1b = aring[1][1];
+#pragma unroll
+            for (int d = 0; d < 2; ++d) {
+              aring[d][0] = aring[d + 2][0];
+              aring[d][1] = aring[d + 2][1];
+            }
+            if (kt + 4 < kt1)
+              ld_tile(kt + 4, ring[2][0], ring[2][1], aring[2][0], aring[2][1]);
+            if (kt + 5 < kt1)
+              ld_tile(kt + 5, ring[3][0], ring[3][1], aring[3][0], aring[3][1]);
+
+            sh_tile[warp][lane] = c0a;
+            if (lane < 16) sh_tile[warp][32 + lane] = c1a;
+            sh_tile[warp][48 + lane] = c0b;
+            if (lane < 16) sh_tile[warp][48 + 32 + lane] = c1b;
+            __syncwarp();
+            const int i0v = i00 % words32;
+            uint32_t wa[5], wb[5];
+#pragma unroll
+            for (int u = 0; u < 5; ++u) {
+              wa[u] = sh_tile[warp][(i0v + u) % words32];
+              wb[u] = sh_tile[warp][48 + (i0v + u) % words32];
+            }
+            __syncwarp();
+
+            float wva[8], wvb[8];
+#pragma unroll
+            for (int s = 0; s < 8; ++s) {
+              wva[s] = Exl3DecodeCodeword(Exl3SpanCodeword6(wa, lane, s), cb);
+              wvb[s] = Exl3DecodeCodeword(Exl3SpanCodeword6(wb, lane, s), cb);
+            }
+            half2 wv2a[4], wv2b[4];
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {
+              wv2a[q] = __floats2half2_rn(wva[2 * q], wva[2 * q + 1]);
+              wv2b[q] = __floats2half2_rn(wvb[2 * q], wvb[2 * q + 1]);
+            }
+
+            const half2 a01a = __builtin_bit_cast(half2, a0a);
+            const half2 a89a = __builtin_bit_cast(half2, a1a);
+            const half2 a01b = __builtin_bit_cast(half2, a0b);
+            const half2 a89b = __builtin_bit_cast(half2, a1b);
+            acc[0][0] = amd_mixed_dot(wv2a[0], a01a, acc[0][0], false);
+            acc[0][0] = amd_mixed_dot(wv2a[1], a89a, acc[0][0], false);
+            acc[0][1] = amd_mixed_dot(wv2a[2], a01a, acc[0][1], false);
+            acc[0][1] = amd_mixed_dot(wv2a[3], a89a, acc[0][1], false);
+            acc[0][0] = amd_mixed_dot(wv2b[0], a01b, acc[0][0], false);
+            acc[0][0] = amd_mixed_dot(wv2b[1], a89b, acc[0][0], false);
+            acc[0][1] = amd_mixed_dot(wv2b[2], a01b, acc[0][1], false);
+            acc[0][1] = amd_mixed_dot(wv2b[3], a89b, acc[0][1], false);
+          }
+          for (; kt < kt1; ++kt) {
+            uint32_t c0 = ring[0][0], c1 = ring[0][1];
+            uint32_t a0t = aring[0][0], a1t = aring[0][1];
+#pragma unroll
+            for (int d = 0; d < 3; ++d) {
+              ring[d][0] = ring[d + 1][0];
+              ring[d][1] = ring[d + 1][1];
+              aring[d][0] = aring[d + 1][0];
+              aring[d][1] = aring[d + 1][1];
+            }
+            aring[3][0] = a0t; aring[3][1] = a1t;  // placeholder, load below
+            if (kt + 4 < kt1)
+              ld_tile(kt + 4, ring[3][0], ring[3][1], aring[3][0], aring[3][1]);
+            sh_tile[warp][lane] = c0;
+            if (lane < 16) sh_tile[warp][32 + lane] = c1;
+            __syncwarp();
+            const int i0v = i00 % words32;
+            uint32_t w[5];
+#pragma unroll
+            for (int u = 0; u < 5; ++u)
+              w[u] = sh_tile[warp][(i0v + u) % words32];
+            __syncwarp();
+            float wv[8];
+#pragma unroll
+            for (int s = 0; s < 8; ++s)
+              wv[s] = Exl3DecodeCodeword(Exl3SpanCodeword6(w, lane, s), cb);
+            half2 wv2[4];
+#pragma unroll
+            for (int q = 0; q < 4; ++q)
+              wv2[q] = __floats2half2_rn(wv[2 * q], wv[2 * q + 1]);
+            const half2 a01 = __builtin_bit_cast(half2, a0t);
+            const half2 a89 = __builtin_bit_cast(half2, a1t);
+            acc[0][0] = amd_mixed_dot(wv2[0], a01, acc[0][0], false);
+            acc[0][0] = amd_mixed_dot(wv2[1], a89, acc[0][0], false);
+            acc[0][1] = amd_mixed_dot(wv2[2], a01, acc[0][1], false);
+            acc[0][1] = amd_mixed_dot(wv2[3], a89, acc[0][1], false);
+          }
+        } else {
+          for (int kt = kt0; kt < kt1; ++kt) {
+            // rotate: current = oldest ring slot, prefetch four tiles ahead
+            uint32_t c0 = ring[0][0], c1 = ring[0][1];
+#pragma unroll
+            for (int d = 0; d < 3; ++d) {
+              ring[d][0] = ring[d + 1][0];
+              ring[d][1] = ring[d + 1][1];
+            }
+            if (kt + 4 < kt1) ld_tile3(kt + 4, ring[3][0], ring[3][1]);
+
+            // Assemble the lane's three-word span from the warp's words.
+            const int i0v = i00 % words32;  // span word 0's tile index
+            uint32_t w[3];
+            w[0] = DotFetchWord<BITS>(c0, c1, i0v);
+            w[1] = DotFetchWord<BITS>(c0, c1, (i0v + 1) % words32);
+            w[2] = DotFetchWord<BITS>(c0, c1, (i0v + 2) % words32);
+
+            float wv[8];
+#pragma unroll
+            for (int s = 0; s < 8; ++s) {
+              uint16_t cw;
+              if constexpr (BITS == 4)
+                cw = Exl3SpanCodeword4(w, s);
+              else
+                cw = Exl3SpanCodeword6(w, lane, s);
+              wv[s] = Exl3DecodeCodeword(cw, cb);
+            }
+            // Decoded weights are f16-exact (Exl3DecodeCodeword returns an
+            // fp16-rounded value), so the dot pairs run as PACKED f16 through
+            // amd_mixed_dot — v_dot2_f32_f16, which is a VOPD dual-issue
+            // candidate (V_DUAL_DOT2ACC_F32_F16): two pair-dots per issue
+            // slot, and half the FMA count of the scalar form.
+            half2 wv2[4];
+#pragma unroll
+            for (int q = 0; q < 4; ++q)
+              wv2[q] = __floats2half2_rn(wv[2 * q], wv[2 * q + 1]);
+
+            const int kbase = kt * 16 + r0;
+            // r0+{0,1} and r0+{8,9} are adjacent fp16 pairs — one u32 load
+            // per pair, reinterpreted as half2 for the dot.
+#pragma unroll
+            for (int mm = 0; mm < 8; ++mm) {
+              if (mm >= size_m) break;
+              const half* arow = A + (size_t)mm * size_k + kbase;
+              const half2 a01 = __builtin_bit_cast(half2, LoadH2(arow));
+              const half2 a89 = __builtin_bit_cast(half2, LoadH2(arow + 8));
+              // s<4 -> rows r0+q (q=s), col c0; s>=4 -> same rows, col c0+8.
+              acc[mm][0] = amd_mixed_dot(wv2[0], a01, acc[mm][0], false);
+              acc[mm][0] = amd_mixed_dot(wv2[1], a89, acc[mm][0], false);
+              acc[mm][1] = amd_mixed_dot(wv2[2], a01, acc[mm][1], false);
+              acc[mm][1] = amd_mixed_dot(wv2[3], a89, acc[mm][1], false);
+            }
           }
         }
       } else {
@@ -363,8 +489,13 @@ bool Exl3DotTryLaunchRocm(hipStream_t st, const Tensor& a_had, const Tensor& tre
   // ksplit block-level slices for deeper parallelism on narrow shapes. The
   // atomic tail needs a zeroed C, which is why raw scratch zeroing happens
   // here and not in the kernel.
+  static const int kKsplitEnv = [] {
+    const char* e = std::getenv("VT_EXL3_DOT_KSPLIT");
+    return e ? std::atoi(e) : 0;
+  }();
   int ksplit = 1;
   while (ntiles * ksplit < 128 && (size_k / 16) / (ksplit * 2) >= 8) ksplit <<= 1;
+  if (kKsplitEnv > 0) ksplit = kKsplitEnv;  // tuning probe, not a contract
   if (ksplit > 1)
     CheckD(hipMemsetAsync(raw, 0, (size_t)size_m * size_n * sizeof(float), st),
            "exl3_dot zero");
