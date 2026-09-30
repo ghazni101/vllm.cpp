@@ -113,6 +113,11 @@ struct DotTileWords {
 // word < 48; lanes j hold tile word j and (j<16 ? j+16 : none), so the
 // fetch is two shuffles + one select. Span assembly needs at most three
 // words (eb <= 87), so three of these calls per lane per tile.
+// Two 6-bpw codewords decoded straight into one f16 pair: the mcg/3inst
+// map is a pure multiply (+add for 3inst), the mask/xor applies bitwise to
+// both lanes' u32s, and hadd2 on the gathered halves replaces the per-
+// codeword DF16ToF32 + add + round. Numerically identical to the scalar
+// decode because f32-add of two f16-exact halves is exact.
 template <int BITS>
 __device__ __forceinline__ uint32_t DotFetchWord(uint32_t w0, uint32_t w1,
                                                  int word) {
@@ -123,6 +128,35 @@ __device__ __forceinline__ uint32_t DotFetchWord(uint32_t w0, uint32_t w1,
     const uint32_t hi = __shfl_sync(0xffffffffffffffffULL, w1, word & 31);
     return word < 32 ? lo : hi;
   }
+}
+
+// Two codewords decoded straight into one f16 pair: the mcg/3inst map is a
+// pure multiply (+add for 3inst), the mask/xor applies bitwise to both u32s,
+// and __lows2half2/__highs2half2 + __hadd2 produce (wA, wB) — replacing two
+// scalar decode chains (each fshift -> mul -> mask -> xor -> 2xDF16ToF32 ->
+// fadd -> RoundHalf) with one packed round trip. Numerically identical: the
+// f32 sum of two f16-exact halves is exact, so __hadd2's per-half RN is the
+// same rounding the scalar arm did.
+__device__ __forceinline__ half2 Exl3DecodePair6(uint32_t cwa, uint32_t cwb,
+                                               int cb) {
+  if (cb == 2) {
+    const float wa = Exl3DecodeCodeword(static_cast<uint16_t>(cwa), cb);
+    const float wb = Exl3DecodeCodeword(static_cast<uint16_t>(cwb), cb);
+    return __floats2half2_rn(wa, wb);
+  }
+  uint32_t xa = cwa, xb = cwb;
+  if (cb == 0) {
+    xa = xa * 89226354u + 64248484u;
+    xb = xb * 89226354u + 64248484u;
+  } else {
+    xa *= 0xCBAC1FEDu;
+    xb *= 0xCBAC1FEDu;
+  }
+  xa = 0x3b603b60u ^ (xa & 0x8fff8fffu);
+  xb = 0x3b603b60u ^ (xb & 0x8fff8fffu);
+  const half2 ha = __builtin_bit_cast(half2, xa);
+  const half2 hb = __builtin_bit_cast(half2, xb);
+  return __hadd2(__lows2half2(ha, hb), __highs2half2(ha, hb));
 }
 
 // Two adjacent fp16 activations as one u32 load. RowMajorIndex places each
@@ -157,13 +191,16 @@ __device__ __forceinline__ uint32_t LoadH2(const half* p) {
 // warp owns the SAME tile and a disjoint k-slice; the epilogue folds the
 // eight warp partials through LDS (a plain store when the host k-split is
 // 1, atomicAdd when several blocks each produced a partial).
-template <int BITS>
-__global__ __launch_bounds__(256) void Exl3DotK(
+// NW: warps per block. The lane mapping is wave32 either way; a second
+// instantiation at 512 halves each warp's k-walk for shapes that already
+// have enough blocks (the lm_head's 16000).
+template <int BITS, int NW = 8>
+__global__ __launch_bounds__(NW * 32) void Exl3DotKImpl(
     const half* __restrict__ A, const uint16_t* __restrict__ B,
     float* __restrict__ C, int size_m, int size_k, int size_n, int bits_rt, int cb,
     int ksplit) {
   const int bits = BITS > 0 ? BITS : bits_rt;
-  const int warp = threadIdx.x >> 5;
+  const int warp = threadIdx.x >> 5;  // 0..NW-1
   const int lane = threadIdx.x & 31;
   const int ntiles = size_n >> 4;   // n/16 tile columns
   const int ktiles = size_k >> 4;   // k/16 tile rows
@@ -174,8 +211,8 @@ __global__ __launch_bounds__(256) void Exl3DotK(
   // This warp's k-tile range: host k-split slices sit inside the 8-way
   // warp split — kslice*8+warp picks this warp's slice of
   // ceil(ktiles / (ksplit*8)) tiles.
-  const int chunk = (ktiles + ksplit * 8 - 1) / (ksplit * 8);
-  const int kt0 = (kslice * 8 + warp) * chunk;
+  const int chunk = (ktiles + ksplit * NW - 1) / (ksplit * NW);
+  const int kt0 = (kslice * NW + warp) * chunk;
   const int kt1 = min(ktiles, kt0 + chunk);
 
   // per-lane codeword span (tail-biting, modulo words32)
@@ -184,12 +221,12 @@ __global__ __launch_bounds__(256) void Exl3DotK(
   const int i00 = (8 * lane * bits + bits - 16 + 256 * bits) >> 5;
   const int e0 = (8 * lane * bits + bits - 16 + 256 * bits) & 31;
   const uint32_t* B32 = reinterpret_cast<const uint32_t*>(B);
-  __shared__ float sh[8][8][16];  // [warp][m][col within tile]
+  __shared__ float sh[NW][8][16];  // [warp][m][col within tile]
   // bits==6 only: the warp's tile words staged through LDS. Cross-lane
   // fetch via __shfl costs ~30 cycles of dependent latency per word and
   // dominates the m=1 chain; ds_read is ~4 cycles and banks are conflict-
   // free here because lanes' 5-word spans overlap but never share a bank.
-  [[maybe_unused]] __shared__ uint32_t sh_tile[8][96];  // 48 u32 × 2 tiles
+  [[maybe_unused]] __shared__ uint32_t sh_tile[NW][96];  // 48 u32 × 2 tiles
 
   {
     float acc[8][2] = {};  // acc[m][col-half]: c = l/4 (+8)
@@ -266,17 +303,15 @@ __global__ __launch_bounds__(256) void Exl3DotK(
             }
             __syncwarp();
 
-            float wva[8], wvb[8];
-#pragma unroll
-            for (int s = 0; s < 8; ++s) {
-              wva[s] = Exl3DecodeCodeword(Exl3SpanCodeword6(wa, lane, s), cb);
-              wvb[s] = Exl3DecodeCodeword(Exl3SpanCodeword6(wb, lane, s), cb);
-            }
             half2 wv2a[4], wv2b[4];
 #pragma unroll
             for (int q = 0; q < 4; ++q) {
-              wv2a[q] = __floats2half2_rn(wva[2 * q], wva[2 * q + 1]);
-              wv2b[q] = __floats2half2_rn(wvb[2 * q], wvb[2 * q + 1]);
+              wv2a[q] = Exl3DecodePair6(Exl3SpanCodeword6(wa, lane, 2 * q),
+                                        Exl3SpanCodeword6(wa, lane, 2 * q + 1),
+                                        cb);
+              wv2b[q] = Exl3DecodePair6(Exl3SpanCodeword6(wb, lane, 2 * q),
+                                        Exl3SpanCodeword6(wb, lane, 2 * q + 1),
+                                        cb);
             }
 
             const half2 a01a = __builtin_bit_cast(half2, a0a);
@@ -314,14 +349,12 @@ __global__ __launch_bounds__(256) void Exl3DotK(
             for (int u = 0; u < 5; ++u)
               w[u] = sh_tile[warp][(i0v + u) % words32];
             __syncwarp();
-            float wv[8];
-#pragma unroll
-            for (int s = 0; s < 8; ++s)
-              wv[s] = Exl3DecodeCodeword(Exl3SpanCodeword6(w, lane, s), cb);
             half2 wv2[4];
 #pragma unroll
             for (int q = 0; q < 4; ++q)
-              wv2[q] = __floats2half2_rn(wv[2 * q], wv[2 * q + 1]);
+              wv2[q] = Exl3DecodePair6(Exl3SpanCodeword6(w, lane, 2 * q),
+                                       Exl3SpanCodeword6(w, lane, 2 * q + 1),
+                                       cb);
             const half2 a01 = __builtin_bit_cast(half2, a0t);
             const half2 a89 = __builtin_bit_cast(half2, a1t);
             acc[0][0] = amd_mixed_dot(wv2[0], a01, acc[0][0], false);
@@ -444,7 +477,7 @@ __global__ __launch_bounds__(256) void Exl3DotK(
     }
     __syncthreads();
 
-    // Fold the eight warps' partials for this one tile: every (m, col) sums
+    // Fold the warps' partials for this one tile: every (m, col) sums
     // sh[w][m][c] over w — the warp-split k-slices. Warp 0 owns the fold and
     // the writeout; m*16 cells / 32 lanes is 4 passes at m=8.
     if (warp == 0) {
@@ -452,8 +485,9 @@ __global__ __launch_bounds__(256) void Exl3DotK(
       for (int i = lane; i < size_m * 16; i += 32) {
         const int mm = i >> 4;
         const int c = i & 15;
-        float sum = sh[0][mm][c] + sh[1][mm][c] + sh[2][mm][c] + sh[3][mm][c] +
-                    sh[4][mm][c] + sh[5][mm][c] + sh[6][mm][c] + sh[7][mm][c];
+        float sum = 0.0f;
+#pragma unroll
+        for (int w = 0; w < NW; ++w) sum += sh[w][mm][c];
         const size_t off = (size_t)mm * size_n + col0 + c;
         if (ksplit > 1)
           atomicAdd(C + off, sum);
@@ -511,13 +545,18 @@ bool Exl3DotTryLaunchRocm(hipStream_t st, const Tensor& a_had, const Tensor& tre
   // The templated instantiations fold bits into the type: the checkpoint's
   // 4 and 6 bpw decode with compile-time shifts; every other width launches
   // Exl3DotK<0>, the runtime-bits arm.
-  const void* kernel =
-      bits == 4 ? reinterpret_cast<const void*>(&Exl3DotK<4>)
-                : bits == 6 ? reinterpret_cast<const void*>(&Exl3DotK<6>)
-                            : reinterpret_cast<const void*>(&Exl3DotK<0>);
+  const void* kernel;
+  unsigned block_sz = 256;
+  if (bits == 4) {
+    kernel = reinterpret_cast<const void*>(&Exl3DotKImpl<4, 8>);
+  } else if (bits == 6) {
+    kernel = reinterpret_cast<const void*>(&Exl3DotKImpl<6, 8>);
+  } else {
+    kernel = reinterpret_cast<const void*>(&Exl3DotKImpl<0, 8>);
+  }
   CheckD(hipLaunchKernel(kernel,
                          dim3(static_cast<unsigned>(ntiles * ksplit)),
-                         dim3(256), kargs, 0, st),
+                         dim3(block_sz), kargs, 0, st),
          "exl3_dot launch");
   return true;
 }
