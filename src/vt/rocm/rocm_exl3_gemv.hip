@@ -47,6 +47,7 @@
 // sh_red cross-warp reduction. The epilogue writes f32 into the same `raw`
 // scratch Exl3GemmK writes, so LaunchHad post-scale sees an identical operand
 // on both arms.
+#include <algorithm>
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 
@@ -771,10 +772,23 @@ bool Exl3GemvTryLaunchRocm(hipStream_t st, const Tensor& a_had, const Tensor& tr
   // RDNA3-reachable arm lands on the same decision as CC_ADA (K==3 gate) or
   // the fallthrough. Exl3Cc has no gfx bucket and gains none: passing kAda is
   // the same function evaluated, not an approximation of it.
-  const int cfg =
+  const int cfg0 =
       Exl3GemvSelectConfig(Exl3Cc::kAda, size_m, size_k, size_n, args.bits, args.codebook,
                            mode, narrow_coresident);
-  if (cfg < 0) return false;
+  // VT_EXL3_GEMV_CFG forces the upstream cfg choice — a tuning probe, not a
+  // contract: 0 is the 512-thread narrow arm, 1 the 256-thread WNT=4 arm.
+  static const int kCfgEnv = [] {
+    const char* e = std::getenv("VT_EXL3_GEMV_CFG");
+    return e ? std::atoi(e) : -1;
+  }();
+  // ROCm extension (spec rocm-exl3-gemv-residual §R1): a -1 here is upstream's
+  // Ampere-tuned heuristic having no opinion. On this backend the alternative
+  // is the byte-exact scalar transcription (~30 GB/s effective), never another
+  // fast arm, so a hard-eligible call falls back to upstream's own forced
+  // rule (exl3_gemv.cu:66-67: cfg = size_n <= 8192 ? 0 : 1) instead of
+  // declining.
+  const int cfg = kCfgEnv >= 0 ? kCfgEnv
+                               : (cfg0 >= 0 ? cfg0 : (size_n <= 8192 ? 0 : 1));
 
   const void* kernel =
       cfg == 0 ? narrow : GemvKernelFor(args.bits, args.codebook, mmode, cfg, smem, wmma);
@@ -799,5 +813,42 @@ bool Exl3GemvTryLaunchRocm(hipStream_t st, const Tensor& a_had, const Tensor& tr
   CheckG(hipGetLastError(), "exl3_gemv launch");
   return true;
 }
+
+// ─── spec rocm-exl3-gemv-residual: the residual dispatch surface ─────────────
+//
+// Exl3GemmKernelRocm needs two more facts from this TU: whether the shape
+// itself can take the GEMV arm regardless of m (the chunked launcher feeds it
+// 8-row slices), and a chunked variant for 8 < m <= 32. Both stay inside
+// Exl3GemvMode() != 0 — VT_EXL3_GEMV=0 selects the transcription for EVERY
+// shape on this backend, which is what the byte-exact gate relies on.
+
+bool Exl3GemvShapeEligibleRocm(int size_k, int size_n, int bits, int cb) {
+  // The m term of Exl3GemvHardEligible is evaluated per chunk (always <= 8),
+  // so shape eligibility is the predicate with m=1.
+  return GemvArmInstantiated(bits, cb) &&
+         Exl3GemvHardEligible(1, size_k, size_n, bits, cb, /*has_su_sv=*/true);
+}
+
+bool Exl3GemvChunkedTryLaunchRocm(hipStream_t st, const Tensor& a_had,
+                                  const Tensor& trellis, float* raw, int size_m,
+                                  int size_k, int size_n, int device,
+                                  const Exl3GemmArgs& args) {
+  // Every chunk runs upstream's own m<=8 arm (mmode 1) on an 8-row slice of
+  // a_had and raw. B is re-read per chunk — upstream's own trade-off for
+  // mmode 1 — so the caller caps this path at m <= 32, above which the
+  // reconstruct arm's one-pass decode + hipBLAS GEMM is the right shape.
+  for (int base = 0; base < size_m; base += kGemvMaxM) {
+    const int rows = std::min(kGemvMaxM, size_m - base);
+    Tensor a_slice = a_had;
+    a_slice.data = static_cast<char*>(a_had.data) +
+                   static_cast<size_t>(base) * static_cast<size_t>(size_k) * sizeof(half);
+    float* raw_slice = raw + static_cast<size_t>(base) * static_cast<size_t>(size_n);
+    if (!Exl3GemvTryLaunchRocm(st, a_slice, trellis, raw_slice, rows, size_k, size_n,
+                               device, args))
+      return false;
+  }
+  return true;
+}
+
 
 }  // namespace vt::rocm
