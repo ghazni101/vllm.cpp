@@ -123,3 +123,23 @@ candidate gap, not a defect in the landed arm.
 Rejected: WMMA stays evaluation-only behind VT_ROCM_EXL3_WMMA (spec default);
 the fused M>=1024 reconstruct arm was not ported — the unfused chain covers
 all m with no measurable loss at this row's serving scale.
+
+## Residual gap (2026-09-30, row/BACKEND-ROCM-exl3-gfx11-gemv)
+
+Round-2 kernel work landed the 4 bpw m=1 wide-load arm (Exl3GemvM1K4,
+load-position ownership — no per-tile shuffle) and halved the 6 bpw lm_head
+(dot arm: __hadd decode, paired-codeword decode, double-buffered LDS staging,
+A-fragment ring prefetch; 99 → 300 GB/s on the 4096×256000 shape). End-to-end
+decode on the same checkpoint measures ~35 tok/s warm (vs 21.9 on the round-1
+build); a rocprofv3 kernel-trace on that older build attributed per-token GPU
+time as: body GEMV 11.9 ms, DotK<6> lm_head 7.4 ms, GdnScanK 2.3 ms,
+HadK 1.5 ms, plus ~5 ms of smaller attention/GDN/cast kernels.
+
+Still open for the 50 tok/s target: DotK<6> stalls at ~300 GB/s against a
+~176-instr/tile-pair VALU floor (~2.1 ms) — the remaining gap is the
+ld_tile ring's vmcnt(0) waits serialising each pair-iteration (~45%);
+pre-fill m>8 shapes route to the byte-exact Exl3GemmK transcription at
+~14 GB/s (1.5 K-token prompts take ~9 s); the warp-per-row GDN scan
+(VT_GDN_SCAN_COOP=1) shaves ~1 ms/token but stays opt-in until the NMSE
+policy for its reordered reduction is resolved; HadK is fused upstream of
+every projection and contributes ~1.5 ms/token of fixed transform cost.
