@@ -1861,6 +1861,15 @@ bool HasQwen3_5MoeVisionTower(const std::vector<SafetensorsFile>& shards) {
 
 // The tower geometry for a Qwen3.5 conditional-generation checkpoint, shared by
 // BOTH arms (full argument in qwen3_5_weights.h, above the two public wrappers).
+// The family is NOT one tower: the published 27B/35B checkpoints ship
+// depth 27 / hidden 1152 / intermediate 4304, while Qwen3.5-4B ships
+// depth 24 / hidden 1024 / intermediate 4096 (its vision_config mirrors the
+// Qwen3-VL-4B tower). Every member declares these values in config.json's
+// `vision_config`, so the constants below are ONLY the fallback for a config
+// that omits the block — the checkpoint's own declaration is authoritative
+// (ISSUE-LOCAL-01M3SQMXYKT2RV2D6MHCY2FCAC: hardcoding the big towers made the
+// loader index blocks.0..26 against a 24-block 4B checkpoint and fatal on
+// `model.visual.blocks.24.norm1.weight`).
 multimodal::Qwen3VLVisionConfig Qwen3_5FamilyVisionConfig(
     const HfConfig& config) {
   multimodal::Qwen3VLVisionConfig v;
@@ -1868,10 +1877,6 @@ multimodal::Qwen3VLVisionConfig Qwen3_5FamilyVisionConfig(
   v.num_heads = 16;
   v.depth = 27;
   v.intermediate_size = 4304;
-  // The merger writes straight into the text residual stream, so the tower's
-  // output width IS the text hidden size (2048 on the 35B MoE, 5120 on the 27B
-  // dense) — the ONE field the two arms disagree on.
-  v.out_hidden_size = config.hidden_size;
   v.patch_size = 16;
   v.temporal_patch_size = 2;
   v.spatial_merge_size = 2;
@@ -1879,6 +1884,38 @@ multimodal::Qwen3VLVisionConfig Qwen3_5FamilyVisionConfig(
   v.in_channels = 3;
   v.deepstack_visual_indexes = {};  // NO DeepStack on this family.
   v.norm_eps = 1e-6f;
+  if (config.raw.contains("vision_config") &&
+      config.raw["vision_config"].is_object()) {
+    const nlohmann::json& vc = config.raw["vision_config"];
+    v.hidden_size = vc.value("hidden_size", v.hidden_size);
+    v.num_heads = vc.value("num_heads", v.num_heads);
+    v.depth = vc.value("depth", v.depth);
+    v.intermediate_size = vc.value("intermediate_size", v.intermediate_size);
+    v.patch_size = vc.value("patch_size", v.patch_size);
+    v.temporal_patch_size =
+        vc.value("temporal_patch_size", v.temporal_patch_size);
+    v.spatial_merge_size =
+        vc.value("spatial_merge_size", v.spatial_merge_size);
+    v.num_position_embeddings =
+        vc.value("num_position_embeddings", v.num_position_embeddings);
+    v.in_channels = vc.value("in_channels", v.in_channels);
+    if (vc.contains("deepstack_visual_indexes") &&
+        vc["deepstack_visual_indexes"].is_array())
+      v.deepstack_visual_indexes =
+          vc["deepstack_visual_indexes"].get<std::vector<int>>();
+    v.norm_eps = vc.value("norm_eps", v.norm_eps);
+  }
+  // The merger writes straight into the text residual stream, so the tower's
+  // output width IS the text hidden size (2048 on the 35B MoE, 5120 on the 27B
+  // dense, 2560 on the 4B) unless vision_config declares out_hidden_size —
+  // which every published member does. The vision block wins when present
+  // because a checkpoint that widens the merger output independently of the
+  // text hidden size would silently mis-load under the text-derived value.
+  v.out_hidden_size = config.hidden_size;
+  if (config.raw.contains("vision_config") &&
+      config.raw["vision_config"].is_object())
+    v.out_hidden_size = config.raw["vision_config"].value(
+        "out_hidden_size", v.out_hidden_size);
   return v;
 }
 
