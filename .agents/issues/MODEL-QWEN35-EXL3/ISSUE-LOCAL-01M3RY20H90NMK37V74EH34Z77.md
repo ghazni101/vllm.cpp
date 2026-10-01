@@ -3,8 +3,8 @@ Title: No eos_token_id resolution from tokenizer_config.json: requests carry no 
 Row: MODEL-QWEN35-EXL3
 State: OPEN
 Kind: bug
-GitHub: -
-Mirror: PENDING
+GitHub: 3364
+Mirror: SYNCED
 Availability: FULL
 Created: 2026-09-30
 Updated: 2026-09-30

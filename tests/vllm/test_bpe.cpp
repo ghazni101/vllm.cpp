@@ -1075,9 +1075,28 @@ class TempTokenizerDir {
   std::string tokenizer_path() const {
     return (dir_ / "tokenizer.json").string();
   }
+  const std::filesystem::path& dir() const { return dir_; }
+
 
  private:
   std::filesystem::path dir_;
+};
+
+// Holds the process working directory inside `new_cwd` for the enclosing
+// scope: FromHfJson("tokenizer.json") resolves a BARE filename against the
+// CWD, and its sibling lookup must follow the same resolution (PR #3363).
+// Declared AFTER the TempTokenizerDir it scopes so destruction order restores
+// the CWD before the directory is removed.
+class ScopedCwd {
+ public:
+  explicit ScopedCwd(const std::filesystem::path& new_cwd)
+      : saved_(std::filesystem::current_path()) {
+    std::filesystem::current_path(new_cwd);
+  }
+  ~ScopedCwd() { std::filesystem::current_path(saved_); }
+
+ private:
+  std::filesystem::path saved_;
 };
 
 // NOTE: there is deliberately no `kTinySpecialId` constant here. It named
@@ -1233,5 +1252,18 @@ TEST_CASE("tokenizer_config.json eos_token/bos_token NAMES resolve when the "
     const TempTokenizerDir d(kTinyJson, R"json({"eos_token": "<|missing|>"})json");
     const Tokenizer t = Tokenizer::FromHfJson(d.tokenizer_path());
     CHECK(t.EosId() == -1);
+  }
+
+  SUBCASE("a bare filename resolves siblings from the CWD too (PR #3363)") {
+    // parent_path() of "tokenizer.json" is empty; the sibling join must still
+    // find tokenizer_config.json in the CWD. The unfixed `!dir.empty()` guard
+    // skipped the lookup on this spelling and left EosId() at -1 while
+    // "./tokenizer.json" resolved 19.
+    const TempTokenizerDir d(kTinyJson, R"json({"eos_token": "<|end|>"})json");
+    const ScopedCwd cwd(d.dir());
+    const Tokenizer bare = Tokenizer::FromHfJson("tokenizer.json");
+    CHECK(bare.EosId() == 19);
+    const Tokenizer dotted = Tokenizer::FromHfJson("./tokenizer.json");
+    CHECK(dotted.EosId() == 19);
   }
 }

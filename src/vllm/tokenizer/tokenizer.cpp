@@ -810,17 +810,20 @@ Tokenizer Tokenizer::FromHfJson(const std::string& tokenizer_json_path) {
   // post_processor does not. FromHfJsonBytes is file-less, so the sibling read
   // lives here and not inside the shared parse. The post_processor keeps
   // precedence: a name only fills an id the template left at -1.
+  // parent_path() of a BARE filename is empty; joining the sibling name onto
+  // it yields just the sibling's filename, which std::filesystem resolves
+  // against the current working directory -- the same directory the bare
+  // tokenizer.json was opened from. So an empty dir must NOT skip the lookup:
+  // "tokenizer.json" and "./tokenizer.json" are the same file (PR #3363).
   const std::filesystem::path dir =
       std::filesystem::path(tokenizer_json_path).parent_path();
-  if (!dir.empty()) {
-    const auto [bos_name, eos_name] =
-        ConfigSpecialTokenNames(dir, tokenizer_json_path);
-    if (tok.bos_id_ < 0 && !bos_name.empty()) {
-      tok.bos_id_ = ConfigTokenId(tok, bos_name);
-    }
-    if (tok.eos_id_ < 0 && !eos_name.empty()) {
-      tok.eos_id_ = ConfigTokenId(tok, eos_name);
-    }
+  const auto [bos_name, eos_name] =
+      ConfigSpecialTokenNames(dir, tokenizer_json_path);
+  if (tok.bos_id_ < 0 && !bos_name.empty()) {
+    tok.bos_id_ = ConfigTokenId(tok, bos_name);
+  }
+  if (tok.eos_id_ < 0 && !eos_name.empty()) {
+    tok.eos_id_ = ConfigTokenId(tok, eos_name);
   }
   return tok;
 }
