@@ -29,7 +29,13 @@
 #include <hip/hip_fp16.h>
 #include <hipblas/hipblas.h>
 
+#ifdef VLLM_CPP_HAS_HIPBLASLT
+#include <hipblaslt/hipblaslt.h>
+#endif
+
 #include <cstdint>
+#include <cstdio>
+#include <limits>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -49,10 +55,13 @@ inline void CheckR(hipError_t err, const char* what) {
                              hipGetErrorString(err));
 }
 inline void CheckBlas(hipblasStatus_t st, const char* what) {
+
   if (st != HIPBLAS_STATUS_SUCCESS)
     throw std::runtime_error(std::string("vt rocm exl3 recon: ") + what +
                              " failed with status " + std::to_string(static_cast<int>(st)));
 }
+
+bool StreamCapturing(hipStream_t s);  // defined below, same anonymous namespace
 inline hipStream_t AsStreamR(const Queue& q) { return static_cast<hipStream_t>(q.handle); }
 
 constexpr float kInvSqrt128R = 0.088388347648f;
@@ -84,6 +93,201 @@ __global__ void ReconstructDecodeSliceK(half* __restrict__ w, const uint16_t* __
   w[r * n_slice + c] =
       __float2half_rn(Exl3DecodeCodeword(Exl3TileCodeword(tp, bits, t), codebook));
 }
+
+
+// ─── step 3, fast arm: the same GEMM through hipBLASLt ───────────────────────
+//
+// hipblasGemmEx + HIPBLAS_COMPUTE_32F + HIPBLAS_GEMM_DEFAULT resolves to a
+// non-tensor-core assembly kernel on gfx1101 (rocprofv3 on Qwen3.5-9B-EXL3:
+// Cijk...HSS at ~16.4 ms/call, ~2 TFLOP/s — 6% of the fp16 MMA peak for a
+// m=2022 n=4096 k=4096 call). hipBLASLt's heuristic returns the MMA kernels
+// for the same shape. VT_EXL3_RECON_NO_LT=1 pins the old arm for A/B. The Lt
+// call honours `ldc` exactly as GemmEx does — Lt matrix layouts take a stride.
+#ifdef VLLM_CPP_HAS_HIPBLASLT
+struct ReconLtHandle {
+  hipblasLtHandle_t h = nullptr;
+  ReconLtHandle() {
+    if (hipblasLtCreate(&h) != HIPBLAS_STATUS_SUCCESS) h = nullptr;
+  }
+  ~ReconLtHandle() {
+    if (h) (void)hipblasLtDestroy(h);
+  }
+};
+
+static bool ReconLtDisabled() {
+  static const bool off = [] {
+    const char* e = std::getenv("VT_EXL3_RECON_NO_LT");
+    return e && e[0] == '1';
+  }();
+  return off;
+}
+
+static bool HgemmLtRowMajor(hipStream_t s, void* C, const void* A, const void* W,
+                            int m, int n, int k, int64_t ldc, bool c_f32) {
+  static thread_local ReconLtHandle lt;
+  if (!lt.h) return false;
+
+  // Layout key: shapes + output dtype + ldc. Algorithms are cached; the
+  // heuristic call is per new shape only.
+  const hipDataType c_dt = c_f32 ? HIP_R_32F : HIP_R_16F;
+  struct LtKey {
+    int m, n, k;
+    int64_t ldc;
+    hipDataType c;
+    bool operator==(const LtKey& o) const {
+      return m == o.m && n == o.n && k == o.k && ldc == o.ldc && c == o.c;
+    }
+  };
+  struct LtKeyHash {
+    size_t operator()(const LtKey& x) const {
+      return (static_cast<size_t>(x.m) * 1315423911u) ^
+             (static_cast<size_t>(x.n) * 2654435761u) ^
+             (static_cast<size_t>(x.k) * 97531u) ^
+             (static_cast<size_t>(x.ldc) * 40503u) ^ static_cast<size_t>(x.c);
+    }
+  };
+  static thread_local std::unordered_map<LtKey, hipblasLtMatmulAlgo_t, LtKeyHash>
+      cache;
+  static thread_local std::unordered_map<LtKey, size_t, LtKeyHash> ws_sizes;
+  const LtKey key{m, n, k, ldc, c_dt};
+
+  // Column-major views, matching HgemmRowMajor's OP_N/OP_N contraction:
+  // C_cm(N,M) = W_cm(N,K) @ A_cm(K,M). ldc is C's column stride (M in a
+  // column-major view), which is where the parent's row stride lands for a
+  // sliced column panel — same identity as the GemmEx arm.
+  hipblasLtMatrixLayout_t lw = nullptr, la = nullptr, lc = nullptr;
+  hipblasLtMatmulDesc_t desc = nullptr;
+  hipblasLtMatmulPreference_t pref = nullptr;
+  auto cleanup = [&]() {
+    if (lw) (void)hipblasLtMatrixLayoutDestroy(lw);
+    if (la) (void)hipblasLtMatrixLayoutDestroy(la);
+    if (lc) (void)hipblasLtMatrixLayoutDestroy(lc);
+    if (desc) (void)hipblasLtMatmulDescDestroy(desc);
+    if (pref) (void)hipblasLtMatmulPreferenceDestroy(pref);
+  };
+  bool ok = hipblasLtMatrixLayoutCreate(&lw, HIP_R_16F, n, k, n) ==
+                HIPBLAS_STATUS_SUCCESS &&
+            hipblasLtMatrixLayoutCreate(&la, HIP_R_16F, k, m, k) ==
+                HIPBLAS_STATUS_SUCCESS &&
+            hipblasLtMatrixLayoutCreate(&lc, c_dt, n, m, ldc) ==
+                HIPBLAS_STATUS_SUCCESS &&
+            hipblasLtMatmulDescCreate(&desc, HIPBLAS_COMPUTE_32F, HIP_R_32F) ==
+                HIPBLAS_STATUS_SUCCESS &&
+            hipblasLtMatmulPreferenceCreate(&pref) == HIPBLAS_STATUS_SUCCESS;
+  if (!ok) {
+    cleanup();
+    return false;
+  }
+  const uint64_t max_ws = 32ull << 20;
+  (void)hipblasLtMatmulPreferenceSetAttribute(
+      pref, HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &max_ws, sizeof(max_ws));
+
+  auto it = cache.find(key);
+  if (it == cache.end()) {
+    // Rank-0 is not trustworthy on gfx11: for (m=2022,n=4096,k=4096,f16->f32)
+    // the heuristic's first pick measured 15.7 ms while algo #4 of the same
+    // request ran 1.5 ms (44.6 TFLOP/s, 10.8x). Ask for several candidates and
+    // time each on the REAL buffers once — the sweep runs on first call only,
+    // per (m,n,k,ldc,dtype) key, and its cost (~30 ms) amortizes inside the
+    // first prefill it saves.
+    hipblasLtMatmulHeuristicResult_t heur[16];
+    int returned = 0;
+    const hipblasStatus_t hs = hipblasLtMatmulAlgoGetHeuristic(
+        lt.h, desc, lw, la, lc, lc, pref, 16, heur, &returned);
+    if (hs != HIPBLAS_STATUS_SUCCESS || returned <= 0) {
+      cleanup();
+      return false;
+    }
+    const float walpha = 1.0f, wbeta = 0.0f;
+    double best_ms = std::numeric_limits<double>::max();
+    int best = -1;
+    size_t best_ws = 0;
+    for (int i = 0; i < returned; ++i) {
+      if (heur[i].state != HIPBLAS_STATUS_SUCCESS) continue;
+      void* tws = nullptr;
+      if (heur[i].workspaceSize &&
+          hipMalloc(&tws, heur[i].workspaceSize) != hipSuccess)
+        continue;
+      // Warm-up then time 3 back-to-back launches on the caller's buffers.
+      // These writes land in c anyway — the GEMM is the caller's own output.
+      (void)hipblasLtMatmul(lt.h, desc, &walpha, W, lw, A, la, &wbeta, C, lc, C,
+                            lc, &heur[i].algo, tws, heur[i].workspaceSize, s);
+      (void)hipStreamSynchronize(s);
+      hipEvent_t ev0, ev1;
+      (void)hipEventCreate(&ev0);
+      (void)hipEventCreate(&ev1);
+      (void)hipEventRecord(ev0, s);
+      for (int r = 0; r < 3; ++r)
+        (void)hipblasLtMatmul(lt.h, desc, &walpha, W, lw, A, la, &wbeta, C, lc,
+                              C, lc, &heur[i].algo, tws,
+                              heur[i].workspaceSize, s);
+      (void)hipEventRecord(ev1, s);
+      (void)hipStreamSynchronize(s);
+      float ms = 0.f;
+      (void)hipEventElapsedTime(&ms, ev0, ev1);
+      ms /= 3.0f;
+      (void)hipEventDestroy(ev0);
+      (void)hipEventDestroy(ev1);
+      if (tws) (void)hipFree(tws);
+      if (ms < best_ms) {
+        best_ms = ms;
+        best = i;
+        best_ws = heur[i].workspaceSize;
+      }
+    }
+    if (best < 0) {
+      cleanup();
+      return false;
+    }
+    it = cache.emplace(key, heur[best].algo).first;
+    ws_sizes.emplace(key, best_ws);
+    std::fprintf(stderr,
+                 "vt rocm exl3 recon: Lt algo %d of %d for m=%d n=%d k=%d "
+                 "(%.3f ms)\n",
+                 best, returned, m, n, k, best_ms);
+  }
+
+  // Grow-only Lt workspace per stream — the same capture-safety contract as
+  // the recon scratch above.
+  struct LtWs {
+    void* p = nullptr;
+    size_t bytes = 0;
+  };
+  static std::mutex ws_mu;
+  static std::unordered_map<hipStream_t, LtWs> ws_pool;
+  const size_t need = ws_sizes.at(key);
+  void* ws = nullptr;
+  if (need) {
+    std::lock_guard<std::mutex> lk(ws_mu);
+    LtWs& e = ws_pool[s];
+    if (need > e.bytes) {
+      if (StreamCapturing(s)) {
+        cleanup();
+        return false;  // refusing growth mid-capture; GemmEx arm picks it up
+      }
+      void* p = nullptr;
+      if (hipMalloc(&p, need) != hipSuccess) {
+        cleanup();
+        return false;
+      }
+      e.p = p;
+      e.bytes = need;
+    }
+    ws = e.p;
+  }
+
+  const float alpha = 1.0f, beta = 0.0f;
+  const hipblasStatus_t st = hipblasLtMatmul(lt.h, desc, &alpha, W, lw, A, la,
+                                           &beta, C, lc, C, lc, &it->second, ws,
+                                           need, s);
+  cleanup();
+  if (st != HIPBLAS_STATUS_SUCCESS) {
+    cache.erase(key);  // a failing cached algo is poison for the next call
+    return false;
+  }
+  return true;
+}
+#endif  // VLLM_CPP_HAS_HIPBLASLT
 
 // ─── step 3: f16 @ f16 -> f16|f32 GEMM through hipblasGemmEx ─────────────────
 //
@@ -218,6 +422,17 @@ void Exl3ReconstructGemmKernelRocm(Queue& q, Tensor& c, const Tensor& a,
     // stride, so ldc is c.stride[0], not n_slice.
     void* c_slice = static_cast<char*>(c.data) +
                     static_cast<size_t>(n_start) * (c.dtype == DType::kF32 ? 4 : 2);
+#ifdef VLLM_CPP_HAS_HIPBLASLT
+    // The Lt arm is an A/B lever, not a dispatch override: a decline (no
+    // handle, heuristic miss, capture-time workspace growth) falls through to
+    // the same GemmEx call the arm replaces.
+    if (!ReconLtDisabled() &&
+        HgemmLtRowMajor(st, c_slice, a_had.data, scratch_w,
+                        static_cast<int>(size_m), static_cast<int>(n_slice),
+                        static_cast<int>(size_k), c.stride[0],
+                        c.dtype == DType::kF32))
+      continue;
+#endif
     HgemmRowMajor(q.device.index, st, c_slice, a_had.data, scratch_w, size_m, n_slice,
                   size_k, c.stride[0], c.dtype == DType::kF32);
   }
