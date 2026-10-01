@@ -8,7 +8,7 @@
 #include "rocm_rdna3_dot2.h"
 // Compile the same rocWMMA BF16 tiles for the admitted RDNA3 and RDNA4 targets.
 // Keep this set aligned with GcnArchNameHasSharedKAttentionWmma at host dispatch.
-#if defined(__gfx1100__) || defined(__gfx1200__) || defined(__gfx1201__)
+#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1200__) || defined(__gfx1201__)
 #include <rocwmma/rocwmma.hpp>
 
 #include "rocm_rdna3_wmma.h"

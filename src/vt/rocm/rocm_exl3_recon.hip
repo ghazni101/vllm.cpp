@@ -184,6 +184,14 @@ static bool HgemmLtRowMajor(hipStream_t s, void* C, const void* A, const void* W
 
   auto it = cache.find(key);
   if (it == cache.end()) {
+    // The timing sweep below runs hipMalloc + hipStreamSynchronize +
+    // hipEvent* — all illegal inside stream capture. A new (shape,ldc,dtype)
+    // key first seen during capture declines to the GemmEx arm instead of
+    // poisoning the capture; the first warm call outside capture caches it.
+    if (StreamCapturing(s)) {
+      cleanup();
+      return false;
+    }
     // Rank-0 is not trustworthy on gfx11: for (m=2022,n=4096,k=4096,f16->f32)
     // the heuristic's first pick measured 15.7 ms while algo #4 of the same
     // request ran 1.5 ms (44.6 TFLOP/s, 10.8x). Ask for several candidates and
@@ -210,17 +218,27 @@ static bool HgemmLtRowMajor(hipStream_t s, void* C, const void* A, const void* W
         continue;
       // Warm-up then time 3 back-to-back launches on the caller's buffers.
       // These writes land in c anyway — the GEMM is the caller's own output.
-      (void)hipblasLtMatmul(lt.h, desc, &walpha, W, lw, A, la, &wbeta, C, lc, C,
-                            lc, &heur[i].algo, tws, heur[i].workspaceSize, s);
+      // A failing matmul must not win 'best': an algo that fails at launch
+      // records ~0 ms and would be cached for the production call below.
+      hipblasStatus_t ms0 = hipblasLtMatmul(lt.h, desc, &walpha, W, lw, A, la,
+                                            &wbeta, C, lc, C, lc, &heur[i].algo,
+                                            tws, heur[i].workspaceSize, s);
+      if (ms0 != HIPBLAS_STATUS_SUCCESS) {
+        if (tws) (void)hipFree(tws);
+        continue;
+      }
       (void)hipStreamSynchronize(s);
       hipEvent_t ev0, ev1;
       (void)hipEventCreate(&ev0);
       (void)hipEventCreate(&ev1);
       (void)hipEventRecord(ev0, s);
-      for (int r = 0; r < 3; ++r)
-        (void)hipblasLtMatmul(lt.h, desc, &walpha, W, lw, A, la, &wbeta, C, lc,
-                              C, lc, &heur[i].algo, tws,
-                              heur[i].workspaceSize, s);
+      hipblasStatus_t timed_st = HIPBLAS_STATUS_SUCCESS;
+      for (int r = 0; r < 3; ++r) {
+        const hipblasStatus_t r_ =
+            hipblasLtMatmul(lt.h, desc, &walpha, W, lw, A, la, &wbeta, C, lc,
+                            C, lc, &heur[i].algo, tws, heur[i].workspaceSize, s);
+        if (r_ != HIPBLAS_STATUS_SUCCESS) timed_st = r_;
+      }
       (void)hipEventRecord(ev1, s);
       (void)hipStreamSynchronize(s);
       float ms = 0.f;
@@ -229,6 +247,7 @@ static bool HgemmLtRowMajor(hipStream_t s, void* C, const void* A, const void* W
       (void)hipEventDestroy(ev0);
       (void)hipEventDestroy(ev1);
       if (tws) (void)hipFree(tws);
+      if (timed_st != HIPBLAS_STATUS_SUCCESS) continue;
       if (ms < best_ms) {
         best_ms = ms;
         best = i;
@@ -240,7 +259,8 @@ static bool HgemmLtRowMajor(hipStream_t s, void* C, const void* A, const void* W
       return false;
     }
     it = cache.emplace(key, heur[best].algo).first;
-    ws_sizes.emplace(key, best_ws);
+    ws_sizes[key] = best_ws;  // overwrite: a stale entry must not pin the
+                            // freshly-swept algo to a too-small workspace
     std::fprintf(stderr,
                  "vt rocm exl3 recon: Lt algo %d of %d for m=%d n=%d k=%d "
                  "(%.3f ms)\n",
@@ -283,6 +303,7 @@ static bool HgemmLtRowMajor(hipStream_t s, void* C, const void* A, const void* W
   cleanup();
   if (st != HIPBLAS_STATUS_SUCCESS) {
     cache.erase(key);  // a failing cached algo is poison for the next call
+    ws_sizes.erase(key);  // paired: a stale size would pin the re-swept algo
     return false;
   }
   return true;
