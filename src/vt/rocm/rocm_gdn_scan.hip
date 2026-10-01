@@ -281,12 +281,16 @@ void LaunchGdnScanState(hipStream_t s, Tensor& out, const Tensor& q_in,
   // the row split (0 disables the fused arm).
   static const int kZsplitEnv = [] {
     const char* e = std::getenv("VT_GDN_SCAN_ZSPLIT");
-    return e ? std::atoi(e) : 4;
+    const int v = e ? std::atoi(e) : 4;
+    // gridDim.z is capped at 65535 and a split wider than dv only wastes idle
+    // blocks — clamp rather than launch invalid.
+    return std::max(0, std::min(v, 65535));
   }();
   const bool fused_ok = scan_coop && qsl == nullptr && kZsplitEnv > 0 &&
                         (dk == 64 || dk == 128);
+  const int zsplit = fused_ok ? std::min<int>(kZsplitEnv, dv) : 1;
   const dim3 grid(static_cast<unsigned>(hv_n), static_cast<unsigned>(n),
-                  static_cast<unsigned>(fused_ok ? kZsplitEnv : 1));
+                  static_cast<unsigned>(zsplit));
   const size_t shmem = 2 * static_cast<size_t>(dk) * sizeof(float);
   if (state.dtype == DType::kF16) {
     if (fused_ok) {
@@ -294,12 +298,12 @@ void LaunchGdnScanState(hipStream_t s, Tensor& out, const Tensor& q_in,
         GdnScanCoopFusedK<Tin, Tout, __half, 4><<<grid, kBlock, shmem, s>>>(
             out.Ptr<Tout>(), q_in.Ptr<Tin>(), k.Ptr<Tin>(), v.Ptr<Tin>(),
             g.Ptr<float>(), beta.Ptr<float>(), state.Ptr<__half>(), qsl,
-            state_idx, state.shape[0], hk_n, dk, hv_n, dv, args.scale, kZsplitEnv);
+            state_idx, state.shape[0], hk_n, dk, hv_n, dv, args.scale, zsplit);
       else
         GdnScanCoopFusedK<Tin, Tout, __half, 2><<<grid, kBlock, shmem, s>>>(
             out.Ptr<Tout>(), q_in.Ptr<Tin>(), k.Ptr<Tin>(), v.Ptr<Tin>(),
             g.Ptr<float>(), beta.Ptr<float>(), state.Ptr<__half>(), qsl,
-            state_idx, state.shape[0], hk_n, dk, hv_n, dv, args.scale, kZsplitEnv);
+            state_idx, state.shape[0], hk_n, dk, hv_n, dv, args.scale, zsplit);
     } else if (scan_coop) {
       GdnScanCoopK<Tin, Tout, __half><<<grid, kBlock, shmem, s>>>(
           out.Ptr<Tout>(), q_in.Ptr<Tin>(), k.Ptr<Tin>(), v.Ptr<Tin>(),
@@ -317,12 +321,12 @@ void LaunchGdnScanState(hipStream_t s, Tensor& out, const Tensor& q_in,
         GdnScanCoopFusedK<Tin, Tout, __hip_bfloat16, 4><<<grid, kBlock, shmem, s>>>(
             out.Ptr<Tout>(), q_in.Ptr<Tin>(), k.Ptr<Tin>(), v.Ptr<Tin>(),
             g.Ptr<float>(), beta.Ptr<float>(), state.Ptr<__hip_bfloat16>(), qsl,
-            state_idx, state.shape[0], hk_n, dk, hv_n, dv, args.scale, kZsplitEnv);
+            state_idx, state.shape[0], hk_n, dk, hv_n, dv, args.scale, zsplit);
       else
         GdnScanCoopFusedK<Tin, Tout, __hip_bfloat16, 2><<<grid, kBlock, shmem, s>>>(
             out.Ptr<Tout>(), q_in.Ptr<Tin>(), k.Ptr<Tin>(), v.Ptr<Tin>(),
             g.Ptr<float>(), beta.Ptr<float>(), state.Ptr<__hip_bfloat16>(), qsl,
-            state_idx, state.shape[0], hk_n, dk, hv_n, dv, args.scale, kZsplitEnv);
+            state_idx, state.shape[0], hk_n, dk, hv_n, dv, args.scale, zsplit);
     } else if (scan_coop) {
       GdnScanCoopK<Tin, Tout, __hip_bfloat16><<<grid, kBlock, shmem, s>>>(
           out.Ptr<Tout>(), q_in.Ptr<Tin>(), k.Ptr<Tin>(), v.Ptr<Tin>(),
@@ -340,12 +344,12 @@ void LaunchGdnScanState(hipStream_t s, Tensor& out, const Tensor& q_in,
         GdnScanCoopFusedK<Tin, Tout, float, 4><<<grid, kBlock, shmem, s>>>(
             out.Ptr<Tout>(), q_in.Ptr<Tin>(), k.Ptr<Tin>(), v.Ptr<Tin>(),
             g.Ptr<float>(), beta.Ptr<float>(), state.Ptr<float>(), qsl,
-            state_idx, state.shape[0], hk_n, dk, hv_n, dv, args.scale, kZsplitEnv);
+            state_idx, state.shape[0], hk_n, dk, hv_n, dv, args.scale, zsplit);
       else
         GdnScanCoopFusedK<Tin, Tout, float, 2><<<grid, kBlock, shmem, s>>>(
             out.Ptr<Tout>(), q_in.Ptr<Tin>(), k.Ptr<Tin>(), v.Ptr<Tin>(),
             g.Ptr<float>(), beta.Ptr<float>(), state.Ptr<float>(), qsl,
-            state_idx, state.shape[0], hk_n, dk, hv_n, dv, args.scale, kZsplitEnv);
+            state_idx, state.shape[0], hk_n, dk, hv_n, dv, args.scale, zsplit);
     } else if (scan_coop) {
       GdnScanCoopK<Tin, Tout, float><<<grid, kBlock, shmem, s>>>(
           out.Ptr<Tout>(), q_in.Ptr<Tin>(), k.Ptr<Tin>(), v.Ptr<Tin>(),
