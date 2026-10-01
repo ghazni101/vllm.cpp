@@ -2929,6 +2929,35 @@ void PagedAttentionKernelRocm(Queue& q, Tensor& out, const Tensor& query, const 
   
   if (bf16_decode_opt) {
     const int64_t qg = hq / num_kv_heads;
+
+    // Qwen3.5-family heads (hq=16, kv=4 → qg=4, d=256): decode stays on
+    // DecodeOpt above, but prefill falls all the way to the serial
+    // PagedAttnOnline — measured 22-24% of a 2k-token prefill on gfx1101
+    // (rocprofv3, Qwen3.5-9B-EXL3). The QG=2 SharedKWmma arm already z-tiles
+    // the group via blockIdx.z (the qg=8/d=512 case proves it), so qg=4 runs
+    // the same kernel at z=2. Prefill-only; nothing on the decode arm changes.
+    if (decode_gqa && qg == 4 && d == 256 && num_reqs == 1 &&
+        total_q >= 64 && SharedKAttentionWmmaHostOk()) {
+      constexpr int BM = 16, BN = 64;
+      const unsigned tiles = static_cast<unsigned>((total_q + BM - 1) / BM);
+      dim3 grid(tiles, static_cast<unsigned>(num_kv_heads), 2u);
+      dim3 block(static_cast<unsigned>(BM * 32));
+      const size_t smem =
+          sizeof(__hip_bfloat16) *
+          (static_cast<size_t>(BM) * 2 * static_cast<size_t>(d) +
+           static_cast<size_t>(BN) * static_cast<size_t>(d));
+      PagedAttnPrefillSharedKWmma<2, 8, BM, BN, false>
+          <<<grid, block, smem, st>>>(
+              out.Ptr<__hip_bfloat16>(), query.Ptr<__hip_bfloat16>(),
+              k_cache.Ptr<__hip_bfloat16>(), v_cache.Ptr<__hip_bfloat16>(),
+              block_table.Ptr<int32_t>(), seq_lens.Ptr<int32_t>(),
+              query_start_loc.Ptr<int32_t>(), num_reqs, hq, num_kv_heads, d,
+              block_size, bt_row, bt_col, kc_blk, kc_pg, kc_hd, vc_blk, vc_pg,
+              vc_hd, args.scale, args.logits_soft_cap, args.causal,
+              window_left, window_right);
+      Check(hipGetLastError(), "paged_attention prefill_sharedk_wmma qg4 launch");
+      return;
+    }
     // GQA fuse: sliding QG=2. Global QG=8: tile as DecodeGqa QG=2 × z=4
     // (proven kernel; halves K/V reloads vs DecodeOpt's 8×). QG=4/8 CTAs lost A/B.
     if (decode_gqa &&
@@ -3254,6 +3283,45 @@ void PagedAttentionKernelRocm(Queue& q, Tensor& out, const Tensor& query, const 
     Check(hipGetLastError(), "paged_attention decode_gqa_f32q launch");
 
     return;
+  }
+
+  // f32-query + bf16-KV prefill fast path (Qwen3.5's served dtype mix:
+  // PagedAttnOnline<float, __hip_bfloat16, float> measured 22-24% of a
+  // 2k-token prefill on gfx1101). Same kernel + z-tiling the fp8 arm uses,
+  // bf16 KV instead of fp8. total_q>=64 mirrors the fp8 admission.
+  static const bool bf16kv_prefill_sharedk = [] {
+    const char* e = std::getenv("VT_ATTN_PREFILL_F32Q_B16KV");
+    if (!e) return true;  // default ON
+    return e[0] != '0';
+  }();
+  const bool f32q_bf16kv_prefill =
+      bf16kv_prefill_sharedk && query.dtype == DType::kF32 &&
+      out.dtype == DType::kF32 && k_cache.dtype == DType::kBF16 &&
+      v_cache.dtype == DType::kBF16 && d == 256 && total_q >= 64 &&
+      num_reqs == 1;
+  if (f32q_bf16kv_prefill) {
+    const int64_t qg = hq / num_kv_heads;
+    if (qg == 2 || qg == 4 || qg == 8) {
+      constexpr int QG = 2;
+      constexpr int EPL = 8;   // d=256
+      constexpr int BM = 32, BN = 32;
+      const unsigned z_groups = static_cast<unsigned>(qg / QG);
+      const unsigned tiles = static_cast<unsigned>((total_q + BM - 1) / BM);
+      dim3 gridp(tiles, static_cast<unsigned>(num_kv_heads), z_groups);
+      dim3 blockp(static_cast<unsigned>(BM * 32));
+      const size_t smemp = sizeof(__hip_bfloat16) * 2u * BN * d;
+      PagedAttnPrefillSharedK<QG, EPL, BM, BN, __hip_bfloat16, float, float>
+          <<<gridp, blockp, smemp, st>>>(
+              out.Ptr<float>(), query.Ptr<float>(),
+              k_cache.Ptr<__hip_bfloat16>(), v_cache.Ptr<__hip_bfloat16>(),
+              block_table.Ptr<int32_t>(), seq_lens.Ptr<int32_t>(),
+              query_start_loc.Ptr<int32_t>(), num_reqs, hq, num_kv_heads, d,
+              block_size, bt_row, bt_col, kc_blk, kc_pg, kc_hd, vc_blk,
+              vc_pg, vc_hd, args.scale, args.logits_soft_cap, args.causal,
+              window_left, window_right, args.k_scale, args.v_scale);
+      Check(hipGetLastError(), "paged_attention f32q_bf16kv prefill_sharedk launch");
+      return;
+    }
   }
   auto launch = [&](auto q_tag, auto kv_tag, auto o_tag) {
     using TQ = decltype(q_tag);
