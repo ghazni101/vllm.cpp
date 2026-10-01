@@ -117,3 +117,29 @@ was reverted.
   is a one-line platform change that should ride with gfx1101 captured-arm
   evidence — this spec's serving run IS that evidence; leaving the flip to
   review discretion.
+
+## Outcome (2026-10-01)
+
+Landed on `pp-exl3-recon-lt` (worktree vllm.cpp-pp), five commits:
+
+- `8103ca546` spec + issue records
+- `b690dea96` hipBLASLt recon GEMM (closes ISSUE-LOCAL-01M3T5GBR5NS2B778YRKWK0ZG3)
+- `63e117e81` f32-query attention + fused GDN scan + gfx1101 WMMA admission
+- `8a230b5c4` recon issue record close
+- `b2028bd57` review repairs
+
+Measured on gfx1101, `Qwen3.5-9B-EXL3-4.00bpw`, greedy: 11.05s → 3.10s
+(2022+32 tok), 29.6 → 40.4 tok/s decode. Fresh-review loop: pass 1 found 2×P1
+(gfx1101 host-admitted but compile-excluded WMMA stub; test_rocm_arch
+contradiction), 2×P2 (capture-unsafe Lt sweep; ws_sizes desync), 3×P3 — all
+repaired in `b2028bd57`. Pass 2: PASS; residual P3s recorded below.
+
+Residuals owed: (a) gfx1101 takes the gfx12-style plain `mma_sync` semantics in
+`AttentionMmaSync` rather than gfx1100's canonicalized path — correct
+(oracle-verified) but numerically distinct; a dedicated gfx1101 parity gate
+would decide whether to extend the gfx1100 gates. (b) `ws_sizes`/`cache`
+pairing is unobservable by current tests. (c) `static_graph_requires_opt_in()`
+still returns eager for gfx1101 by default — `VLLM_CPP_ROCM_STATIC_GRAPH=1`
+verified working (62 replays); the arch flip wants a gfx1101 evidence row.
+(d) M1K4 ~370 GB/s vs ~10.5ms/token stream floor; HadK+casts ~2.6ms/token;
+~10ms/token host-serial step — next structural items.
