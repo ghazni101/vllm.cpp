@@ -177,6 +177,89 @@ __global__ void GdnScanCoopK(Tout* out, const Tin* q, const Tin* k,
   }
 }
 
+// ── Register-fused cooperative scan (RX-7700XT campaign, decode latency) ────
+// Same work mapping as GdnScanCoopK (one warp per state row) with two changes
+// for the latency-bound decode step on gfx1101:
+//   1. FUSED DOT+UPDATE: the row is loaded ONCE into per-lane registers,
+//      dotted, updated in place, stored ONCE. The donor mapping reads the
+//      state row twice (dot pass + update pass) and writes once — this arm
+//      removes one full state pass per row.
+//   2. Row z-split: gridDim.z partitions the dv rows across blocks so the
+//      t=1 decode step occupies more SMs. ZSPLIT is a launch parameter; the
+//      z=1 case degenerates to GdnScanCoopK exactly.
+// Same numerics as GdnScanCoopK (tree-order reductions, same formulas).
+// dk is a template bound (KD elems per lane = dk/32); callers dispatch
+// dk in {64, 128}; anything else falls back to GdnScanCoopK.
+template <typename Tin, typename Tout, typename TState, int KD>
+__global__ void GdnScanCoopFusedK(Tout* out, const Tin* q, const Tin* k,
+                                  const Tin* v, const float* g, const float* beta,
+                                  TState* state, const int32_t* qsl,
+                                  const int32_t* state_idx, int64_t state_slots,
+                                  int64_t hk_n, int64_t dk, int64_t hv_n,
+                                  int64_t dv, float scale, int zsplit) {
+  constexpr int NWARPS = kBlock / 32;
+  const int64_t s = blockIdx.y;
+  const int64_t hv = blockIdx.x;
+  const int64_t hk = hv / (hv_n / hk_n);
+  const int64_t state_slot = state_idx != nullptr ? state_idx[s] : s;
+  // Row slice owned by this z-block: contiguous [row_lo, row_hi).
+  const int64_t rows_per = (dv + zsplit - 1) / zsplit;
+  const int64_t row_lo = blockIdx.z * rows_per;
+  const int64_t row_hi = min(dv, row_lo + rows_per);
+  if (state_slot < 0 || state_slot >= state_slots) {
+    const int64_t begin = qsl != nullptr ? qsl[s] : s;
+    const int64_t end = qsl != nullptr ? qsl[s + 1] : s + 1;
+    for (int64_t t = begin; t < end; ++t)
+      for (int64_t vi = row_lo + threadIdx.x; vi < row_hi; vi += blockDim.x)
+        St(out, (t * hv_n + hv) * dv + vi, 0.0f);
+    return;
+  }
+  extern __shared__ float smem[];
+  float* q_sh = smem;
+  float* k_sh = smem + dk;
+  TState* s_head = state + (state_slot * hv_n + hv) * dv * dk;
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+  const int warp = static_cast<int>(threadIdx.x) >> 5;
+  const int64_t begin = qsl != nullptr ? qsl[s] : s;
+  const int64_t end = qsl != nullptr ? qsl[s + 1] : s + 1;
+  for (int64_t t = begin; t < end; ++t) {
+    for (int64_t i = threadIdx.x; i < dk; i += blockDim.x) {
+      q_sh[i] = Ld(q, (t * hk_n + hk) * dk + i) * scale;
+      k_sh[i] = Ld(k, (t * hk_n + hk) * dk + i);
+    }
+    __syncthreads();
+    const float decay = expf(g[t * hv_n + hv]);
+    const float beta_t = beta[t * hv_n + hv];
+    for (int64_t vi = row_lo + warp; vi < row_hi; vi += NWARPS) {
+      TState* s_row = s_head + vi * dk;
+      float rv[KD];
+      float dot = 0.0f;
+#pragma unroll
+      for (int ki = 0; ki < KD; ++ki) {
+        const int64_t kk = static_cast<int64_t>(lane) + ki * 32;
+        rv[ki] = Ld(s_row, kk) * decay;
+        dot += rv[ki] * k_sh[kk];
+      }
+#pragma unroll
+      for (int off = 16; off > 0; off >>= 1) dot += __shfl_down(dot, off);
+      dot = __shfl(dot, 0);
+      const float vp = (Ld(v, (t * hv_n + hv) * dv + vi) - dot) * beta_t;
+      float o = 0.0f;
+#pragma unroll
+      for (int ki = 0; ki < KD; ++ki) {
+        const int64_t kk = static_cast<int64_t>(lane) + ki * 32;
+        const float updated = rv[ki] + vp * k_sh[kk];
+        St(s_row, kk, updated);
+        o += updated * q_sh[kk];
+      }
+#pragma unroll
+      for (int off = 16; off > 0; off >>= 1) o += __shfl_down(o, off);
+      if (lane == 0) St(out, (t * hv_n + hv) * dv + vi, o);
+    }
+    __syncthreads();
+  }
+}
+
 template <typename Tin, typename Tout>
 void LaunchGdnScanState(hipStream_t s, Tensor& out, const Tensor& q_in,
                         const Tensor& k, const Tensor& v, const Tensor& g,
@@ -185,16 +268,39 @@ void LaunchGdnScanState(hipStream_t s, Tensor& out, const Tensor& q_in,
                         const GdnArgs& args) {
   const int64_t hk_n = q_in.shape[1], dk = q_in.shape[2];
   const int64_t hv_n = v.shape[1], dv = v.shape[2];
-  const dim3 grid(static_cast<unsigned>(hv_n), static_cast<unsigned>(n));
-  const size_t shmem = 2 * static_cast<size_t>(dk) * sizeof(float);
   // T6a opt-in (read once per process like the sibling arms): the
   // warp-per-row cooperative mapping. Default OFF keeps the donor walk.
   static const bool scan_coop = [] {
     const char* e = std::getenv("VT_GDN_SCAN_COOP");
     return e != nullptr && e[0] == '1' && e[1] == '\0';
   }();
+  // Register-fused arm (same mapping, one state pass): decode is the
+  // latency-bound case, so the fused kernel + a row z-split applies only
+  // when qsl == nullptr (each seq advances exactly one token). Prefill and
+  // dk not in {64,128} stay on GdnScanCoopK. VT_GDN_SCAN_ZSPLIT overrides
+  // the row split (0 disables the fused arm).
+  static const int kZsplitEnv = [] {
+    const char* e = std::getenv("VT_GDN_SCAN_ZSPLIT");
+    return e ? std::atoi(e) : 4;
+  }();
+  const bool fused_ok = scan_coop && qsl == nullptr && kZsplitEnv > 0 &&
+                        (dk == 64 || dk == 128);
+  const dim3 grid(static_cast<unsigned>(hv_n), static_cast<unsigned>(n),
+                  static_cast<unsigned>(fused_ok ? kZsplitEnv : 1));
+  const size_t shmem = 2 * static_cast<size_t>(dk) * sizeof(float);
   if (state.dtype == DType::kF16) {
-    if (scan_coop) {
+    if (fused_ok) {
+      if (dk == 128)
+        GdnScanCoopFusedK<Tin, Tout, __half, 4><<<grid, kBlock, shmem, s>>>(
+            out.Ptr<Tout>(), q_in.Ptr<Tin>(), k.Ptr<Tin>(), v.Ptr<Tin>(),
+            g.Ptr<float>(), beta.Ptr<float>(), state.Ptr<__half>(), qsl,
+            state_idx, state.shape[0], hk_n, dk, hv_n, dv, args.scale, kZsplitEnv);
+      else
+        GdnScanCoopFusedK<Tin, Tout, __half, 2><<<grid, kBlock, shmem, s>>>(
+            out.Ptr<Tout>(), q_in.Ptr<Tin>(), k.Ptr<Tin>(), v.Ptr<Tin>(),
+            g.Ptr<float>(), beta.Ptr<float>(), state.Ptr<__half>(), qsl,
+            state_idx, state.shape[0], hk_n, dk, hv_n, dv, args.scale, kZsplitEnv);
+    } else if (scan_coop) {
       GdnScanCoopK<Tin, Tout, __half><<<grid, kBlock, shmem, s>>>(
           out.Ptr<Tout>(), q_in.Ptr<Tin>(), k.Ptr<Tin>(), v.Ptr<Tin>(),
           g.Ptr<float>(), beta.Ptr<float>(), state.Ptr<__half>(), qsl, state_idx,
@@ -206,7 +312,18 @@ void LaunchGdnScanState(hipStream_t s, Tensor& out, const Tensor& q_in,
           state.shape[0], hk_n, dk, hv_n, dv, args.scale);
     }
   } else if (state.dtype == DType::kBF16) {
-    if (scan_coop) {
+    if (fused_ok) {
+      if (dk == 128)
+        GdnScanCoopFusedK<Tin, Tout, __hip_bfloat16, 4><<<grid, kBlock, shmem, s>>>(
+            out.Ptr<Tout>(), q_in.Ptr<Tin>(), k.Ptr<Tin>(), v.Ptr<Tin>(),
+            g.Ptr<float>(), beta.Ptr<float>(), state.Ptr<__hip_bfloat16>(), qsl,
+            state_idx, state.shape[0], hk_n, dk, hv_n, dv, args.scale, kZsplitEnv);
+      else
+        GdnScanCoopFusedK<Tin, Tout, __hip_bfloat16, 2><<<grid, kBlock, shmem, s>>>(
+            out.Ptr<Tout>(), q_in.Ptr<Tin>(), k.Ptr<Tin>(), v.Ptr<Tin>(),
+            g.Ptr<float>(), beta.Ptr<float>(), state.Ptr<__hip_bfloat16>(), qsl,
+            state_idx, state.shape[0], hk_n, dk, hv_n, dv, args.scale, kZsplitEnv);
+    } else if (scan_coop) {
       GdnScanCoopK<Tin, Tout, __hip_bfloat16><<<grid, kBlock, shmem, s>>>(
           out.Ptr<Tout>(), q_in.Ptr<Tin>(), k.Ptr<Tin>(), v.Ptr<Tin>(),
           g.Ptr<float>(), beta.Ptr<float>(), state.Ptr<__hip_bfloat16>(), qsl,
@@ -218,7 +335,18 @@ void LaunchGdnScanState(hipStream_t s, Tensor& out, const Tensor& q_in,
           state_idx, state.shape[0], hk_n, dk, hv_n, dv, args.scale);
     }
   } else {
-    if (scan_coop) {
+    if (fused_ok) {
+      if (dk == 128)
+        GdnScanCoopFusedK<Tin, Tout, float, 4><<<grid, kBlock, shmem, s>>>(
+            out.Ptr<Tout>(), q_in.Ptr<Tin>(), k.Ptr<Tin>(), v.Ptr<Tin>(),
+            g.Ptr<float>(), beta.Ptr<float>(), state.Ptr<float>(), qsl,
+            state_idx, state.shape[0], hk_n, dk, hv_n, dv, args.scale, kZsplitEnv);
+      else
+        GdnScanCoopFusedK<Tin, Tout, float, 2><<<grid, kBlock, shmem, s>>>(
+            out.Ptr<Tout>(), q_in.Ptr<Tin>(), k.Ptr<Tin>(), v.Ptr<Tin>(),
+            g.Ptr<float>(), beta.Ptr<float>(), state.Ptr<float>(), qsl,
+            state_idx, state.shape[0], hk_n, dk, hv_n, dv, args.scale, kZsplitEnv);
+    } else if (scan_coop) {
       GdnScanCoopK<Tin, Tout, float><<<grid, kBlock, shmem, s>>>(
           out.Ptr<Tout>(), q_in.Ptr<Tin>(), k.Ptr<Tin>(), v.Ptr<Tin>(),
           g.Ptr<float>(), beta.Ptr<float>(), state.Ptr<float>(), qsl, state_idx,

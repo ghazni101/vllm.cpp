@@ -1204,6 +1204,18 @@ bool Exl3GemvTryLaunchRocm(hipStream_t st, const Tensor& a_had, const Tensor& tr
     block_dim = cfg == 0 ? 512 : 256;
     cols = cfg == 0 ? 32 : 64;
   }
+
+  // Lab diagnostic: VT_EXL3_GEMV_DUMP=1 prints one stderr line per launch with
+  // the resolved shape. Off by default; launch sites only.
+  static const bool kDump = [] {
+    const char* e = std::getenv("VT_EXL3_GEMV_DUMP");
+    return e != nullptr && e[0] == '1';
+  }();
+  if (kDump)
+    std::fprintf(stderr,
+                 "[exl3_gemv] m=%d k=%d n=%d bits=%d cb=%d cols=%d block=%d\n",
+                 size_m, size_k, size_n, args.bits, args.codebook, cols,
+                 block_dim);
   if (kernel == nullptr) return false;
 
   const int max_blocks = GemvOccupancyRocm(kernel, block_dim) * num_sms;
