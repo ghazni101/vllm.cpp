@@ -1008,6 +1008,98 @@ __global__ __launch_bounds__(512) void Exl3GemvM1K4(
     __syncthreads();
   }
 }
+// Load-position 3 bpw sibling of Exl3GemvM1K4 (bench3.hip M1K3v, verified
+// bit-identical to Exl3GemvM1K<3,cb> at ksplit 1 and 2). Same ownership idea:
+// lane l owns codewords 32*l7..32*l7+31 of tile l>>3, and a 3 bpw lane window
+// lands in exactly THREE words {24*t + 3*l7 .. +2}, so the stream is three
+// contiguous dword loads per lane per k-slice plus ONE boundary word fetched
+// with a single convergent __shfl_sync from the previous lane (the l7==0 lane
+// takes lane|7, the same tile group's last lane, matching the window math).
+// Whole-column accumulators feed the same sh_red epilogue as M1K4 — no
+// per-tile xor folds. Serving shapes measure +5..+35% over the dq8-mapping
+// 3 bpw arm (own3 rows of bench3.hip, gfx1100).
+template <int cb>
+__global__ __launch_bounds__(512) void Exl3GemvM1K3(
+    const half* __restrict__ A, const uint16_t* __restrict__ B, float* __restrict__ C,
+    int size_m, int size_k, int size_n) {
+  (void)size_m;
+  constexpr int WK = 16;
+  constexpr int PF = 4;
+  constexpr int COLS = 64;
+  const int warp = threadIdx.x / 32;
+  const int lane = threadIdx.x % 32;
+  const int l7 = lane & 7;
+  const int ntiles = size_n / 16;
+  const int kslices = size_k / 16;
+  const int num_groups = size_n / COLS;
+  const int ksplit = gridDim.y;
+  const int chunk = (kslices + WK * ksplit - 1) / (WK * ksplit);
+  const int ks0 = (blockIdx.y * WK + warp) * chunk;
+  const int myn = max(0, min(chunk, kslices - ks0));
+  const uint32_t* B32 = reinterpret_cast<const uint32_t*>(B);
+  const int w0 = (lane >> 3) * 24 + l7 * 3;
+  const size_t slice_stride = (size_t)ntiles * 24;
+  const half2* A2 = reinterpret_cast<const half2*>(A);
+  __shared__ float sh_red[WK][COLS];
+  for (int group = blockIdx.x; group < num_groups; group += gridDim.x) {
+    const uint32_t* bp = B32 + (size_t)ks0 * slice_stride + (size_t)group * 96;
+    auto ld_b = [&](int i, uint32_t& x, uint32_t& y, uint32_t& z) {
+      const uint32_t* p = bp + (size_t)i * slice_stride + w0;
+      x = p[0]; y = p[1]; z = p[2];
+    };
+    uint32_t pf[PF][3];
+#pragma unroll
+    for (int d = 0; d < PF; ++d) if (d < myn) ld_b(d, pf[d][0], pf[d][1], pf[d][2]);
+    float accA = 0.0f, accB = 0.0f;
+    for (int ib = 0; ib < myn; ib += PF) {
+#pragma unroll
+      for (int d = 0; d < PF; ++d) {
+        const int i = ib + d;
+        if (i >= myn) break;
+        const uint32_t v0 = pf[d][0], v1 = pf[d][1], v2 = pf[d][2];
+        if (i + PF < myn) ld_b(i + PF, pf[d][0], pf[d][1], pf[d][2]);
+        const int bsrc = (l7 == 0) ? (lane | 7) : (lane - 1);
+        const uint32_t wb = __shfl_sync(0xffffffffffffffffULL, v2, bsrc);
+        const uint32_t w[4] = {wb, v0, v1, v2};
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          FragB fA, fB;
+          uint32_t cw[8];
+#pragma unroll
+          for (int ss = 0; ss < 8; ++ss) {
+            const int sc = j * 8 + ss;
+            // window rel to word 3*l7-1: r0 = ((3*sc+755)>>5)-23
+            const int r0 = ((3 * sc + 755) >> 5) - 23;
+            const int r1 = ((3 * sc + 770) >> 5) - 23;
+            const int s0 = 32 * (((3 * sc + 770) >> 5) + 1) - (3 * sc + 771);
+            cw[ss] = fshift(w[r1], w[r0], s0) & 0xffffu;
+          }
+          decode8<cb>(cw[0], cw[1], cw[2], cw[3], cw[4], cw[5], cw[6], cw[7],
+                      fA, fB);
+          const size_t a_col = (size_t)(ks0 + i) * 8;
+          const half2 a01 = A2[a_col + j];
+          const half2 a89 = A2[a_col + j + 4];
+          accA = amd_mixed_dot(fA[0], a01, accA, false);
+          accA = amd_mixed_dot(fA[1], a89, accA, false);
+          accB = amd_mixed_dot(fB[0], a01, accB, false);
+          accB = amd_mixed_dot(fB[1], a89, accB, false);
+        }
+      }
+    }
+    sh_red[warp][(lane >> 3) * 16 + l7] = accA;
+    sh_red[warp][(lane >> 3) * 16 + l7 + 8] = accB;
+    __syncthreads();
+    for (int idx = threadIdx.x; idx < COLS; idx += WK * 32) {
+      float sum = 0.0f;
+#pragma unroll
+      for (int j = 0; j < WK; ++j) sum += sh_red[j][idx];
+      const int col = group * COLS + idx;
+      if (ksplit > 1) atomicAdd(C + col, sum); else C[col] = sum;
+    }
+    __syncthreads();
+  }
+}
+
 // ─── the fused input-Hadamard m=1 arm ────────────────────────────────────────
 //
 // For m=1 decode the three-kernel chain launches had_r_128 (A, f16→f16) as a
@@ -1359,14 +1451,18 @@ const void* GemvM1KernelFor(int bits, int cb) {
 #define VT_GEMV_M1W4(bits_, cb_)                                            \
   if (bits == bits_ && cb == cb_)                                           \
     return reinterpret_cast<const void*>(&Exl3GemvM1K4<cb_>);
-  // The wide-load ownership arm is instantiated for the 4 bpw rows only —
-  // its codeword-span arithmetic is the 4 bpw window math; 2/3 bpw keep the
-  // dq8-mapping arm.
+#define VT_GEMV_M1K3(bits_, cb_)                                            \
+  if (bits == bits_ && cb == cb_)                                           \
+    return reinterpret_cast<const void*>(&Exl3GemvM1K3<cb_>);
+  // The wide-load ownership arm serves 4 bpw; its 3 bpw sibling (same
+  // load-position mapping on 24-word tiles) serves 3 bpw. 2 bpw keeps the
+  // dq8-mapping arm — a 2 bpw load-position variant was never benched.
   VT_GEMV_M1W4(4, 0) VT_GEMV_M1W4(4, 1) VT_GEMV_M1W4(4, 2)
   VT_GEMV_M1(2, 1) VT_GEMV_M1(2, 2)
-  VT_GEMV_M1(3, 1) VT_GEMV_M1(3, 2)
+  VT_GEMV_M1K3(3, 1) VT_GEMV_M1K3(3, 2)
 #undef VT_GEMV_M1W4
 #undef VT_GEMV_M1
+#undef VT_GEMV_M1K3
   return nullptr;
 }
 template <bool ABf16>
@@ -1528,12 +1624,13 @@ bool Exl3GemvTryLaunchRocm(hipStream_t st, const Tensor& a_had, const Tensor& tr
   // still selects the WMMA evaluation arm for A/B completeness.
   const void* kernel;
   int block_dim, cols;
-  if (mmode == 0 && !wmma && kCfgEnv < 0) {
+  const bool m1_direct = mmode == 0 && !wmma && kCfgEnv < 0;
+  if (m1_direct) {
     kernel = GemvM1KernelFor(args.bits, args.codebook);
     block_dim = 512;
-    // M1K4's warp owns a four-tile group (64 columns); the dq8 arm's warp
-    // covers two tiles (32).
-    cols = (args.bits == 4) ? 64 : 32;
+    // The ownership arms (M1K4 at 4 bpw, M1K3 at 3 bpw) map one warp to a
+    // four-tile group = 64 columns; the dq8 arm covers two tiles (32).
+    cols = (args.bits == 4 || args.bits == 3) ? 64 : 32;
   } else {
     kernel = cfg == 0 ? narrow
                       : GemvKernelFor(args.bits, args.codebook, mmode, cfg, smem,
@@ -1562,13 +1659,22 @@ bool Exl3GemvTryLaunchRocm(hipStream_t st, const Tensor& a_had, const Tensor& tr
   // Grid-level k-split (the kernel halves its per-warp serial k-chain per
   // extra blockIdx.y) is a bench lever first: VT_EXL3_GEMV_KSPLIT=N raises
   // grid.y to N and pays one f32 atomicAdd per (m, stripe col) per slice.
-  // It stays OFF by default until serving measurements pick a value.
+  // On M1K3 the split wins exactly where grid.x alone under-fills the 96 CUs
+  // (bench3 own3 rows, gfx1100): n<=8192 takes 4, n<=12288 takes 2. The env
+  // still overrides for A/B probes. Every other arm keeps the historical
+  // ksplit=1 default — a blanket ksplit=2 measured net SLOWER in serving
+  // (24.73 vs 25.29 decode tok/s, memset+atomic cost).
   static const int kKsplitEnv = [] {
     const char* e = std::getenv("VT_EXL3_GEMV_KSPLIT");
-    return e ? std::atoi(e) : 1;
+    return e ? std::atoi(e) : -1;
   }();
+  const bool m1k3 = m1_direct && args.bits == 3;
+  const int ksplit_want =
+      kKsplitEnv >= 0 ? kKsplitEnv
+                      : (m1k3 ? (size_n <= 8192 ? 4 : (size_n <= 12288 ? 2 : 1))
+                              : 1);
   const int ksplit = std::max(
-      1, std::min(kKsplitEnv, (size_k / 16) / 16));
+      1, std::min(ksplit_want, (size_k / 16) / 16));
   if (ksplit > 1)
     CheckG(hipMemsetAsync(raw, 0, (size_t)size_m * size_n * sizeof(float), st),
            "exl3_gemv ksplit zero");
