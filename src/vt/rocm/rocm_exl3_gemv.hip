@@ -136,15 +136,11 @@ __device__ __forceinline__ half2 decode_mcg_or_3inst_2(uint32_t x0, uint32_t x1)
 __device__ __forceinline__ half2 decode_pair_cb2_dp4a_(uint32_t x0, uint32_t x1) {
   x0 *= 0x83DCD12Du;
   x1 *= 0x83DCD12Du;
-  // acc + the four UNSIGNED bytes of x, spelled scalar for the same reason
-  // rocm_exl3.hip's DecodeCodeword spells it: integer arithmetic is exact
-  // either way, and __dp4a is a perf lever, not a correctness requirement.
-  auto byte_sum = [](uint32_t x) -> uint32_t {
-    return (x & 0xffu) + ((x >> 8) & 0xffu) + ((x >> 16) & 0xffu) +
-           ((x >> 24) & 0xffu);
-  };
-  uint32_t sum0 = 0x6400u + byte_sum(x0);
-  uint32_t sum1 = 0x6400u + byte_sum(x1);
+  // acc + the four UNSIGNED bytes of x via the byte-dot: the u32xu8 dot is
+  // byte_sum(x) in one instruction (v_dot4_u32_u8 on gfx11). __dp4a is not in
+  // this HIP's device headers; __builtin_amdgcn_udot4 spelled directly is.
+  uint32_t sum0 = __builtin_amdgcn_udot4(x0, 0x01010101u, 0x6400u, false);
+  uint32_t sum1 = __builtin_amdgcn_udot4(x1, 0x01010101u, 0x6400u, false);
   half2 k_inv_h2 = __half2half2(__ushort_as_half(0x1eee));
   half2 k_bias_h2 = __half2half2(__ushort_as_half(0xc931));
   half_uint16 h0(static_cast<uint16_t>(sum0));
@@ -155,8 +151,12 @@ __device__ __forceinline__ half2 decode_pair_cb2_dp4a_(uint32_t x0, uint32_t x1)
 // ─── tail-biting window (exl3_dq.cuh) ────────────────────────────────────────
 
 __device__ __forceinline__ uint32_t fshift(const uint32_t b, const uint32_t a, int shift) {
-  uint64_t merged = (static_cast<uint64_t>(a) << 32) | static_cast<uint64_t>(b);
-  return static_cast<uint32_t>(merged >> shift);
+  // __funnelshift_r lowers to v_alignbit_b32 (one VALU op) on gfx11; the
+  // (a<<32|b)>>s idiom lowers to v_lshrrev_b64, a multi-cycle 64-bit shift.
+  // Same bits either way — for shift < 32. dq8_regs_3bits calls this with
+  // s2+12 which reaches 42, and v_alignbit wraps its shift mod 32 while the
+  // 64-bit shift yields a >> (s-32). The guard keeps both halves correct.
+  return shift < 32 ? __funnelshift_r(b, a, shift) : (a >> (shift - 32));
 }
 
 template <int cb>
