@@ -60,11 +60,18 @@
 
 #include "vt/ops.h"
 #include "vt/rocm/rocm_device_bind.h"
+#include "vt/rocm/rocm_f16_codec.h"
 
 namespace vt::rocm {
 namespace {
 
 constexpr int kGemvMaxM = 8;  // EXL3_GEMV_MAX_M (exl3_gemv_kernel.cuh:31)
+
+// 1/sqrt(128), the same literal rocm_exl3.hip's kInvSqrt128 spells (transcribed;
+// recomputing 1/sqrt(128) can differ in the last f32 bit). Prefixed kGemv*
+// because both TUs sit in vt::rocm's anonymous namespace scope when a bench
+// translation unit includes them together.
+constexpr float kGemvInvSqrt128 = 0.088388347648f;
 
 inline void CheckG(hipError_t err, const char* what) {
   if (err != hipSuccess)
@@ -1016,6 +1023,321 @@ __global__ __launch_bounds__(512) void Exl3GemvM1K4(
     __syncthreads();
   }
 }
+// ─── the fused input-Hadamard m=1 arm ────────────────────────────────────────
+//
+// For m=1 decode the three-kernel chain launches had_r_128 (A, f16→f16) as a
+// separate kernel, then every GEMV block re-streams A_had from global memory
+// once per column group. M1K4 v5 (bench3.hip, verified bit-identical against
+// HadK<true,true> + the unfused kernel) instead computes a_had in LDS once per
+// block: k/128 warp-jobs of the same 5-level xor-partner butterfly HadK runs,
+// stores packed half2s, and the dot loop reads shA where the unfused arm read
+// A2. One fewer launch and no a_had write+read round-trip per projection.
+//
+// The butterfly is HadK<true,true> op-for-op: MulF16 pre-scale (the fp16
+// product rounded once from f32, same as the host __hmul2), in-lane levels
+// 1-2 as (s0+s1, d0+d1, s0-s1, d0-s1), then the five xor-partner levels with
+// own-first adds and NegBySignBit flips — the identical instruction sequence,
+// LDS in HadK replaced by __shfl_xor here. DF16ToF32/DF32ToF16 come from
+// rocm_f16_codec.h; NegBySignBit/MulF16 are transcribed 1:1 from
+// rocm_exl3.hip (the two files share no TU).
+
+__device__ __forceinline__ float GemvNegBySignBit(float v) {
+  return __int_as_float(static_cast<int>(__float_as_uint(v) ^ 0x80000000u));
+}
+__device__ __forceinline__ uint16_t GemvMulF16(uint16_t a, uint16_t b) {
+  return DF32ToF16(DF16ToF32(a) * DF16ToF32(b));
+}
+__device__ __forceinline__ void HadBlock128ToH2(const uint16_t* __restrict__ a,
+                                              const uint16_t* __restrict__ pre,
+                                              int64_t base, half2* out4) {
+  const int t = threadIdx.x & 31;
+  float v[4];
+#pragma unroll
+  for (int j = 0; j < 4; ++j)
+    v[j] = DF16ToF32(GemvMulF16(a[base + 4 * t + j], pre[base + 4 * t + j]));
+  const float s0 = v[0] + v[1], d0 = v[0] - v[1];
+  const float s1 = v[2] + v[3], d1 = v[2] - v[3];
+  float x[4] = {s0 + s1, d0 + d1, s0 - s1, d0 - d1};
+#pragma unroll
+  for (int i = 1; i < 32; i <<= 1) {
+    const bool flip = (t & i) != 0;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const float par = __shfl_xor_sync(0xffffffffffffffffULL, x[j], i);
+      const float own = flip ? GemvNegBySignBit(x[j]) : x[j];
+      x[j] = own + par;  // own FIRST, matching the host adds
+    }
+  }
+#pragma unroll
+  for (int j = 0; j < 4; ++j)
+    // DF32ToF16, not __float2half: HadK rounds f32(res) then f32->f16 (double
+    // rounding). __float2half(x * k) contracts to v_fma_mixlo_f16, a SINGLE
+    // rounding, which diffs by 1 ulp on ~1/5K boundary inputs and silently
+    // perturbs every GEMV column downstream. Write through uint16_t* —
+    // DF32ToF16 returns the bit pattern, not a numeric half.
+    reinterpret_cast<uint16_t*>(out4)[j] = DF32ToF16(x[j] * kGemvInvSqrt128);
+}
+
+// 4 bpw fused arm — Exl3GemvM1K4 with the input hadamard staged in LDS.
+// `shA` is dynamic LDS sized size_k * 2 bytes; every block stages the same
+// a_had (only its own group columns differ), which is the trade the launch
+// count buys.
+template <int cb>
+__global__ __launch_bounds__(512) void Exl3GemvM1K4Fused(
+    const uint16_t* __restrict__ A, const uint16_t* __restrict__ suh,
+    const uint16_t* __restrict__ B, float* __restrict__ C, int size_m,
+    int size_k, int size_n) {
+  (void)size_m;
+  constexpr int WK = 16;
+  constexpr int PF = 4;
+  constexpr int COLS = 64;
+  extern __shared__ half2 shA[];
+
+  const int warp = threadIdx.x / 32;
+  const int lane = threadIdx.x % 32;
+  const int l7 = lane & 7;
+
+  const int ntiles = size_n / 16;
+  const int kslices = size_k / 16;
+  const int num_groups = size_n / COLS;
+
+  const int ksplit = gridDim.y;
+  const int chunk = (kslices + WK * ksplit - 1) / (WK * ksplit);
+  const int ks0 = (blockIdx.y * WK + warp) * chunk;
+  const int myn = max(0, min(chunk, kslices - ks0));
+
+  // In-had phase: warp-jobs over k/128 blocks. Every warp iterates its stride;
+  // each produces one 128-column block of a_had into LDS as packed half2s.
+  const uint16_t* ap = A;
+  for (int hb = warp; hb < size_k / 128; hb += WK) {
+    half2 o2[2];
+    HadBlock128ToH2(ap, suh, hb * 128, o2);
+    shA[hb * 64 + lane * 2] = o2[0];
+    shA[hb * 64 + lane * 2 + 1] = o2[1];
+  }
+  __syncthreads();
+
+  const uint32_t* B32 = reinterpret_cast<const uint32_t*>(B);
+  const int w0 = (lane >> 3) * 32 + (l7 << 2);
+  const size_t slice_stride = (size_t)ntiles * 32;
+
+  __shared__ float sh_red[WK][COLS];
+
+  for (int group = blockIdx.x; group < num_groups; group += gridDim.x) {
+    const uint32_t* bp = B32 + (size_t)ks0 * slice_stride + (size_t)group * 128;
+    auto ld_b = [&](int i) -> uint4 {
+      return *reinterpret_cast<const uint4*>(bp + (size_t)i * slice_stride + w0);
+    };
+    uint4 pf[PF];
+#pragma unroll
+    for (int d = 0; d < PF; ++d) if (d < myn) pf[d] = ld_b(d);
+
+    float accA = 0.0f, accB = 0.0f;
+    for (int ib = 0; ib < myn; ib += PF) {
+#pragma unroll
+      for (int d = 0; d < PF; ++d) {
+        const int i = ib + d;
+        if (i >= myn) break;
+        const uint4 v = pf[d];
+        if (i + PF < myn) pf[d] = ld_b(i + PF);
+        const int bsrc = (l7 == 0) ? (lane | 7) : (lane - 1);
+        const uint32_t wb = __shfl_sync(0xffffffffffffffffULL, v.w, bsrc);
+        uint32_t w[5] = {wb, v.x, v.y, v.z, v.w};
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          FragB fA, fB;
+          uint32_t cw[8];
+#pragma unroll
+          for (int s2 = 0; s2 < 8; ++s2) {
+            const int sc = j * 8 + s2;
+            cw[s2] = fshift(w[((4 * sc + 1027) >> 5) - 31],
+                            w[((4 * sc + 1012) >> 5) - 31],
+                            (28 - 4 * sc) & 31) & 0xffffu;
+          }
+          decode8<cb>(cw[0], cw[1], cw[2], cw[3], cw[4], cw[5], cw[6], cw[7],
+                      fA, fB);
+          const int a_col = (ks0 + i) * 8;
+          const half2 a01 = shA[a_col + j];
+          const half2 a89 = shA[a_col + j + 4];
+          accA = amd_mixed_dot(fA[0], a01, accA, false);
+          accA = amd_mixed_dot(fA[1], a89, accA, false);
+          accB = amd_mixed_dot(fB[0], a01, accB, false);
+          accB = amd_mixed_dot(fB[1], a89, accB, false);
+        }
+      }
+    }
+
+    sh_red[warp][(lane >> 3) * 16 + l7] = accA;
+    sh_red[warp][(lane >> 3) * 16 + l7 + 8] = accB;
+    __syncthreads();
+    for (int idx = threadIdx.x; idx < COLS; idx += WK * 32) {
+      float sum = 0.0f;
+#pragma unroll
+      for (int j = 0; j < WK; ++j) sum += sh_red[j][idx];
+      const int col = group * COLS + idx;
+      if (ksplit > 1)
+        atomicAdd(C + col, sum);
+      else
+        C[col] = sum;
+    }
+    __syncthreads();
+  }
+}
+
+// Sub-4 bpw fused arm — Exl3GemvM1K with the same LDS input-hadamard phase.
+// The A read it replaces is `A2[a_col]`/`A2[a_col+4]` (the lane's k quarter),
+// which maps 1:1 onto shA since a_had's layout is column-major-contiguous
+// half2s.
+template <int bits, int cb>
+__global__ __launch_bounds__(512) void Exl3GemvM1KFused(
+    const uint16_t* __restrict__ A, const uint16_t* __restrict__ suh,
+    const uint16_t* __restrict__ B, float* __restrict__ C, int size_m,
+    int size_k, int size_n) {
+  (void)size_m;
+  constexpr int WK = 16;
+  constexpr int WNT = 2;
+  constexpr int PF = 4;
+  constexpr int COLS = WNT * 16;
+  constexpr int TWORDS = 8 * bits;
+  constexpr int LOADS = bits == 2 ? WNT / 2 : WNT;
+  constexpr int LSTRIDE = bits == 3 ? 24 : 32;
+  extern __shared__ half2 shA[];
+
+  const int warp = threadIdx.x / 32;
+  const int lane = threadIdx.x % 32;
+
+  const int ntiles = size_n / 16;
+  const int kslices = size_k / 16;
+  const int num_groups = size_n / COLS;
+
+  const int ksplit = gridDim.y;
+  const int chunk = (kslices + WK * ksplit - 1) / (WK * ksplit);
+  const int ks0 = (blockIdx.y * WK + warp) * chunk;
+  const int myn = max(0, min(chunk, kslices - ks0));
+
+  const uint16_t* ap = A;
+  for (int hb = warp; hb < size_k / 128; hb += WK) {
+    half2 o2[2];
+    HadBlock128ToH2(ap, suh, hb * 128, o2);
+    shA[hb * 64 + lane * 2] = o2[0];
+    shA[hb * 64 + lane * 2 + 1] = o2[1];
+  }
+  __syncthreads();
+
+  const uint32_t* B32 = reinterpret_cast<const uint32_t*>(B);
+  const size_t slice_stride = (size_t)ntiles * TWORDS;
+
+  [[maybe_unused]] int x_src_a = 0, x_src_b = 0, x_s2 = 0;
+  if constexpr (bits == 2) {
+    int i1 = lane >> 1;
+    x_src_b = i1;
+    x_src_a = (i1 + 15) & 15;
+  }
+  if constexpr (bits == 3) {
+    int t_offset = lane << 3;
+    int b1 = (t_offset + 257) * 3;
+    int b2 = b1 + 21;
+    int i0 = (b1 - 16) / 32;
+    int i2 = (b2 - 1) / 32;
+    x_s2 = (i2 + 1) * 32 - b2;
+    x_src_a = i0 % 24;
+    x_src_b = i2 % 24;
+  }
+
+  __shared__ float sh_red[WK][COLS];
+
+  for (int group = blockIdx.x; group < num_groups; group += gridDim.x) {
+    const uint32_t* bp = B32 + (size_t)ks0 * slice_stride + group * WNT * TWORDS + lane;
+    auto ld_b = [&](int i, int l) -> uint32_t {
+      if constexpr (bits == 3)
+        return lane < 24 ? __builtin_nontemporal_load(bp + (size_t)i * slice_stride +
+                                                          l * LSTRIDE)
+                         : 0;
+      else
+        return __builtin_nontemporal_load(bp + (size_t)i * slice_stride + l * LSTRIDE);
+    };
+
+    uint32_t pf[PF][LOADS];
+#pragma unroll
+    for (int d = 0; d < PF; ++d)
+      if (d < myn)
+#pragma unroll
+        for (int l = 0; l < LOADS; ++l) pf[d][l] = ld_b(d, l);
+
+    float acc0[WNT] = {}, acc1[WNT] = {};
+    for (int ib = 0; ib < myn; ib += PF) {
+#pragma unroll
+      for (int d = 0; d < PF; ++d) {
+        const int i = ib + d;
+        if (i >= myn) break;
+
+        uint32_t bw[LOADS];
+#pragma unroll
+        for (int l = 0; l < LOADS; ++l) bw[l] = pf[d][l];
+
+        if (i + PF < myn) {
+#pragma unroll
+          for (int l = 0; l < LOADS; ++l) pf[d][l] = ld_b(i + PF, l);
+        }
+
+        const size_t a_col = (size_t)(ks0 + i) * 8 + (lane & 3);
+        const half2 a01 = shA[a_col];
+        const half2 a23 = shA[a_col + 4];
+
+#pragma unroll
+        for (int t = 0; t < WNT; ++t) {
+          FragB f0, f1;
+          if constexpr (bits == 4) {
+            uint32_t aw = __shfl_sync(0xffffffffffffffffULL, bw[t], (lane + 31) & 31);
+            dq8_regs_4bits<cb>(aw, bw[t], f0, f1);
+          } else if constexpr (bits == 2) {
+            const uint32_t w = bw[t >> 1];
+            const int base = (t & 1) << 4;
+            uint32_t bwv = __shfl_sync(0xffffffffffffffffULL, w, base + x_src_b);
+            uint32_t awv = __shfl_sync(0xffffffffffffffffULL, w, base + x_src_a);
+            dq8_regs_2bits<cb>(awv, bwv, lane << 3, f0, f1);
+          } else {
+            uint32_t awv = __shfl_sync(0xffffffffffffffffULL, bw[t], x_src_a);
+            uint32_t bwv = __shfl_sync(0xffffffffffffffffULL, bw[t], x_src_b);
+            dq8_regs_3bits<cb>(awv, bwv, x_s2, f0, f1);
+          }
+
+          acc0[t] = amd_mixed_dot(f0[0], a01, acc0[t], false);
+          acc0[t] = amd_mixed_dot(f0[1], a23, acc0[t], false);
+          acc1[t] = amd_mixed_dot(f1[0], a01, acc1[t], false);
+          acc1[t] = amd_mixed_dot(f1[1], a23, acc1[t], false);
+        }
+      }
+    }
+
+    const int c0 = lane >> 2;
+#pragma unroll
+    for (int t = 0; t < WNT; ++t) {
+      float v0 = acc0[t], v1 = acc1[t];
+      v0 += __shfl_xor_sync(0xffffffffffffffffULL, v0, 1);
+      v0 += __shfl_xor_sync(0xffffffffffffffffULL, v0, 2);
+      v1 += __shfl_xor_sync(0xffffffffffffffffULL, v1, 1);
+      v1 += __shfl_xor_sync(0xffffffffffffffffULL, v1, 2);
+      if ((lane & 3) == 0) {
+        sh_red[warp][t * 16 + c0] = v0;
+        sh_red[warp][t * 16 + c0 + 8] = v1;
+      }
+    }
+    __syncthreads();
+
+    for (int idx = threadIdx.x; idx < COLS; idx += WK * 32) {
+      float sum = 0.0f;
+#pragma unroll
+      for (int j = 0; j < WK; ++j) sum += sh_red[j][idx];
+      const int col = group * COLS + idx;
+      if (ksplit > 1)
+        atomicAdd(C + col, sum);
+      else
+        C[col] = sum;
+    }
+    __syncthreads();
+  }
+}
 
 // ─── the try-launch (exl3_gemv.cu:29-179) ────────────────────────────────────
 
@@ -1047,6 +1369,22 @@ const void* GemvM1KernelFor(int bits, int cb) {
   VT_GEMV_M1(3, 1) VT_GEMV_M1(3, 2)
 #undef VT_GEMV_M1W4
 #undef VT_GEMV_M1
+  return nullptr;
+}
+const void* GemvM1FusedKernelFor(int bits, int cb) {
+  // The fused in-had arm's instantiation set mirrors GemvM1KernelFor's: same
+  // (bits, cb) coverage, one kernel per row.
+#define VT_GEMV_M1F(bits_, cb_)                                             \
+  if (bits == bits_ && cb == cb_)                                           \
+    return reinterpret_cast<const void*>(&Exl3GemvM1KFused<bits_, cb_>);
+#define VT_GEMV_M1F4(bits_, cb_)                                            \
+  if (bits == bits_ && cb == cb_)                                           \
+    return reinterpret_cast<const void*>(&Exl3GemvM1K4Fused<cb_>);
+  VT_GEMV_M1F4(4, 0) VT_GEMV_M1F4(4, 1) VT_GEMV_M1F4(4, 2)
+  VT_GEMV_M1F(2, 1) VT_GEMV_M1F(2, 2)
+  VT_GEMV_M1F(3, 1) VT_GEMV_M1F(3, 2)
+#undef VT_GEMV_M1F4
+#undef VT_GEMV_M1F
   return nullptr;
 }
 
@@ -1248,6 +1586,88 @@ bool Exl3GemvTryLaunchRocm(hipStream_t st, const Tensor& a_had, const Tensor& tr
                          dim3(static_cast<unsigned>(block_dim)), kargs, 0, st),
          "exl3_gemv launch");
   CheckG(hipGetLastError(), "exl3_gemv launch");
+  return true;
+}
+// Spec gfx1100-exl3-decode-60tps: the fused in-had m=1 arm. Runs the
+// HadBlock128ToH2 staging phase (bit-identical to HadK<true,true>) inside the
+// GEMV kernel, so the caller must NOT launch the separate input hadamard when
+// this returns true. Declines on the same terms Exl3GemvTryLaunchRocm does,
+// plus m != 1, an uninstantiated fused (bits, cb), a null suh (the kernel
+// dereferences it), or size_k not a multiple of 128 (the had block size).
+bool Exl3GemvM1FusedTryLaunchRocm(hipStream_t st, const void* a_raw,
+                                  const uint16_t* suh_ptr,
+                                  const Tensor& trellis, float* raw,
+                                  int size_k, int size_n, int device,
+                                  const Exl3GemmArgs& args) {
+  if (args.force_gemv == 0) return false;
+  if (size_k % 128 != 0) return false;
+  if (suh_ptr == nullptr || a_raw == nullptr) return false;
+  const int mode = args.force_gemv > 0 ? 2 : Exl3GemvMode();
+  if (mode == 0) return false;
+  if (!GemvArmInstantiated(args.bits, args.codebook)) return false;
+  static const int kFuseHadEnv = [] {
+    const char* e = std::getenv("VT_EXL3_FUSED_HAD");
+    return e ? std::atoi(e) : 1;
+  }();
+  if (kFuseHadEnv != 1) return false;
+  if (GemvWmmaMode()) return false;  // fused arm is the dot decode, not WMMA
+
+  int warp_size = 0;
+  CheckG(hipDeviceGetAttribute(&warp_size, hipDeviceAttributeWarpSize, device),
+         "warp size query");
+  if (warp_size != 32) return false;
+  int num_sms = 0;
+  CheckG(hipDeviceGetAttribute(&num_sms, hipDeviceAttributeMultiprocessorCount, device),
+         "multiprocessor count");
+  if (num_sms < 1) num_sms = 1;
+
+  const void* kernel = GemvM1FusedKernelFor(args.bits, args.codebook);
+  if (kernel == nullptr) return false;
+  const int cols = (args.bits == 4) ? 64 : 32;
+
+  // Dynamic LDS is the whole a_had row: size_k halves. Above the 48 KiB
+  // hipLaunchKernel limit the arm declines (bigger-k models keep the
+  // separate-had path); hipFuncSetAttributeOpt-in is a later row.
+  const size_t shmem = static_cast<size_t>(size_k) * sizeof(uint16_t);
+  if (shmem > 48 * 1024) return false;
+
+  int max_blocks = GemvOccupancyRocm(kernel, 512);
+  if (max_blocks < 1) max_blocks = 1;
+  const int grid = size_n / cols < max_blocks * num_sms ? size_n / cols
+                                                        : max_blocks * num_sms;
+  if (grid < 1) return false;
+
+  static const int kKsplitEnv = [] {
+    const char* e = std::getenv("VT_EXL3_GEMV_KSPLIT");
+    return e ? std::atoi(e) : 1;
+  }();
+  const int ksplit = std::max(1, std::min(kKsplitEnv, (size_k / 16) / 16));
+  if (ksplit > 1)
+    CheckG(hipMemsetAsync(raw, 0, (size_t)size_n * sizeof(float), st),
+           "exl3_gemv fused ksplit zero");
+
+
+  static const bool kDumpF = [] {
+    const char* e = std::getenv("VT_EXL3_GEMV_DUMP");
+    return e != nullptr && e[0] == '1';
+  }();
+  if (kDumpF)
+    std::fprintf(stderr,
+                 "[exl3_gemv] fused m=1 k=%d n=%d bits=%d cb=%d grid=%d lds=%zu\n",
+                 size_k, size_n, args.bits, args.codebook, grid, shmem);
+  const uint16_t* a_ptr = static_cast<const uint16_t*>(a_raw);
+  const uint16_t* b_ptr = trellis.Ptr<uint16_t>();
+  int size_m = 1;
+  void* kargs[] = {static_cast<void*>(&a_ptr),  static_cast<void*>(&suh_ptr),
+                   static_cast<void*>(&b_ptr),  static_cast<void*>(&raw),
+                   static_cast<void*>(&size_m), static_cast<void*>(&size_k),
+                   static_cast<void*>(&size_n)};
+  CheckG(hipLaunchKernel(kernel,
+                         dim3(static_cast<unsigned>(grid),
+                              static_cast<unsigned>(ksplit)),
+                         dim3(512), kargs, shmem, st),
+         "exl3_gemv fused-had launch");
+  CheckG(hipGetLastError(), "exl3_gemv fused-had launch");
   return true;
 }
 
