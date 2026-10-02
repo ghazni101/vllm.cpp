@@ -224,6 +224,10 @@ cut to ~4 ms. Both halves of the work are therefore required:
   dot arms. Every productionized arm on this branch is now the measured
   fastest of its alternates: M1K/M1K4 GEMV, fused-had on the 4bpw wide
   shapes only, dot for the 6bpw head, coop GDN scan, folded bf16 casts.
+- `VT_EXL3_GEMV_CFG=0` (narrow fragment arm) and `=1` (wide): both serve
+  14.7 decode tok/s — 1.7x slower than the dq8 m=1 arm. Every
+  selector-reachable arm is now measured; the production set is the
+  fastest of each family.
 
 ## Owed
 
