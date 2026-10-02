@@ -217,6 +217,13 @@ cut to ~4 ms. Both halves of the work are therefore required:
   GDN, lm_head dot at 557 GB/s) + ~5ms dispatch gap. 60 tok/s needs the
   GEMV to stream ~3x its issue-limited rate — a different codeword
   decode algebra or a lower-byte arm, both out of scope.
+- 2026-10-02 (remaining dispatch arms measured dead): `VT_EXL3_DOT_FIRST=1`
+  serves ~3x slower per request (mid-request hipBLASLt recon autotune
+  storms, leg abandoned after >200s); `VT_ROCM_EXL3_WMMA=1` serves
+  7.62 decode tok/s on a 6-prompt/128-token leg — 3.3x slower than the
+  dot arms. Every productionized arm on this branch is now the measured
+  fastest of its alternates: M1K/M1K4 GEMV, fused-had on the 4bpw wide
+  shapes only, dot for the 6bpw head, coop GDN scan, folded bf16 casts.
 
 ## Owed
 
