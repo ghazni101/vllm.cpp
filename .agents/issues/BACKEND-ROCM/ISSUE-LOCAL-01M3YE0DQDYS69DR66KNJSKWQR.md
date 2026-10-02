@@ -1,14 +1,14 @@
 ID: ISSUE-LOCAL-01M3YE0DQDYS69DR66KNJSKWQR
 Title: fused EXL3 GEMV staging: __float2half contracts to single-rounding v_fma_mixlo_f16, diverges from HadK double rounding
 Row: BACKEND-ROCM
-State: OPEN
+State: CLOSED
 Kind: bug
 GitHub: -
 Mirror: PENDING
 Availability: FULL
 Created: 2026-10-02
 Updated: 2026-10-02
-Closed: -
+Closed: 2026-10-02
 
 ## Problem
 
@@ -16,4 +16,4 @@ HadBlock128ToH2 (src/vt/rocm/rocm_exl3_gemv.hip) wrote its staged a_had elements
 
 ## Resolution
 
--
+Fixed in 1d04d72dc. Store now uses DF32ToF16(x*kGemvInvSqrt128) via uint16_t*, matching HadK<true,true>'s double rounding and blocking the v_fma_mixlo_f16 single-rounding contraction. gfx1100 verify (bench3.hip, RX 7900 XTX, 2026-10-02): staging-bits bad=0 at k=5120 and k=17408; fused-vs-unfused raw C bit-identical at n=1024 (k=5120, k=17408) and n=4096 (k=5120).
