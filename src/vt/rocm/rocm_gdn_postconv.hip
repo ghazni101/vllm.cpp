@@ -125,7 +125,11 @@ __global__ void GdnPostConvChunkedK(Tqkv* q_out, Tqkv* k_out, Tqkv* v_out, float
                                     int64_t v_chunks) {
   const int64_t key_dim = hk * dk, value_dim = hv * dv;
   const int64_t conv_dim = 2 * key_dim + value_dim;
-  const int64_t slots = hk + v_chunks + 1;
+  // One slot per gate head too: the shared gate slot was ONE thread running
+  // hv serial expf/log1pf chains (~36us measured at hv=48 on gfx1100, the
+  // kernel's whole duration at t=1). Every head's output is an independent
+  // elementwise result, so splitting the slot is bit-exact.
+  const int64_t slots = hk + v_chunks + hv;
   const int64_t items = t * slots;
   const int64_t step = static_cast<int64_t>(gridDim.x) * blockDim.x;
   for (int64_t item = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -160,15 +164,14 @@ __global__ void GdnPostConvChunkedK(Tqkv* q_out, Tqkv* k_out, Tqkv* v_out, float
       const int64_t j1 = (j0 + v_chunk) < value_dim ? (j0 + v_chunk) : value_dim;
       for (int64_t j = j0; j < j1; ++j) St(vo, j, Ld(vin, j));
     } else {
-      for (int64_t h = 0; h < hv; ++h) {
-        const int64_t idx = tok * hv + h;
-        const float av = Ld(araw, tok * a_row_stride + h);
-        const float bv = Ld(braw, tok * b_row_stride + h);
-        const float x = av + dt_bias[h];
-        const float sp = x > 20.0f ? x : log1pf(expf(x));
-        g_out[idx] = -expf(a_log[h]) * sp;
-        beta_out[idx] = 1.0f / (1.0f + expf(-bv));
-      }
+      const int64_t h = slot - hk - v_chunks;
+      const int64_t idx = tok * hv + h;
+      const float av = Ld(araw, tok * a_row_stride + h);
+      const float bv = Ld(braw, tok * b_row_stride + h);
+      const float x = av + dt_bias[h];
+      const float sp = x > 20.0f ? x : log1pf(expf(x));
+      g_out[idx] = -expf(a_log[h]) * sp;
+      beta_out[idx] = 1.0f / (1.0f + expf(-bv));
     }
   }
 }
@@ -206,7 +209,7 @@ void GdnPostConvKernelRocm(Queue& q, Tensor& q_out, Tensor& k_out, Tensor& v_out
   const int64_t value_dim = hv * dv;
   const int64_t v_chunk = dk > 0 ? dk : value_dim;
   const int64_t v_chunks = v_chunk > 0 ? (value_dim + v_chunk - 1) / v_chunk : 1;
-  const int64_t items_chunked = t * (hk + v_chunks + 1);
+  const int64_t items_chunked = t * (hk + v_chunks + hv);
   hipStream_t s = AsStream(q);
   auto launch = [&](auto qkv_tag, auto conv_tag, auto gate_tag) {
     using Tqkv = decltype(qkv_tag);
