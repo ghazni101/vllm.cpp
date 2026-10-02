@@ -201,6 +201,22 @@ cut to ~4 ms. Both halves of the work are therefore required:
   Sharing a_had across q/k/v is impossible on this checkpoint: their
   suh sign matrices differ (sha256 over layer-3 bytes), and the
   in-hadamard is per-weight — dead on correctness grounds, not cost.
+- 2026-10-02 (M1K3 load-position 3bpw — implemented, measured, REVERTED):
+  `29652758a` ported the M1K4 ownership mapping to the 24-word 3bpw tile
+  (3 contiguous dwords + 1 boundary shfl per lane) with a shape-tuned
+  ksplit. Bit-identical at ks1/2/4, n up to 12288; bench3 showed +5..35%
+  GB/s on every serving shape. Serving did NOT transfer: 25.06 tok/s
+  (ksplit defaults), 24.81 (ksplit off) vs 25.29-25.42 for the dq8 arm.
+  The GEMV is not the wall-clock limiter at this dispatch overhead and
+  per-launch memsets re-inflate the graph. Reverted at `c088fc512`;
+  post-revert leg re-measures 25.42 decode tok/s.
+- Session ceiling (honest): **25.4 decode tok/s / ~23.3 whole-run**,
+  +40% over the 18.15 start. The decode wall is ~39.3ms: ~34ms GPU busy
+  (3bpw GEMV ~19.4ms at ~560-600 GB/s effective — its decode+dot issue
+  ceiling per `M1K4stream`; the other ~15ms is HadK×366, wvSplitKSml,
+  GDN, lm_head dot at 557 GB/s) + ~5ms dispatch gap. 60 tok/s needs the
+  GEMV to stream ~3x its issue-limited rate — a different codeword
+  decode algebra or a lower-byte arm, both out of scope.
 
 ## Owed
 
