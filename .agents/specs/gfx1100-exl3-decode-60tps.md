@@ -170,6 +170,23 @@ cut to ~4 ms. Both halves of the work are therefore required:
   6bpw trellis, already near the measured stream ceiling), GdnPostConv
   1.73, wvSplitKSml 0.5, everything else ~1.3ms. Total ~35.5ms GPU busy
   vs ~39.6ms wall — ~4ms/token launch gap after the cast removals.
+- 2026-10-02 (GEMV diagnosis + postconv): `M1K4stream` (identical load
+  pattern, decode/dot removed) reaches 706-841 GB/s on the big shapes
+  where the full kernel runs 566-602 — the gap is decode+dot dependency
+  latency, not the access pattern; `M1K4g2`'s 1024B contiguous loads do
+  not beat it, and `VT_EXL3_GEMV_SMEM` never reaches m=1 (the mmode-0
+  dispatch bypasses the smem table by construction). cb=2 decode8 is
+  already the udot4 byte-dot (~5 instr/pair); the residual stall is
+  shfl/LDS/fshift latency inside the per-slice chain. `15e19e6db` splits
+  GdnPostConvChunkedK's gate slot per head (was one thread × hv serial
+  expf chains; bit-identical, 284→65us microbench); serving-neutral at
+  25.29 tok/s — the slot hid under GEMV latency.
+- Final: **25.29 decode tok_s / 23.31 whole-run** on the 12-prompt leg
+  (`38fe6cae2` tree). Decode wall ~39.5ms = ~34ms GPU busy (GEMV M1 arms
+  ~19.4, HadK ~1.9, lm_head dot 1.71 at ~557 GB/s effective, GDN ~2.9,
+  casts now folded) + ~4-5ms launch/host gap. 60 tok/s would need the
+  GEMV to run >2x the measured ALU-bound rate — that is a different
+  decode structure, not a scheduling fix.
 
 ## Owed
 
