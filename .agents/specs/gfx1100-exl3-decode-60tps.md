@@ -239,6 +239,12 @@ cut to ~4 ms. Both halves of the work are therefore required:
   the mul1 hash consumes all of them, and a pair LUT would need a
   32-bit index. The measurement stands as evidence for what the ceiling
   would pay if decode got cheaper, not as a usable kernel.
+- 2026-10-02 (hard ceiling statement): even a ZERO-cost decode cannot
+  reach 60 tok/s. The no-decode stream kernel's 800-840 GB/s bounds the
+  GEMV at ~14ms/token -> ~35 tok/s before every other kernel. 60 tok/s
+  requires moving fewer bytes per token — a lower-bpw arm, a repacked
+  trellis, or fp8 KV — i.e. a format change, which the task rules
+  forbid. The measured-optimal 25.4 tok/s is 71% of that floor.
 
 ## Owed
 
