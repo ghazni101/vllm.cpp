@@ -228,6 +228,9 @@ cut to ~4 ms. Both halves of the work are therefore required:
   14.7 decode tok/s — 1.7x slower than the dq8 m=1 arm. Every
   selector-reachable arm is now measured; the production set is the
   fastest of each family.
+- `VT_EXL3_GEMV_SMEM=1` smem-staged fragment arms (reached via CFG=0/1):
+  11.4-11.7 tok/s. Census complete: the dq8 m=1 dot arm at 25.4 is the
+  fastest implementation of every tried structure for this checkpoint.
 
 ## Owed
 
