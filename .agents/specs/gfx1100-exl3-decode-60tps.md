@@ -187,6 +187,17 @@ cut to ~4 ms. Both halves of the work are therefore required:
   casts now folded) + ~4-5ms launch/host gap. 60 tok/s would need the
   GEMV to run >2x the measured ALU-bound rate — that is a different
   decode structure, not a scheduling fix.
+- 2026-10-02 (ksplit + qkv-structure dead ends): `VT_EXL3_GEMV_KSPLIT=2`
+  measures **slower** (24.73 vs 25.29 decode tok/s, same leg) — the
+  atomicAdd+memset cost exceeds the shorter serial k-chain, so the GEMV
+  is not k-chain-latency bound either; its ~600 GB/s sits at the
+  decode+dot issue rate. q/k/v DO share the same `dhn` activation
+  (dense_attn_block.h:627-629) but gate_up is already a merged
+  projection, so the only HadK duplication is 2 in-hads per attention
+  layer (~48 launches/token of 366 total) — the GEMV/HadK launches
+  dominate the ~7.5ms/token dispatch gap (median 3.2us between nodes,
+  ~2480 nodes/token) and batching them is the structural fix that
+  remains.
 
 ## Owed
 
