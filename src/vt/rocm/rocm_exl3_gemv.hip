@@ -1599,6 +1599,14 @@ bool Exl3GemvM1FusedTryLaunchRocm(hipStream_t st, const void* a_raw,
   if (suh_ptr == nullptr || a_raw == nullptr) return false;
   const int mode = args.force_gemv > 0 ? 2 : Exl3GemvMode();
   if (mode == 0) return false;
+  // The fused arm loses to unfused+separate-Had below ~12288 columns on every
+  // serving shape measured on gfx1100 (bench3.hip: 4bpw down/attn-z/o-proj/
+  // attn-gate run unfused at 570-670 GB/s vs fused 470-530 — the in-LDS had
+  // staging amortizes only when the group loop is long), and at 3 bpw fused
+  // loses everywhere (~330-390 vs ~440-520 GB/s). Only 4bpw at n>=12288 —
+  // qkvo and gateup — keeps the fused arm; everything else falls through to
+  // Exl3GemvTryLaunchRocm plus the separate Had.
+  if (args.bits != 4 || size_n < 12288) return false;
   if (!GemvArmInstantiated(args.bits, args.codebook)) return false;
   static const int kFuseHadEnv = [] {
     const char* e = std::getenv("VT_EXL3_FUSED_HAD");
