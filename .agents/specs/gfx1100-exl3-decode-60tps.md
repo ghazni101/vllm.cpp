@@ -153,6 +153,23 @@ cut to ~4 ms. Both halves of the work are therefore required:
   Reaching 60 needs a structurally different decode (batched/grouped
   GEMV, CUDA/HIP-graph replay of the per-layer stack, or a quant with
   fewer bytes/token) — none allowed by this task's constraints.
+- 2026-10-02 (bf16 fold): `e1982b8aa` — the bf16 residual stream's two
+  per-linear casts (CastF16 on the activation, CastBf16 on the f32
+  transform output) fold bit-identically into the Hadamard kernel's new
+  dtype arms (2=bf16 in loads `DF32ToF16(__bfloat162float(x))` — the
+  exact chain `CastF16K<bf16>` runs; bf16 out stores
+  `__float2bfloat16(res*post)`, the same op `CastBf16K` runs). ops.cpp
+  admits bf16 A/C on ROCm only; `Exl3MatmulD` skips both staging launches
+  there. Bench `verify_bf16_fold`: in-fold, fused staging and out-fold
+  all bit-identical. Same-leg serving: 24.24 -> **25.27 decode tok/s**
+  (whole-run 22.40 -> 23.30), +4.3%; ~817 launches/token removed.
+  Golden parity holds.
+- Post-fold decode census (rocprofv3, 40-token leg, ÷40): GEMV M1 arms
+  19.4ms GPU busy (4bpw M1K4 6.9 + fused4 3.3 + 3bpw M1K 9.2), HadK ~1.9,
+  lm_head dot arm 1.71 (0.855ms x2 — ~557 GB/s effective over the 953MB
+  6bpw trellis, already near the measured stream ceiling), GdnPostConv
+  1.73, wvSplitKSml 0.5, everything else ~1.3ms. Total ~35.5ms GPU busy
+  vs ~39.6ms wall — ~4ms/token launch gap after the cast removals.
 
 ## Owed
 
