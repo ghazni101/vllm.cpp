@@ -86,6 +86,16 @@ bool Exl3GemvTryLaunchRocm(hipStream_t st, const Tensor& a_had, const Tensor& tr
 bool Exl3DotTryLaunchRocm(hipStream_t st, const Tensor& a_had, const Tensor& trellis,
                           float* raw, int size_m, int size_k, int size_n, int device,
                           const Exl3GemmArgs& args);
+// Spec gfx1100-exl3-decode-60tps: the fused in-had m=1 arm. When it accepts,
+// it computes a_had inside the kernel (HadBlock128ToH2, bit-identical to
+// HadK<true,true>) and the caller MUST NOT launch the separate input
+// hadamard. a_raw is the UNTRANSFORMED input (f16 storage), suh_ptr the
+// pre-scale vector. Same decline contract as Exl3GemvTryLaunchRocm.
+bool Exl3GemvM1FusedTryLaunchRocm(hipStream_t st, const void* a_raw,
+                                  const uint16_t* suh_ptr,
+                                  const Tensor& trellis, float* raw,
+                                  int size_k, int size_n, int device,
+                                  const Exl3GemmArgs& args);
 bool Exl3DotChunkedTryLaunchRocm(hipStream_t st, const Tensor& a_had,
                                  const Tensor& trellis, float* raw, int size_m,
                                  int size_k, int size_n, int device,
@@ -407,15 +417,9 @@ void Exl3GemmKernelRocm(Queue& q, Tensor& c, const Tensor& a, const Tensor& trel
   }
 
   // 1. the input transform, into the caller's scratch (which may alias A).
-  LaunchHad<true, true>(a_had.data, a.data, suh.Ptr<uint16_t>(), nullptr, kInvSqrt128, m, k,
-                        st);
-
-  // 2. the matmul against the decoded trellis. The m<=8 GEMV arm is tried
-  // first — the same order Exl3GemmKernelCuda runs its Exl3GemvTryLaunch —
-  // then the dot arm for shapes outside its envelope, then the 8-row
-  // chunked variants for 8 < m <= 32 (spec R2a); a decline falls through
-  // to the byte-exact transcription below. All of them write `raw` in f32,
-  // so step 3 is identical whichever ran step 2.
+  // For m == 1 the fused arm is tried BEFORE this launches: it computes a_had
+  // in LDS inside the GEMV kernel (HadBlock128ToH2, bit-identical to
+  // HadK<true,true>) so the launch below is skipped only when it accepted.
   float* raw = EnsureRawScratch(static_cast<size_t>(m) * static_cast<size_t>(n) * sizeof(float),
                                 st);
   bool gemv = false;
@@ -429,6 +433,18 @@ void Exl3GemmKernelRocm(Queue& q, Tensor& c, const Tensor& a, const Tensor& trel
     return env && std::atoi(env) != 0;
   }();
   const bool dot_first = fast_paths && kDotFirstEnv;
+  // The fused arm is NOT tried when VT_EXL3_DOT_FIRST is set: that lever asks
+  // for the dot arm ahead of every GEMV variant, and the dot arm consumes the
+  // already-transformed a_had, so it cannot run ahead of the input transform
+  // the way the fused arm does.
+  if (m == 1 && !(dot_first && dot_shape)) {
+    gemv = Exl3GemvM1FusedTryLaunchRocm(
+        st, a.data, suh.data ? suh.Ptr<uint16_t>() : nullptr, trellis, raw,
+        static_cast<int>(k), static_cast<int>(n), q.device.index, args);
+  }
+  if (!gemv)
+    LaunchHad<true, true>(a_had.data, a.data, suh.Ptr<uint16_t>(), nullptr,
+                          kInvSqrt128, m, k, st);
 
   if (m <= kExl3GemvMaxM) {
     if (dot_first && dot_shape)
