@@ -1600,7 +1600,12 @@ bool Exl3GemvM1FusedTryLaunchRocm(hipStream_t st, const void* a_raw,
                                   int size_k, int size_n, int device,
                                   const Exl3GemmArgs& args) {
   if (args.force_gemv == 0) return false;
-  if (size_k % 128 != 0) return false;
+  // Same hard gates as the unfused arm — n%128 included. Without it a
+  // shape like n%64==0 && n%128!=0 was accepted and the group loop left
+  // trailing columns of C stale (reviewer finding on 1d04d72dc).
+  if (!Exl3GemvHardEligible(1, size_k, size_n, args.bits, args.codebook,
+                            /*has_su_sv=*/true))
+    return false;
   if (suh_ptr == nullptr || a_raw == nullptr) return false;
   const int mode = args.force_gemv > 0 ? 2 : Exl3GemvMode();
   if (mode == 0) return false;

@@ -437,7 +437,12 @@ void Exl3GemmKernelRocm(Queue& q, Tensor& c, const Tensor& a, const Tensor& trel
   // for the dot arm ahead of every GEMV variant, and the dot arm consumes the
   // already-transformed a_had, so it cannot run ahead of the input transform
   // the way the fused arm does.
-  if (m == 1 && !(dot_first && dot_shape)) {
+  // The fused arm is NOT tried when VT_EXL3_DOT_FIRST is set: that lever asks
+  // for the dot arm ahead of every GEMV variant, and the dot arm consumes the
+  // already-transformed a_had, so it cannot run ahead of the input transform
+  // the way the fused arm does. It also honours the same fast_paths gate as
+  // every fast arm — VT_EXL3_GEMV=0 must still select the transcription.
+  if (m == 1 && fast_paths && !(dot_first && dot_shape)) {
     gemv = Exl3GemvM1FusedTryLaunchRocm(
         st, a.data, suh.data ? suh.Ptr<uint16_t>() : nullptr, trellis, raw,
         static_cast<int>(k), static_cast<int>(n), q.device.index, args);
