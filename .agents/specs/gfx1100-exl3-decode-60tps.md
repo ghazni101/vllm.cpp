@@ -139,6 +139,20 @@ cut to ~4 ms. Both halves of the work are therefore required:
     no measured arm reaches (~600 GB/s best). Stop-condition territory:
     ~40-45 tok/s is the plausible bound without a structurally different
     decode.
+- 2026-10-02 (close): `05183d1ca` defaults the three coop arms
+  (`VT_GDN_SCAN_COOP`, `VT_ATTN_PREAMBLE_COOP`, `VT_GDN_NORMGATED_COOP`)
+  ON — measured +1.7 tok/s decode with the fused dispatch gate.
+  Authoritative same-harness A/B on the 12-prompt HumanEval leg,
+  256-token decode, 0.6/0.95/20 sampling, identical server flags:
+  `ecd81113c` (day-start HEAD) 18.15 decode tok/s, 16.49 whole-run →
+  `05183d1ca` 24.24 decode tok/s, 22.40 whole-run. +33.6% decode,
+  +35.8% whole-run. Golden greedy parity holds ("The capital of France
+  is" → " Paris.").
+  Final state vs the 60 tok/s target: ~24.4 tps achieved, ~40-45 the
+  plausible ceiling — see the 11.59 GB/token byte-traffic bound above.
+  Reaching 60 needs a structurally different decode (batched/grouped
+  GEMV, CUDA/HIP-graph replay of the per-layer stack, or a quant with
+  fewer bytes/token) — none allowed by this task's constraints.
 
 ## Owed
 
