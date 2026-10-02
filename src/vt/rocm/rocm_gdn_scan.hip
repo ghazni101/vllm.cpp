@@ -269,10 +269,12 @@ void LaunchGdnScanState(hipStream_t s, Tensor& out, const Tensor& q_in,
   const int64_t hk_n = q_in.shape[1], dk = q_in.shape[2];
   const int64_t hv_n = v.shape[1], dv = v.shape[2];
   // T6a opt-in (read once per process like the sibling arms): the
-  // warp-per-row cooperative mapping. Default OFF keeps the donor walk.
+  // warp-per-row cooperative mapping. Default ON: measured +1.7 tok/s
+  // decode end-to-end with the sibling coop arms on gfx1100 (Qwen3.8-27B
+  // EXL3, 2026-10-02). `VT_GDN_SCAN_COOP=0` keeps the donor walk.
   static const bool scan_coop = [] {
     const char* e = std::getenv("VT_GDN_SCAN_COOP");
-    return e != nullptr && e[0] == '1' && e[1] == '\0';
+    return e == nullptr || std::string(e) != "0";
   }();
   // Register-fused arm (same mapping, one state pass): decode is the
   // latency-bound case, so the fused kernel + a row z-split applies only

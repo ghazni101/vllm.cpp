@@ -320,10 +320,11 @@ void RmsNormGatedKernelRocm(Queue& q, Tensor& out, const Tensor& x, const Tensor
   const int64_t gate_outer = gate.stride[0];
   hipStream_t s = AsStream(q);
   const unsigned grid = static_cast<unsigned>(t);
-  // T9 opt-in arm (read PER CALL like the sibling flags): one block per
-  // row, cooperative reduction. Default OFF keeps the donor kernel.
+  // T9 arm (read PER CALL like the sibling flags): one block per row,
+  // cooperative reduction. Default ON — measured on gfx1100 (2026-10-02);
+  // `VT_GDN_NORMGATED_COOP=0` keeps the donor kernel.
   const char* coop_e = std::getenv("VT_GDN_NORMGATED_COOP");
-  const bool coop = coop_e != nullptr && coop_e[0] == '1' && coop_e[1] == '\0';
+  const bool coop = coop_e == nullptr || std::string(coop_e) != "0";
   if (coop) {
     if (x.dtype == DType::kF32) {
       if (out.dtype == DType::kF32) {
@@ -515,11 +516,12 @@ void AttnQkNormRopeGateKernelRocm(Queue& q, Tensor& q_out, Tensor& k_out, Tensor
     using Tsrc = decltype(src_tag);
     using Tqk = decltype(qk_tag);
     using Tgate = decltype(gate_tag);
-    // T6b opt-in (read once per process like the sibling arms): warp-per-item
-    // cooperative mapping. Default OFF keeps the donor walk.
+    // T6b arm (read once per process like the sibling arms): warp-per-item
+    // cooperative mapping. Default ON — measured on gfx1100 with the GDN
+    // coop arms (2026-10-02); `VT_ATTN_PREAMBLE_COOP=0` keeps the donor walk.
     static const bool preamble_coop = [] {
       const char* e = std::getenv("VT_ATTN_PREAMBLE_COOP");
-      return e != nullptr && e[0] == '1' && e[1] == '\0';
+      return e == nullptr || std::string(e) != "0";
     }();
     if (preamble_coop) {
       AttnQkNormRopeGateCoopK<Tsrc, Tqk, Tgate><<<GridFor(items), kBlock, 0, s>>>(
