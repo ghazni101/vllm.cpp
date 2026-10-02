@@ -60,15 +60,12 @@ __device__ inline float Exl3DecodeCodeword(uint16_t codeword, int codebook) {
   if (codebook == 2) {
     x *= 0x83DCD12Du;
     // `__dp4a(x, 0x01010101u, acc)` == acc + the four UNSIGNED bytes of x.
-    // Scalar here for the same reason rocm_grouped_gemm.hip's Dp4a is scalar:
-    // integer arithmetic is exact either way, and v_dot4 is a perf lever, not
-    // a correctness requirement.
-    const uint32_t byte_sum = (x & 0xffu) + ((x >> 8) & 0xffu) + ((x >> 16) & 0xffu) +
-                              ((x >> 24) & 0xffu);
-    // 0x6400 is chosen so the reinterpretation is EXACT: the fp16 binade
-    // [1024, 2048) has an ULP of exactly 1.0 and the byte sum is at most 1020,
-    // so the pattern never leaves that binade.
-    const uint32_t sum = 0x6400u + byte_sum;
+    // v_dot4_u32_u8 folds the four masks/adds into one instruction; integer
+    // arithmetic is exact either way. 0x6400 is chosen so the
+    // reinterpretation is EXACT: the fp16 binade [1024, 2048) has an ULP of
+    // exactly 1.0 and the byte sum is at most 1020, so the pattern never
+    // leaves that binade.
+    const uint32_t sum = __builtin_amdgcn_udot4(x, 0x01010101u, 0x6400u, false);
     const float h = DF16ToF32(static_cast<uint16_t>(sum));
     // BIT PATTERNS, not the rounded decimals upstream's comments carry:
     // 0x1eee is 887/131072 and 0xc931 is -1329/128.
@@ -93,6 +90,28 @@ __device__ inline float Exl3DecodeCodeword(uint16_t codeword, int codebook) {
   // converts, the f32 add, and Exl3RoundHalf.
   const half2 pair = __builtin_bit_cast(half2, x);
   return __hadd(__low2half(pair), __high2half(pair));
+}
+
+// mul1 pair via the u32xu8 byte-dot (codebook.cuh:25-41,76-89). The constants
+// are BIT PATTERNS: 0x1eee = 887/131072, 0xc931 = -1329/128, and 0x6400's
+// binade makes the integer reinterpretation exact (cuda_exl3.cu:281-304).
+// __builtin_amdgcn_udot4 is v_dot4_u32_u8 — acc + the four UNSIGNED bytes of
+// x in one instruction; __dp4a is not in this HIP's device headers. One
+// packed __hfma2 ends the pair where the scalar arm runs two f32 chains;
+// the CPU exhaustively proves both roundings equal, so bits are unchanged.
+__device__ __forceinline__ half2 Exl3DecodePairCb2Dp4a(uint32_t x0,
+                                                        uint32_t x1) {
+  x0 *= 0x83DCD12Du;
+  x1 *= 0x83DCD12Du;
+  const uint32_t sum0 = __builtin_amdgcn_udot4(x0, 0x01010101u, 0x6400u, false);
+  const uint32_t sum1 = __builtin_amdgcn_udot4(x1, 0x01010101u, 0x6400u, false);
+  const half2 k_inv_h2 = __half2half2(__ushort_as_half(0x1eee));
+  const half2 k_bias_h2 = __half2half2(__ushort_as_half(0xc931));
+  union {
+    uint16_t u16;
+    half h;
+  } h0{static_cast<uint16_t>(sum0)}, h1{static_cast<uint16_t>(sum1)};
+  return __hfma2(__halves2half2(h0.h, h1.h), k_inv_h2, k_bias_h2);
 }
 
 // Exl3TileRowMajorIndex (quantize.py:28-42). `t / 8` is the tensor-core lane,

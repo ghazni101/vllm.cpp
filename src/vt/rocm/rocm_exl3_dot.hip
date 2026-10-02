@@ -140,9 +140,10 @@ __device__ __forceinline__ uint32_t DotFetchWord(uint32_t w0, uint32_t w1,
 __device__ __forceinline__ half2 Exl3DecodePair6(uint32_t cwa, uint32_t cwb,
                                                int cb) {
   if (cb == 2) {
-    const float wa = Exl3DecodeCodeword(static_cast<uint16_t>(cwa), cb);
-    const float wb = Exl3DecodeCodeword(static_cast<uint16_t>(cwb), cb);
-    return __floats2half2_rn(wa, wb);
+    // The shared byte-dot pair decode — two ~10-op scalar Exl3DecodeCodeword
+    // calls collapse to one v_dot4_u32_u8 + __hfma2 each. Bit-identical:
+    // the CPU arm proves both roundings agree over every reachable byte sum.
+    return Exl3DecodePairCb2Dp4a(cwa, cwb);
   }
   uint32_t xa = cwa, xb = cwb;
   if (cb == 0) {

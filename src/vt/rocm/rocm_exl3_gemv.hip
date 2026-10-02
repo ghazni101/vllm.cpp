@@ -61,6 +61,7 @@
 #include "vt/ops.h"
 #include "vt/rocm/rocm_device_bind.h"
 #include "vt/rocm/rocm_f16_codec.h"
+#include "vt/rocm/rocm_exl3_decode.h"  // Exl3DecodePairCb2Dp4a
 
 namespace vt::rocm {
 namespace {
@@ -130,23 +131,6 @@ __device__ __forceinline__ half2 decode_mcg_or_3inst_2(uint32_t x0, uint32_t x1)
   return __hadd2(d0, d1);
 }
 
-// mul1 pair via dp4a byte sum (codebook.cuh:25-41,76-89). The constants are
-// BIT PATTERNS: 0x1eee = 887/131072, 0xc931 = -1329/128, and 0x6400's binade
-// makes the integer reinterpretation exact (cuda_exl3.cu:281-304 documents it).
-__device__ __forceinline__ half2 decode_pair_cb2_dp4a_(uint32_t x0, uint32_t x1) {
-  x0 *= 0x83DCD12Du;
-  x1 *= 0x83DCD12Du;
-  // acc + the four UNSIGNED bytes of x via the byte-dot: the u32xu8 dot is
-  // byte_sum(x) in one instruction (v_dot4_u32_u8 on gfx11). __dp4a is not in
-  // this HIP's device headers; __builtin_amdgcn_udot4 spelled directly is.
-  uint32_t sum0 = __builtin_amdgcn_udot4(x0, 0x01010101u, 0x6400u, false);
-  uint32_t sum1 = __builtin_amdgcn_udot4(x1, 0x01010101u, 0x6400u, false);
-  half2 k_inv_h2 = __half2half2(__ushort_as_half(0x1eee));
-  half2 k_bias_h2 = __half2half2(__ushort_as_half(0xc931));
-  half_uint16 h0(static_cast<uint16_t>(sum0));
-  half_uint16 h1(static_cast<uint16_t>(sum1));
-  return __hfma2(__halves2half2(h0.as_half, h1.as_half), k_inv_h2, k_bias_h2);
-}
 
 // ─── tail-biting window (exl3_dq.cuh) ────────────────────────────────────────
 
@@ -164,10 +148,10 @@ __device__ __forceinline__ void decode8(uint32_t w0, uint32_t w1, uint32_t w2, u
                                         uint32_t w4, uint32_t w5, uint32_t w6, uint32_t w7,
                                         FragB& f0, FragB& f1) {
   if constexpr (cb == 2) {
-    f0[0] = decode_pair_cb2_dp4a_(w0, w1);
-    f0[1] = decode_pair_cb2_dp4a_(w2, w3);
-    f1[0] = decode_pair_cb2_dp4a_(w4, w5);
-    f1[1] = decode_pair_cb2_dp4a_(w6, w7);
+    f0[0] = Exl3DecodePairCb2Dp4a(w0, w1);
+    f0[1] = Exl3DecodePairCb2Dp4a(w2, w3);
+    f1[0] = Exl3DecodePairCb2Dp4a(w4, w5);
+    f1[1] = Exl3DecodePairCb2Dp4a(w6, w7);
   } else {
     f0[0] = decode_mcg_or_3inst_2<cb>(w0, w1);
     f0[1] = decode_mcg_or_3inst_2<cb>(w2, w3);
