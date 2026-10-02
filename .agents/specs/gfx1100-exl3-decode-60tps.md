@@ -198,6 +198,9 @@ cut to ~4 ms. Both halves of the work are therefore required:
   dominate the ~7.5ms/token dispatch gap (median 3.2us between nodes,
   ~2480 nodes/token) and batching them is the structural fix that
   remains.
+  Sharing a_had across q/k/v is impossible on this checkpoint: their
+  suh sign matrices differ (sha256 over layer-3 bytes), and the
+  in-hadamard is per-weight — dead on correctness grounds, not cost.
 
 ## Owed
 
