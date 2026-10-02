@@ -104,6 +104,41 @@ cut to ~4 ms. Both halves of the work are therefore required:
 - Baseline census: `~/agent-artifacts/exl3-perf-gfx1100/trace/run1/`
   (rocprofv3 kernel trace + stats CSV, 2026-10-01).
 - Baseline decode: 19.5 tok/s (256-token leg), 17.7 tok/s under rocprofv3.
+- 2026-10-02: fused in-hadamard m=1 GEMV arms landed (`1d04d72dc`, review
+  fixes `91c263249`). Fused-vs-unfused bitwise checks pass (staging 0 bad
+  at k=5120 and k=17408; C bit-identical at n=1024/4096 for 4 bpw and
+  n=1024 for 3 bpw). Served greedy probe returns the pinned continuation.
+  Decode on the same HumanEval leg: `ecd81113c` 19.1 tok/s → `91c263249`
+  21.4 tok/s decode-only (52.4 → 46.8 ms/token mean tpot).
+- 2026-10-02 (later): kernel-level work on `rocm-gfx11-exl3-perf`:
+  - `e092643c2` — `fshift` lowered to `v_alignbit_b32` via
+    `__funnelshift_r` (the 64-bit idiom compiled to a multi-cycle
+    `v_lshrrev_b64`) with a `shift < 32` guard for the 3 bpw path whose
+    `s2+12` reaches 42; `decode_pair_cb2_dp4a_` byte-sum via
+    `__builtin_amdgcn_udot4` (`v_dot4_u32_u8`). GEMV bench: fused4
+    456→571-596 GB/s, fused3 373→~390, unfused prod4 453→~580,
+    prod3 373→~500.
+  - `aaac1aa51` — the same byte-dot pair decode in the dot arm's cb=2
+    path (`Exl3DecodePair6`), helper hoisted to `rocm_exl3_decode.h` so
+    both TUs share it; scalar `Exl3DecodeCodeword` cb=2 also uses udot4.
+  - `fb64d2ae8` — evict-first (`__builtin_nontemporal_load`) trellis
+    loads in the fused 4 bpw arm: fused4 571→596-603 GB/s.
+  - `91c2e3f43` — the fused m=1 arm is shape-gated: measured slower than
+    unfused everywhere except 4bpw n>=12288 (qkvo/gateup). 3 bpw fused
+    ~330-390 vs unfused ~440-520 GB/s on every shape.
+  - A/B levers measured end-to-end (decode-only tok/s, same leg):
+    defaults+fused-everywhere 24.4 → `VT_GDN_SCAN_COOP=1` 26.1 →
+    +`VT_ATTN_PREAMBLE_COOP=1`+`VT_GDN_NORMGATED_COOP=1` 27.2 →
+    with the dispatch gate 27.7. `VT_EXL3_GEMV_KSPLIT=4` 20.5 (regression),
+    `VT_EXL3_DOT_FIRST=1` 7.6 (regression), `VT_ROCM_EXL3_WMMA=1` 7.8
+    (regression).
+  - Ceiling: 11.59 GB of trellis bytes per decode token (quantization
+    tensor_storage sum) vs ~700-960 GB/s DRAM on this card puts the
+    GEMV-only floor at ~12-16.5 ms/token; every other kernel adds on top.
+    60 tok/s therefore needs the decode GEMV to run at DRAM peak, which
+    no measured arm reaches (~600 GB/s best). Stop-condition territory:
+    ~40-45 tok/s is the plausible bound without a structurally different
+    decode.
 
 ## Owed
 
