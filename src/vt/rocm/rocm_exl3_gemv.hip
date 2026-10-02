@@ -1109,8 +1109,14 @@ __global__ __launch_bounds__(512) void Exl3GemvM1K4Fused(
 
   for (int group = blockIdx.x; group < num_groups; group += gridDim.x) {
     const uint32_t* bp = B32 + (size_t)ks0 * slice_stride + (size_t)group * 128;
+    // The trellis is touched once per decode step — the sub-4 fused arm's
+    // nontemporal spelling kept for parity (evict-first .slc on gfx11).
     auto ld_b = [&](int i) -> uint4 {
-      return *reinterpret_cast<const uint4*>(bp + (size_t)i * slice_stride + w0);
+      const uint32_t* p = bp + (size_t)i * slice_stride + w0;
+      return make_uint4(__builtin_nontemporal_load(p),
+                        __builtin_nontemporal_load(p + 1),
+                        __builtin_nontemporal_load(p + 2),
+                        __builtin_nontemporal_load(p + 3));
     };
     uint4 pf[PF];
 #pragma unroll
