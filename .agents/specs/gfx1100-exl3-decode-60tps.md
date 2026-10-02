@@ -245,6 +245,11 @@ cut to ~4 ms. Both halves of the work are therefore required:
   requires moving fewer bytes per token — a lower-bpw arm, a repacked
   trellis, or fp8 KV — i.e. a format change, which the task rules
   forbid. The measured-optimal 25.4 tok/s is 71% of that floor.
+- `M1K3v2` (boundary word as a direct prefetched L1-sector load instead
+  of `__shfl_sync`): bit-verified, microbench-neutral vs `own3`
+  (486 vs 489 GB/s on qkvo). The extract/decode dependency chain is not
+  the shfl — every structural variant of the 3bpw m=1 GEMV is now
+  measured and the production arm stands.
 
 ## Owed
 
