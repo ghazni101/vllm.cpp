@@ -3230,54 +3230,99 @@ void PagedAttentionKernelRocm(Queue& q, Tensor& out, const Tensor& query, const 
       ((k_cache.dtype == DType::kBF16 && v_cache.dtype == DType::kBF16) ||
        (k_cache.dtype == DType::kI8 && v_cache.dtype == DType::kI8 &&
         args.kv_cache_dtype != Fp8KVCacheDataType::kAuto)) &&
-      (d == 128 || d == 256) && hq == 16 && num_kv_heads == 4) {
+      (d == 128 || d == 256) && num_kv_heads > 0 &&
+      hq % num_kv_heads == 0 &&
+      (hq / num_kv_heads == 4 || hq / num_kv_heads == 6 ||
+       hq / num_kv_heads == 8)) {
     constexpr int kDecWarpsG = 8;
-    constexpr int kQgG = 4;
+    // The kernel tiles a wider GQA group over blockIdx.z in chunks of QG.
+    // qg_total 4 -> QG=4 z=1 (the TG150 arm), 6 -> QG=6 z=1 (Qwen3.5-dense
+    // 27B class: hq=24, kv=4), 8 -> QG=4 z=2.
+    const int64_t qg_total = hq / num_kv_heads;
+    const int qg = qg_total == 4 ? 4 : qg_total == 6 ? 6 : 4;
+    const unsigned z_groups = static_cast<unsigned>(qg_total / qg);
     constexpr int kNwarpsG = kDecWarpsG;
     // EPL = d / 32 lanes: 8 at head_dim 256 (the original TG150 arm), 4 at
     // head_dim 128 (Qwen3-dense class, TG200). One kernel body; it
     // self-guards d != EPL*32, so a wrong pairing exits without reading.
-    const size_t smem = sizeof(float) *
-        (static_cast<size_t>(kNwarpsG) * kQgG * static_cast<size_t>(d) +
-         2 * static_cast<size_t>(kNwarpsG) * kQgG);
-    dim3 grid3(static_cast<unsigned>(total_q), static_cast<unsigned>(num_kv_heads), 1);
+    const int64_t smem_qg =
+        static_cast<int64_t>(kNwarpsG) * qg * (static_cast<int64_t>(d) + 2);
+    const size_t smem = sizeof(float) * static_cast<size_t>(smem_qg);
+    dim3 grid3(static_cast<unsigned>(total_q), static_cast<unsigned>(num_kv_heads),
+               z_groups);
     dim3 block3(static_cast<unsigned>(kNwarpsG * 32));
     const bool gqa4_fp8 = k_cache.dtype == DType::kI8;
     if (d == 128) {
       if (gqa4_fp8) {
-        PagedAttnDecodeGqaF32Q<kQgG, 4, kDecWarpsG, uint8_t><<<grid3, block3, smem, st>>>(
-            out.Ptr<float>(), query.Ptr<float>(), k_cache.Ptr<uint8_t>(),
-            v_cache.Ptr<uint8_t>(), block_table.Ptr<int32_t>(), seq_lens.Ptr<int32_t>(),
-            query_start_loc.Ptr<int32_t>(), num_reqs, hq, num_kv_heads, d, block_size,
-            bt_row, bt_col, kc_blk, kc_pg, kc_hd, vc_blk, vc_pg, vc_hd, args.scale,
-            args.logits_soft_cap, args.causal, window_left, window_right,
-            args.k_scale, args.v_scale);
+        if (qg == 6)
+          PagedAttnDecodeGqaF32Q<6, 4, kDecWarpsG, uint8_t><<<grid3, block3, smem, st>>>(
+              out.Ptr<float>(), query.Ptr<float>(), k_cache.Ptr<uint8_t>(),
+              v_cache.Ptr<uint8_t>(), block_table.Ptr<int32_t>(), seq_lens.Ptr<int32_t>(),
+              query_start_loc.Ptr<int32_t>(), num_reqs, hq, num_kv_heads, d, block_size,
+              bt_row, bt_col, kc_blk, kc_pg, kc_hd, vc_blk, vc_pg, vc_hd, args.scale,
+              args.logits_soft_cap, args.causal, window_left, window_right,
+              args.k_scale, args.v_scale);
+        else
+          PagedAttnDecodeGqaF32Q<4, 4, kDecWarpsG, uint8_t><<<grid3, block3, smem, st>>>(
+              out.Ptr<float>(), query.Ptr<float>(), k_cache.Ptr<uint8_t>(),
+              v_cache.Ptr<uint8_t>(), block_table.Ptr<int32_t>(), seq_lens.Ptr<int32_t>(),
+              query_start_loc.Ptr<int32_t>(), num_reqs, hq, num_kv_heads, d, block_size,
+              bt_row, bt_col, kc_blk, kc_pg, kc_hd, vc_blk, vc_pg, vc_hd, args.scale,
+              args.logits_soft_cap, args.causal, window_left, window_right,
+              args.k_scale, args.v_scale);
       } else {
-        PagedAttnDecodeGqaF32Q<kQgG, 4, kDecWarpsG><<<grid3, block3, smem, st>>>(
-            out.Ptr<float>(), query.Ptr<float>(), k_cache.Ptr<__hip_bfloat16>(),
-            v_cache.Ptr<__hip_bfloat16>(), block_table.Ptr<int32_t>(), seq_lens.Ptr<int32_t>(),
-            query_start_loc.Ptr<int32_t>(), num_reqs, hq, num_kv_heads, d, block_size,
-            bt_row, bt_col, kc_blk, kc_pg, kc_hd, vc_blk, vc_pg, vc_hd, args.scale,
-            args.logits_soft_cap, args.causal, window_left, window_right,
-            1.0f, 1.0f);
+        if (qg == 6)
+          PagedAttnDecodeGqaF32Q<6, 4, kDecWarpsG><<<grid3, block3, smem, st>>>(
+              out.Ptr<float>(), query.Ptr<float>(), k_cache.Ptr<__hip_bfloat16>(),
+              v_cache.Ptr<__hip_bfloat16>(), block_table.Ptr<int32_t>(), seq_lens.Ptr<int32_t>(),
+              query_start_loc.Ptr<int32_t>(), num_reqs, hq, num_kv_heads, d, block_size,
+              bt_row, bt_col, kc_blk, kc_pg, kc_hd, vc_blk, vc_pg, vc_hd, args.scale,
+              args.logits_soft_cap, args.causal, window_left, window_right,
+              1.0f, 1.0f);
+        else
+          PagedAttnDecodeGqaF32Q<4, 4, kDecWarpsG><<<grid3, block3, smem, st>>>(
+              out.Ptr<float>(), query.Ptr<float>(), k_cache.Ptr<__hip_bfloat16>(),
+              v_cache.Ptr<__hip_bfloat16>(), block_table.Ptr<int32_t>(), seq_lens.Ptr<int32_t>(),
+              query_start_loc.Ptr<int32_t>(), num_reqs, hq, num_kv_heads, d, block_size,
+              bt_row, bt_col, kc_blk, kc_pg, kc_hd, vc_blk, vc_pg, vc_hd, args.scale,
+              args.logits_soft_cap, args.causal, window_left, window_right,
+              1.0f, 1.0f);
       }
     } else {
       if (gqa4_fp8) {
-        PagedAttnDecodeGqaF32Q<kQgG, 8, kDecWarpsG, uint8_t><<<grid3, block3, smem, st>>>(
-            out.Ptr<float>(), query.Ptr<float>(), k_cache.Ptr<uint8_t>(),
-            v_cache.Ptr<uint8_t>(), block_table.Ptr<int32_t>(), seq_lens.Ptr<int32_t>(),
-            query_start_loc.Ptr<int32_t>(), num_reqs, hq, num_kv_heads, d, block_size,
-            bt_row, bt_col, kc_blk, kc_pg, kc_hd, vc_blk, vc_pg, vc_hd, args.scale,
-            args.logits_soft_cap, args.causal, window_left, window_right,
-            args.k_scale, args.v_scale);
+        if (qg == 6)
+          PagedAttnDecodeGqaF32Q<6, 8, kDecWarpsG, uint8_t><<<grid3, block3, smem, st>>>(
+              out.Ptr<float>(), query.Ptr<float>(), k_cache.Ptr<uint8_t>(),
+              v_cache.Ptr<uint8_t>(), block_table.Ptr<int32_t>(), seq_lens.Ptr<int32_t>(),
+              query_start_loc.Ptr<int32_t>(), num_reqs, hq, num_kv_heads, d, block_size,
+              bt_row, bt_col, kc_blk, kc_pg, kc_hd, vc_blk, vc_pg, vc_hd, args.scale,
+              args.logits_soft_cap, args.causal, window_left, window_right,
+              args.k_scale, args.v_scale);
+        else
+          PagedAttnDecodeGqaF32Q<4, 8, kDecWarpsG, uint8_t><<<grid3, block3, smem, st>>>(
+              out.Ptr<float>(), query.Ptr<float>(), k_cache.Ptr<uint8_t>(),
+              v_cache.Ptr<uint8_t>(), block_table.Ptr<int32_t>(), seq_lens.Ptr<int32_t>(),
+              query_start_loc.Ptr<int32_t>(), num_reqs, hq, num_kv_heads, d, block_size,
+              bt_row, bt_col, kc_blk, kc_pg, kc_hd, vc_blk, vc_pg, vc_hd, args.scale,
+              args.logits_soft_cap, args.causal, window_left, window_right,
+              args.k_scale, args.v_scale);
       } else {
-        PagedAttnDecodeGqaF32Q<kQgG, 8, kDecWarpsG><<<grid3, block3, smem, st>>>(
-            out.Ptr<float>(), query.Ptr<float>(), k_cache.Ptr<__hip_bfloat16>(),
-            v_cache.Ptr<__hip_bfloat16>(), block_table.Ptr<int32_t>(), seq_lens.Ptr<int32_t>(),
-            query_start_loc.Ptr<int32_t>(), num_reqs, hq, num_kv_heads, d, block_size,
-            bt_row, bt_col, kc_blk, kc_pg, kc_hd, vc_blk, vc_pg, vc_hd, args.scale,
-            args.logits_soft_cap, args.causal, window_left, window_right,
-            1.0f, 1.0f);
+        if (qg == 6)
+          PagedAttnDecodeGqaF32Q<6, 8, kDecWarpsG><<<grid3, block3, smem, st>>>(
+              out.Ptr<float>(), query.Ptr<float>(), k_cache.Ptr<__hip_bfloat16>(),
+              v_cache.Ptr<__hip_bfloat16>(), block_table.Ptr<int32_t>(), seq_lens.Ptr<int32_t>(),
+              query_start_loc.Ptr<int32_t>(), num_reqs, hq, num_kv_heads, d, block_size,
+              bt_row, bt_col, kc_blk, kc_pg, kc_hd, vc_blk, vc_pg, vc_hd, args.scale,
+              args.logits_soft_cap, args.causal, window_left, window_right,
+              1.0f, 1.0f);
+        else
+          PagedAttnDecodeGqaF32Q<4, 8, kDecWarpsG><<<grid3, block3, smem, st>>>(
+              out.Ptr<float>(), query.Ptr<float>(), k_cache.Ptr<__hip_bfloat16>(),
+              v_cache.Ptr<__hip_bfloat16>(), block_table.Ptr<int32_t>(), seq_lens.Ptr<int32_t>(),
+              query_start_loc.Ptr<int32_t>(), num_reqs, hq, num_kv_heads, d, block_size,
+              bt_row, bt_col, kc_blk, kc_pg, kc_hd, vc_blk, vc_pg, vc_hd, args.scale,
+              args.logits_soft_cap, args.causal, window_left, window_right,
+              1.0f, 1.0f);
       }
     }
     Check(hipGetLastError(), "paged_attention decode_gqa_f32q launch");
