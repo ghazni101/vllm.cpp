@@ -231,6 +231,14 @@ cut to ~4 ms. Both halves of the work are therefore required:
 - `VT_EXL3_GEMV_SMEM=1` smem-staged fragment arms (reached via CFG=0/1):
   11.4-11.7 tok/s. Census complete: the dq8 m=1 dot arm at 25.4 is the
   fastest implementation of every tried structure for this checkpoint.
+- 2026-10-02 (codeword-LUT decode — fast but impossible): an M1K3
+  variant replacing the cb=2 hash decode with a 6-bit pair LUT in LDS
+  measured **826-1147 GB/s** on every bench3 shape (2.2x the dq8 arm,
+  above the no-decode stream's 800) — but it is WRONG: a cw dump shows
+  the extraction window carries 16 meaningful bits (0x0a18, 0x50c0),
+  the mul1 hash consumes all of them, and a pair LUT would need a
+  32-bit index. The measurement stands as evidence for what the ceiling
+  would pay if decode got cheaper, not as a usable kernel.
 
 ## Owed
 
