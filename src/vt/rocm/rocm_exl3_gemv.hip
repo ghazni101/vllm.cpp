@@ -140,8 +140,12 @@ __device__ __forceinline__ uint32_t fshift(const uint32_t b, const uint32_t a, i
   // (a<<32|b)>>s idiom lowers to v_lshrrev_b64, a multi-cycle 64-bit shift.
   // Same bits either way — for shift < 32. dq8_regs_3bits calls this with
   // s2+12 which reaches 42, and v_alignbit wraps its shift mod 32 while the
-  // 64-bit shift yields a >> (s-32). The guard keeps both halves correct.
-  return shift < 32 ? __funnelshift_r(b, a, shift) : (a >> (shift - 32));
+  // 64-bit shift yields a >> (s-32) = funnelshift_r(a, 0, s & 31). Selecting
+  // the operands instead of the result keeps a per-lane shift branchless
+  // (two v_cndmask + one v_alignbit); a ternary on the result compiled to a
+  // divergent branch per call in the 3 bpw arm.
+  const bool hi = shift >= 32;
+  return __funnelshift_r(hi ? a : b, hi ? 0u : a, shift & 31);
 }
 
 // Codewords are the LOW 16 bits of w0..w7; the extractors leave window spill
@@ -525,7 +529,7 @@ __global__ __launch_bounds__(CFG == 0 ? 512 : 256) void Exl3GemvK(
   constexpr int LSTRIDE = bits == 3 ? 24 : 32;      // uint32 per load
   static_assert(bits != 2 || WNT % 2 == 0, "2 bpw packs two tiles per warp load");
 
-  const int warp = threadIdx.x / 32;
+  const int warp = __builtin_amdgcn_readfirstlane(threadIdx.x / 32);
   const int lane = threadIdx.x % 32;
 
   const int ntiles = size_n / 16;
@@ -742,9 +746,14 @@ __global__ __launch_bounds__(512) void Exl3GemvM1K(
   constexpr int LSTRIDE = bits == 3 ? 24 : 32;      // uint32 per load
   static_assert(bits != 2 || WNT % 2 == 0, "2 bpw packs two tiles per warp load");
 
-
-  const int warp = threadIdx.x / 32;
+  // readfirstlane: warp (and so ks0/myn) is wave-uniform, which the
+  // compiler cannot prove from threadIdx.x / 32; without it every k-loop
+  // bound is a VGPR compare + exec-mask branch.
+  const int warp = __builtin_amdgcn_readfirstlane(threadIdx.x / 32);
   const int lane = threadIdx.x % 32;
+  // 3 bpw: lanes 24..31 own no tile word (the window shuffles read lanes
+  // 0..23 only), so they load word 23 again instead of branching around it.
+  const int lane_ld = bits == 3 ? min(lane, 23) : lane;
 
   const int ntiles = size_n / 16;
   const int kslices = size_k / 16;
@@ -781,15 +790,10 @@ __global__ __launch_bounds__(512) void Exl3GemvM1K(
   __shared__ float sh_red[WK][COLS];
 
   for (int group = blockIdx.x; group < num_groups; group += gridDim.x) {
-    const uint32_t* bp = B32 + (size_t)ks0 * slice_stride + group * WNT * TWORDS + lane;
+    const uint32_t* bp = B32 + (size_t)ks0 * slice_stride + group * WNT * TWORDS + lane_ld;
 
     auto ld_b = [&](int i, int l) -> uint32_t {
-      if constexpr (bits == 3)
-        return lane < 24 ? __builtin_nontemporal_load(bp + (size_t)i * slice_stride +
-                                                          l * LSTRIDE)
-                         : 0;
-      else
-        return __builtin_nontemporal_load(bp + (size_t)i * slice_stride + l * LSTRIDE);
+      return __builtin_nontemporal_load(bp + (size_t)i * slice_stride + l * LSTRIDE);
     };
 
     uint32_t pf[PF][LOADS];
@@ -906,7 +910,7 @@ __global__ __launch_bounds__(512) void Exl3GemvM1K4(
   constexpr int PF = 4;    // prefetch ring depth
   constexpr int COLS = 64; // one warp covers 4 tiles = 64 columns
 
-  const int warp = threadIdx.x / 32;
+  const int warp = __builtin_amdgcn_readfirstlane(threadIdx.x / 32);
   const int lane = threadIdx.x % 32;
   const int l7 = lane & 7;   // column base within the lane's tile
 
@@ -1089,7 +1093,7 @@ __global__ __launch_bounds__(512) void Exl3GemvM1K4Fused(
   constexpr int COLS = 64;
   extern __shared__ half2 shA[];
 
-  const int warp = threadIdx.x / 32;
+  const int warp = __builtin_amdgcn_readfirstlane(threadIdx.x / 32);
   const int lane = threadIdx.x % 32;
   const int l7 = lane & 7;
 
@@ -1204,7 +1208,7 @@ __global__ __launch_bounds__(512) void Exl3GemvM1KFused(
   constexpr int LSTRIDE = bits == 3 ? 24 : 32;
   extern __shared__ half2 shA[];
 
-  const int warp = threadIdx.x / 32;
+  const int warp = __builtin_amdgcn_readfirstlane(threadIdx.x / 32);
   const int lane = threadIdx.x % 32;
 
   const int ntiles = size_n / 16;
@@ -1439,7 +1443,7 @@ __global__ __launch_bounds__(512) void Exl3GemvMK3(
   constexpr int WK = 16;
   constexpr int PF = 4;
   constexpr int COLS = 64;
-  const int warp = threadIdx.x / 32;
+  const int warp = __builtin_amdgcn_readfirstlane(threadIdx.x / 32);
   const int lane = threadIdx.x % 32;
   const int l7 = lane & 7;
   const int ntiles = size_n / 16;
@@ -1787,7 +1791,11 @@ bool Exl3GemvM1FusedTryLaunchRocm(hipStream_t st, const void* a_raw,
 
   int max_blocks = GemvOccupancyRocm(kernel, 512);
   if (max_blocks < 1) max_blocks = 1;
-  const int grid = GemvGridForGroups(size_n / cols, max_blocks * num_sms);
+  // Capped at co-residency regardless of VT_EXL3_GEMV_GRID: every block
+  // re-stages the whole a_had row in LDS, so extra blocks add staging work
+  // (measured 65 -> 75 us/call on the 4 bpw gate/up shapes uncapped).
+  const int groups = size_n / cols;
+  const int grid = std::min(groups, max_blocks * num_sms);
   if (grid < 1) return false;
 
   static const int kKsplitEnv = [] {
