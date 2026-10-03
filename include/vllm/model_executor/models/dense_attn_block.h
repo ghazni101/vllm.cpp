@@ -343,21 +343,9 @@ inline DBuf Exl3MatmulD(Dev d, const vt::Tensor& x, const Exl3Weight& w,
                out_dtype == vt::DType::kF16,
            "exl3 linear: out_dtype must be f32, bf16 or f16");
 
-  // ROCm carries bf16 A and C natively (ops.cpp gates the dtype on the
-  // backend): the input Hadamard folds the CastF16 into its load and the
-  // output one folds the CastBf16 into its store — both bit-identical to the
-  // separate passes — so on ROCm a bf16 activation and a bf16 request skip
-  // both staging launches. The reconstruct arm (M > 144, its own Hadamard
-  // path) still wants the f16 staging, as does every other backend.
-  const bool use_reconstruct_check =
-      M > 144 &&
-      vt::OpRegistered(vt::OpId::kExl3ReconstructGemm, d.q.device.type);
-  const bool rocm_direct_bf16 =
-      d.q.device.type == vt::DeviceType::kROCM && !use_reconstruct_check;
   DBuf a_owned;
   vt::Tensor a = x;
-  if (x.dtype != vt::DType::kF16 &&
-      !(rocm_direct_bf16 && x.dtype == vt::DType::kBF16)) {
+  if (x.dtype != vt::DType::kF16) {
     a_owned = DBuf(d, vt::DType::kF16, {M, K});
     vt::CastF16(d.q, a_owned.t(), x);
     a = a_owned.t();
@@ -380,7 +368,10 @@ inline DBuf Exl3MatmulD(Dev d, const vt::Tensor& x, const Exl3Weight& w,
   // No divisibility guard is needed here: `Exl3ReconstructGemm` requires k and
   // n to be multiples of 128, and `Exl3Gemm` already refuses the same shapes
   // (src/vt/ops.cpp), so the dispatch cannot turn a served shape into a refusal.
-  const bool use_reconstruct = use_reconstruct_check;
+  constexpr int64_t kReconstructThreshold = 144;
+  const bool use_reconstruct =
+      M > kReconstructThreshold &&
+      vt::OpRegistered(vt::OpId::kExl3ReconstructGemm, d.q.device.type);
   // THE WEIGHT SCRATCH IS NOT A POOL BLOCK (QUANT-EXL3 W7,
   // .agents/specs/quant-exl3-recon-scratch.md). The fp16 [K, min(N, 32768)]
   // reconstructed weight comes from the backend's ONE persistent buffer per
@@ -407,13 +398,6 @@ inline DBuf Exl3MatmulD(Dev d, const vt::Tensor& x, const Exl3Weight& w,
 
   if (out_dtype == vt::DType::kF16) {
     DBuf c(d, vt::DType::kF16, {M, N});
-    run_gemm(c.t());
-    return c;
-  }
-  if (out_dtype == vt::DType::kBF16 && rocm_direct_bf16) {
-    // The output Hadamard writes bf16 straight — one RN round, the same
-    // __float2bfloat16 CastBf16K would run on the f32 form.
-    DBuf c(d, vt::DType::kBF16, {M, N});
     run_gemm(c.t());
     return c;
   }
