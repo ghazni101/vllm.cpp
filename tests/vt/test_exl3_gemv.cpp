@@ -284,7 +284,7 @@ TEST_CASE("exl3 device: every instantiated GEMV arm meets tier 3c") {
   vt::Backend& cb_be = vt::GetBackend(vt::DeviceType::kCUDA);
   vt::Queue hq = vt::GetBackend(vt::DeviceType::kCPU).CreateQueue();
 
-  const int64_t m = 1;
+  const int64_t kSingleM = 1;
 
   // EVERY INSTANTIATED ARM, and both CONFIGS of the envelope.
   //
@@ -306,6 +306,11 @@ TEST_CASE("exl3 device: every instantiated GEMV arm meets tier 3c") {
   struct Arm {
     int bits, cb;
     int64_t k, n;
+    // m is the row count: 1 is the dq8/direct arm, 2..8 take the batched
+    // Exl3GemvMK3 arm added under spec gfx1100-exl3-decode-60tps (the arm that
+    // decodes each trellis tile once for the whole batch instead of
+    // re-streaming it per row).
+    int64_t m;
     // `std::string`, NOT `const char*`. Under doctest 2.5.2 a `const char*`
     // streamed into `MESSAGE` or `CAPTURE` decays to BOOL and prints `1`, so a
     // parameterised suite's per-arm diagnostic silently stops naming the arm --
@@ -316,10 +321,11 @@ TEST_CASE("exl3 device: every instantiated GEMV arm meets tier 3c") {
     std::string what;
   };
   const Arm kArms[] = {
-      {3, 1, kW2K, kW2N, "(3,1) narrow"},
-      {3, 2, kW2K, kW2N, "(3,2) narrow"},
-      {4, 2, kW2K, kW2N, "(4,2) narrow"},
-      {4, 2, 2048, 8320, "(4,2) wide"},
+      {3, 1, kW2K, kW2N, 1, "(3,1) narrow"},
+      {3, 2, kW2K, kW2N, 1, "(3,2) narrow"},
+      {3, 2, kW2K, kW2N, 8, "(3,2) narrow m8"},
+      {4, 2, kW2K, kW2N, 1, "(4,2) narrow"},
+      {4, 2, 2048, 8320, 1, "(4,2) wide"},
   };
 
   // The (3,1)/(3,2) device outputs are kept for the cross-arm check below.
@@ -330,6 +336,7 @@ TEST_CASE("exl3 device: every instantiated GEMV arm meets tier 3c") {
     CAPTURE(arm.bits);
     CAPTURE(arm.cb);
     const int64_t k = arm.k, n = arm.n;
+    const int64_t m = arm.m;
     const int64_t tile_bytes = 32 * arm.bits;
     Exl3Fixture f = MakeFixture(k, n, arm.bits, 0x5EEDu);
     std::vector<uint16_t> a(static_cast<size_t>(m * k));
@@ -467,7 +474,7 @@ TEST_CASE("exl3 device: every instantiated GEMV arm meets tier 3c") {
     // cannot be met by an arm that decoded with the wrong codebook.
     CHECK(rel_sib > 100.0 * 6.0e-3);
 
-    if (arm.bits == 3) bits3_per_cb.push_back(got);
+    if (arm.bits == 3 && arm.m == kSingleM) bits3_per_cb.push_back(got);
 
     cb_be.Free(d_a);
     cb_be.Free(d_ah);
@@ -483,6 +490,7 @@ TEST_CASE("exl3 device: every instantiated GEMV arm meets tier 3c") {
   // than each against a host reference. If they agree the case is measuring one
   // arm twice and its tolerances mean nothing — which is the spec's stop
   // condition, not a tolerance to widen.
+  // Same-m rows only: the m=8 batched arm writes a different output extent.
   REQUIRE(bits3_per_cb.size() == 2);
   size_t differing = 0;
   for (size_t i = 0; i < bits3_per_cb[0].size(); ++i)
