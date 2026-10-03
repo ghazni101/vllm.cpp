@@ -138,14 +138,25 @@ __device__ __forceinline__ half2 decode_mcg_or_3inst_2(uint32_t x0, uint32_t x1)
 __device__ __forceinline__ uint32_t fshift(const uint32_t b, const uint32_t a, int shift) {
   // __funnelshift_r lowers to v_alignbit_b32 (one VALU op) on gfx11; the
   // (a<<32|b)>>s idiom lowers to v_lshrrev_b64, a multi-cycle 64-bit shift.
-  // Same bits either way — for shift < 32. dq8_regs_3bits calls this with
-  // s2+12 which reaches 42, and v_alignbit wraps its shift mod 32 while the
-  // 64-bit shift yields a >> (s-32) = funnelshift_r(a, 0, s & 31). Selecting
-  // the operands instead of the result keeps a per-lane shift branchless
-  // (two v_cndmask + one v_alignbit); a ternary on the result compiled to a
-  // divergent branch per call in the 3 bpw arm.
+  // Same bits either way — for shift < 32. For shift >= 32 v_alignbit wraps
+  // mod 32 while the 64-bit shift yields a >> (s-32) =
+  // funnelshift_r(a, 0, s & 31). Selecting the operands instead of the
+  // result keeps a per-lane shift branchless (two v_cndmask + one
+  // v_alignbit); a ternary on the result compiles to a divergent branch.
+  // Constant shifts fold to the single v_alignbit.
   const bool hi = shift >= 32;
   return __funnelshift_r(hi ? a : b, hi ? 0u : a, shift & 31);
+}
+
+// Raw buffer resource over a tensor for the m=1 arms. A buffer load takes the
+// wave-uniform byte offset in an SGPR (soffset) and the per-lane offset in a
+// loop-invariant VGPR, so the stream issues no 64-bit VALU address adds.
+// Word 3 is the gfx11 raw-buffer descriptor (DST_SEL_XYZW, FORMAT
+// 32_FLOAT; CK's CK_BUFFER_RESOURCE_3RD_DWORD for gfx11). num_records is an
+// int: the launcher keeps tensors >= 2 GiB off these arms.
+__device__ __forceinline__ __amdgpu_buffer_rsrc_t M1BufferRsrc(const void* p, size_t bytes) {
+  return __builtin_amdgcn_make_buffer_rsrc(const_cast<void*>(p), 0, static_cast<int>(bytes),
+                                           0x31004000);
 }
 
 // Codewords are the LOW 16 bits of w0..w7; the extractors leave window spill
@@ -209,11 +220,15 @@ template <int cb>
 __device__ __forceinline__ void dq8_regs_3bits(uint32_t a, uint32_t b, int s2,
                                                FragB& f0, FragB& f1) {
   uint32_t w0, w1, w2, w3, w4, w5, w6, w7;
-  w7 = fshift(b, a, s2);
+  // s2 is in [0, 31] by construction ((i2+1)*32 - b2 with i2 = (b2-1)/32),
+  // so the first window is one v_alignbit. The second is (a:b) >> (s2+12),
+  // whose low word is the 64-bit value (a >> s2 : w7) shifted by 12 — the
+  // same bits as the 64-bit shift without a per-lane >= 32 select.
+  w7 = __funnelshift_r(b, a, s2);
   w6 = w7 >> 3;
   w5 = w6 >> 3;
   w4 = w5 >> 3;
-  w3 = fshift(b, a, s2 + 12);
+  w3 = __funnelshift_r(w7, a >> s2, 12);
   w2 = w3 >> 3;
   w1 = w2 >> 3;
   w0 = w1 >> 3;
@@ -764,9 +779,7 @@ __global__ __launch_bounds__(512) void Exl3GemvM1K(
   const int ks0 = (blockIdx.y * WK + warp) * chunk;
   const int myn = max(0, min(chunk, kslices - ks0));
 
-  const uint32_t* B32 = reinterpret_cast<const uint32_t*>(B);
   const size_t slice_stride = (size_t)ntiles * TWORDS;
-  const half2* A2 = reinterpret_cast<const half2*>(A);
 
   // Per-lane extraction constants — the same formulas the fragment arm uses
   // (dq8_aligned_2bits / dq8<3, cb, 4> in exl3_dq.cuh).
@@ -789,11 +802,18 @@ __global__ __launch_bounds__(512) void Exl3GemvM1K(
 
   __shared__ float sh_red[WK][COLS];
 
+  const __amdgpu_buffer_rsrc_t b_rsrc = M1BufferRsrc(B, (size_t)kslices * slice_stride * 4);
+  const __amdgpu_buffer_rsrc_t a_rsrc = M1BufferRsrc(A, (size_t)size_k * 2);
+  const int b_lane = lane_ld * 4;
+  const int a_lane = (lane & 3) * 4;
+  const uint32_t sstride = static_cast<uint32_t>(slice_stride) * 4;
+
   for (int group = blockIdx.x; group < num_groups; group += gridDim.x) {
-    const uint32_t* bp = B32 + (size_t)ks0 * slice_stride + group * WNT * TWORDS + lane_ld;
+    const uint32_t gbyte = static_cast<uint32_t>(ks0) * sstride + group * WNT * TWORDS * 4;
 
     auto ld_b = [&](int i, int l) -> uint32_t {
-      return __builtin_nontemporal_load(bp + (size_t)i * slice_stride + l * LSTRIDE);
+      return __builtin_amdgcn_raw_buffer_load_b32(b_rsrc, b_lane,
+                                                  gbyte + i * sstride + l * LSTRIDE * 4, 6);
     };
 
     uint32_t pf[PF][LOADS];
@@ -823,9 +843,11 @@ __global__ __launch_bounds__(512) void Exl3GemvM1K(
 
         // A row 0's two half2s at this lane's k quarter — the same pair the
         // fragment arm loads into a01/a23.
-        const size_t a_col = (size_t)(ks0 + i) * 8 + (lane & 3);
-        const half2 a01 = A2[a_col];
-        const half2 a23 = A2[a_col + 4];
+        const uint32_t a_s = static_cast<uint32_t>(ks0 + i) * 32;
+        const half2 a01 = __builtin_bit_cast(
+            half2, __builtin_amdgcn_raw_buffer_load_b32(a_rsrc, a_lane, a_s, 0));
+        const half2 a23 = __builtin_bit_cast(
+            half2, __builtin_amdgcn_raw_buffer_load_b32(a_rsrc, a_lane, a_s + 16, 0));
 
 #pragma unroll
         for (int t = 0; t < WNT; ++t) {
@@ -923,7 +945,6 @@ __global__ __launch_bounds__(512) void Exl3GemvM1K4(
   const int ks0 = (blockIdx.y * WK + warp) * chunk;
   const int myn = max(0, min(chunk, kslices - ks0));
 
-  const uint32_t* B32 = reinterpret_cast<const uint32_t*>(B);
   // Tile-word index of this lane's four words inside the 128-word group.
   const int w0 = (lane >> 3) * 32 + (l7 << 2);
   const int wprev = (lane >> 3) * 32 + (((l7 << 2) - 1) & 31);
@@ -932,14 +953,15 @@ __global__ __launch_bounds__(512) void Exl3GemvM1K4(
 
   __shared__ float sh_red[WK][COLS];
 
+  const __amdgpu_buffer_rsrc_t b_rsrc = M1BufferRsrc(B, (size_t)kslices * slice_stride * 4);
+  const uint32_t sstride = static_cast<uint32_t>(slice_stride) * 4;
+
   for (int group = blockIdx.x; group < num_groups; group += gridDim.x) {
-    const uint32_t* bp = B32 + (size_t)ks0 * slice_stride + (size_t)group * 128;
+    const uint32_t gbyte = static_cast<uint32_t>(ks0) * sstride + group * 512;
 
     auto ld_b = [&](int i) -> uint4 {
-      // Plain uint4 deref lowers to global_load_dwordx4; the stream is
-      // single-use so the L1 evict-first policy is all it needs.
-      return *reinterpret_cast<const uint4*>(bp + (size_t)i * slice_stride +
-                                             w0);
+      const auto r = __builtin_amdgcn_raw_buffer_load_b128(b_rsrc, w0 * 4, gbyte + i * sstride, 0);
+      return uint4{r[0], r[1], r[2], r[3]};
     };
 
     uint4 pf[PF];
@@ -959,7 +981,7 @@ __global__ __launch_bounds__(512) void Exl3GemvM1K4(
         if (i + PF < myn) pf[d] = ld_b(i + PF);
 
         const uint32_t wb =
-            bp[(size_t)i * slice_stride + wprev];
+            __builtin_amdgcn_raw_buffer_load_b32(b_rsrc, wprev * 4, gbyte + i * sstride, 0);
 
         // Window for group-codeword s (tile codeword t = 32*l7 + s): from
         // Exl3TileCodeword, words (i0,i1) map to regs [(4s+1008)>>5, (4s+1023)>>5]
@@ -1673,7 +1695,9 @@ bool Exl3GemvTryLaunchRocm(hipStream_t st, const Tensor& a_had, const Tensor& tr
     kernel = GemvMK3KernelFor(args.codebook, size_m);
     block_dim = 512;
     cols = 64;
-  } else if (mmode == 0 && !wmma && kCfgEnv < 0) {
+  } else if (mmode == 0 && !wmma && kCfgEnv < 0 &&
+             (int64_t)size_k * size_n * args.bits / 8 <= INT32_MAX) {
+    // The bound is M1BufferRsrc's int num_records.
     kernel = GemvM1KernelFor(args.bits, args.codebook);
     block_dim = 512;
     // M1K4's warp owns a four-tile group (64 columns); the dq8 arm's warp
