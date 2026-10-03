@@ -2,9 +2,12 @@
 // kGdnPrefill + kGdnDecode over the PORTABLE scan — hand-translation of
 // cuda_gdn.cu GdnScanKernel (:1856) + its launchers, readable side by side
 // against the donor. CPU oracle: src/vt/cpu/cpu_ops.cpp:1331/1368
-// (GdnHeadTokenStep); formula reference gdn-semantics.md §7/§8. One kernel
-// serves both ops (qsl != null => varlen prefill; qsl == null => single-step
-// decode with optional state_idx + NULL-block zero-out).
+// (GdnHeadTokenStep); formula reference gdn-semantics.md §7/§8. The scan
+// family serves both ops in two mappings (qsl != null => varlen prefill;
+// qsl == null => single-step decode with optional state_idx + NULL-block
+// zero-out): GdnScanCoopK (warp-per-row, two state passes) and
+// GdnScanCoopFusedK (register-fused, one state pass + row z-split,
+// bit-identical arithmetic) — the launcher picks per mode and dk.
 //
 // Deliberately NOT ported (docs/ROCM.md §6): the WMMA chunked prefill
 // (`#if __CUDA_ARCH__ >= 800`), the fused/packed/Triton-AOT decode variants —
@@ -184,12 +187,21 @@ __global__ void GdnScanCoopK(Tout* out, const Tin* q, const Tin* k,
 //      dotted, updated in place, stored ONCE. The donor mapping reads the
 //      state row twice (dot pass + update pass) and writes once — this arm
 //      removes one full state pass per row.
-//   2. Row z-split: gridDim.z partitions the dv rows across blocks so the
-//      t=1 decode step occupies more SMs. ZSPLIT is a launch parameter; the
-//      z=1 case degenerates to GdnScanCoopK exactly.
-// Same numerics as GdnScanCoopK (tree-order reductions, same formulas).
-// dk is a template bound (KD elems per lane = dk/32); callers dispatch
-// dk in {64, 128}; anything else falls back to GdnScanCoopK.
+//   2. Row z-split: gridDim.z partitions the dv rows across blocks so a short
+//      token walk occupies more SMs. ZSPLIT is a launch parameter; the z=1
+//      case degenerates to GdnScanCoopK's work split exactly.
+// BIT-IDENTICAL to GdnScanCoopK under the build's -ffp-contract=off: every
+// product and sum rounds separately in both arms (rv = Ld*decay, then
+// rv*k / rv + vp*k), so the per-row state and outputs match the two-pass
+// coop math exactly. A contracting build would fuse the two arms
+// differently (fma(vp, k, rv) vs fma(Ld, decay, vp*k)) and lose that.
+// Serves BOTH modes: qsl == nullptr => decode (begin=s, end=s+1, optional
+// state_idx indirection + NULL-block zero-out); qsl != nullptr => varlen
+// prefill (per-seq [qsl[s], qsl[s+1]) walk, initial state read from the
+// working-state slot s and the final state left there — the engine gathers/
+// scatters the persistent pool outside this op). dk is a template bound
+// (KD elems per lane = dk/32); callers dispatch dk in {64, 128}; anything
+// else falls back to GdnScanCoopK.
 template <typename Tin, typename Tout, typename TState, int KD>
 __global__ void GdnScanCoopFusedK(Tout* out, const Tin* q, const Tin* k,
                                   const Tin* v, const float* g, const float* beta,
@@ -276,11 +288,15 @@ void LaunchGdnScanState(hipStream_t s, Tensor& out, const Tensor& q_in,
     const char* e = std::getenv("VT_GDN_SCAN_COOP");
     return e == nullptr || std::string(e) != "0";
   }();
-  // Register-fused arm (same mapping, one state pass): decode is the
-  // latency-bound case, so the fused kernel + a row z-split applies only
-  // when qsl == nullptr (each seq advances exactly one token). Prefill and
-  // dk not in {64,128} stay on GdnScanCoopK. VT_GDN_SCAN_ZSPLIT overrides
-  // the row split (0 disables the fused arm).
+  // Register-fused arm (same mapping, one state pass, bit-identical to the
+  // coop arm — see the kernel header): serves decode (qsl == nullptr) AND
+  // varlen prefill (qsl != nullptr) — the kernel handles qsl, state_idx,
+  // begin/end and the row-sliced zero-out internally; initial/final state
+  // live in the working-state slot per seq, exactly as GdnScanCoopK sees it.
+  // dk not in {64,128} stays on GdnScanCoopK. VT_GDN_SCAN_ZSPLIT overrides
+  // the decode row split (0 disables the fused arm entirely, both modes);
+  // VT_GDN_SCAN_ZSPLIT_PREFILL sets the prefill split (0 keeps prefill on
+  // the coop arm).
   static const int kZsplitEnv = [] {
     const char* e = std::getenv("VT_GDN_SCAN_ZSPLIT");
     const int v = e ? std::atoi(e) : 4;
@@ -288,9 +304,28 @@ void LaunchGdnScanState(hipStream_t s, Tensor& out, const Tensor& q_in,
     // blocks — clamp rather than launch invalid.
     return std::max(0, std::min(v, 65535));
   }();
-  const bool fused_ok = scan_coop && qsl == nullptr && kZsplitEnv > 0 &&
-                        (dk == 64 || dk == 128);
-  const int zsplit = fused_ok ? std::min<int>(kZsplitEnv, dv) : 1;
+  // Prefill z-split default 8: measured on gfx1100 (hk=16, hv=48, dk=dv=128,
+  // f32 state) — T>=7 favors z=8 (1.9 us/tok vs coop 14-16), tiny walks
+  // (T<=4) favor z=4. gdn_bench.hip, review/GdnPrefillScan/REPORT.md.
+  // Read per prefill call (one getenv per GDN layer per prefill step, never
+  // on the captured decode path) so a test process can A/B the two arms.
+  const int zsplit_prefill = [qsl] {
+    if (qsl == nullptr) return 0;
+    const char* e = std::getenv("VT_GDN_SCAN_ZSPLIT_PREFILL");
+    const int v = e ? std::atoi(e) : 8;
+    return std::max(0, std::min(v, 65535));
+  }();
+  const int64_t t_total = q_in.shape[0];
+  const bool fused_ok =
+      scan_coop && kZsplitEnv > 0 && (dk == 64 || dk == 128) &&
+      (qsl == nullptr || zsplit_prefill > 0);
+  const int zsplit =
+      fused_ok ? std::min<int>(qsl == nullptr ? kZsplitEnv
+                                             : (t_total <= 4
+                                                    ? std::min(zsplit_prefill, 4)
+                                                    : zsplit_prefill),
+                               dv)
+               : 1;
   const dim3 grid(static_cast<unsigned>(hv_n), static_cast<unsigned>(n),
                   static_cast<unsigned>(zsplit));
   const size_t shmem = 2 * static_cast<size_t>(dk) * sizeof(float);

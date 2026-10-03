@@ -5565,3 +5565,99 @@ TEST_CASE("ROCm gdn_post_conv row kernel is byte-identical to the chunked kernel
     }
   }
 }
+
+// ROCm gdn_prefill: the register-fused scan (GdnScanCoopFusedK, row z-split)
+// serves varlen prefill and must be BYTE-identical to GdnScanCoopK
+// (VT_GDN_SCAN_ZSPLIT_PREFILL=0) on the output AND the final state, at
+// several splits, with a nonzero initial state and multi-sequence batches.
+namespace {
+
+void RunRocmGdnPrefillFusedCase(const std::vector<int32_t>& qsl, int64_t hk, int64_t hv,
+                                int64_t dk, int64_t dv, DType io_dt, uint32_t seed) {
+  const int64_t t = qsl.back();
+  const int64_t n = static_cast<int64_t>(qsl.size()) - 1;
+  // L2-normalized q/k rows keep the delta rule bounded, as vt::L2Norm does
+  // upstream of the scan in the model.
+  auto normed = [&](uint32_t s, int64_t heads, int64_t d) {
+    auto x = RandomF32(static_cast<size_t>(t * heads * d), s, -1.0f, 1.0f);
+    for (int64_t r = 0; r < t * heads; ++r) {
+      double ss = 0.0;
+      for (int64_t j = 0; j < d; ++j) ss += double(x[r * d + j]) * x[r * d + j];
+      const float inv = static_cast<float>(1.0 / std::sqrt(ss + 1e-6));
+      for (int64_t j = 0; j < d; ++j) x[r * d + j] *= inv;
+    }
+    return Pack(x, io_dt);
+  };
+  const auto qb = normed(seed, hk, dk);
+  const auto kb = normed(seed + 1, hk, dk);
+  const auto vb = Pack(RandomF32(static_cast<size_t>(t * hv * dv), seed + 2, -1.0f, 1.0f), io_dt);
+  auto gf = RandomF32(static_cast<size_t>(t * hv), seed + 3, 0.7f, 0.999f);
+  for (float& x : gf) x = std::log(x);
+  const auto betaf = RandomF32(static_cast<size_t>(t * hv), seed + 4, 0.05f, 0.95f);
+  const auto stf = RandomF32(static_cast<size_t>(n * hv * dv * dk), seed + 5, -0.5f, 0.5f);
+  const GdnArgs args{1.0f / std::sqrt(static_cast<float>(dk))};
+
+  Backend& gpu = vt::GetBackend(DeviceType::kROCM);
+  Queue q = gpu.CreateQueue();
+  {
+    RocmBuf dq(gpu, q, qb.size(), qb.data());
+    RocmBuf dk_(gpu, q, kb.size(), kb.data());
+    RocmBuf dv_(gpu, q, vb.size(), vb.data());
+    RocmBuf dg(gpu, q, gf.size() * 4, gf.data());
+    RocmBuf db(gpu, q, betaf.size() * 4, betaf.data());
+    RocmBuf dqsl(gpu, q, qsl.size() * 4, qsl.data());
+    auto run = [&](const char* zsplit, std::vector<uint8_t>& out, std::vector<uint8_t>& st) {
+      ::setenv("VT_GDN_SCAN_ZSPLIT_PREFILL", zsplit, 1);
+      RocmBuf ds(gpu, q, stf.size() * 4, stf.data());
+      RocmBuf dout(gpu, q, static_cast<size_t>(t * hv * dv) * vt::SizeOf(io_dt));
+      Tensor to = dout.T(io_dt, {t, hv, dv});
+      Tensor ts = ds.T(DType::kF32, {n, hv, dv, dk});
+      vt::GdnPrefill(q, to, dq.T(io_dt, {t, hk, dk}), dk_.T(io_dt, {t, hk, dk}),
+                     dv_.T(io_dt, {t, hv, dv}), dg.T(DType::kF32, {t, hv}),
+                     db.T(DType::kF32, {t, hv}), ts, dqsl.T(DType::kI32, {n + 1}), args);
+      out = dout.Get(q);
+      st = ds.Get(q);
+    };
+    std::vector<uint8_t> out_coop, st_coop;
+    run("0", out_coop, st_coop);
+    bool nonzero = false;
+    for (uint8_t b : out_coop) nonzero = nonzero || b != 0;
+    CHECK(nonzero);
+    CHECK(st_coop != std::vector<uint8_t>(st_coop.size(), 0));
+    for (const char* z : {"1", "4", "8", "16"}) {
+      CAPTURE(z);
+      std::vector<uint8_t> out_f, st_f;
+      run(z, out_f, st_f);
+      CHECK(out_f == out_coop);
+      CHECK(st_f == st_coop);
+    }
+    ::unsetenv("VT_GDN_SCAN_ZSPLIT_PREFILL");
+  }
+  gpu.DestroyQueue(q);
+}
+
+}  // namespace
+
+TEST_CASE("ROCm gdn_prefill fused scan is byte-identical to the coop scan") {
+  try {
+    (void)vt::GetBackend(DeviceType::kROCM);
+  } catch (const std::runtime_error&) {
+    MESSAGE("no ROCm backend registered; skipping");
+    return;
+  }
+  if (!vt::OpRegistered(vt::OpId::kGdnPrefill, DeviceType::kROCM)) {
+    MESSAGE("no ROCm gdn_prefill; skipping");
+    return;
+  }
+  uint32_t seed = 12700;
+  for (DType io : {DType::kBF16, DType::kF32}) {
+    CAPTURE(static_cast<int>(io));
+    RunRocmGdnPrefillFusedCase({0, 1}, 16, 48, 128, 128, io, seed);             // t = 1
+    RunRocmGdnPrefillFusedCase({0, 7}, 16, 48, 128, 128, io, seed + 10);        // tiny walk
+    RunRocmGdnPrefillFusedCase({0, 67}, 16, 48, 128, 128, io, seed + 20);
+    RunRocmGdnPrefillFusedCase({0, 3, 8}, 16, 48, 128, 128, io, seed + 30);     // two seqs
+    RunRocmGdnPrefillFusedCase({0, 67, 579, 596}, 16, 48, 128, 128, io, seed + 40);
+    RunRocmGdnPrefillFusedCase({0, 0, 5, 9}, 4, 8, 64, 64, io, seed + 50);      // empty seq, dk 64
+    seed += 100;
+  }
+}
