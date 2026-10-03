@@ -265,6 +265,15 @@ cut to ~4 ms. Both halves of the work are therefore required:
 
 ## Outcome (2026-10-03)
 
+> **Correction (2026-10-03, later):** the 800–840 GB/s figure below is the
+> M1K4stream kernel's own load pattern, not the card. A dedicated read
+> benchmark (b128 nontemporal loads, 4 GiB buffer, 1024 threads x 32
+> blocks/WGP) measures **960.8 GB/s** (plain loads 917–923). With 12.2 GB
+> per token (weights + GDN state) the hard ceiling is ~77 tok/s, and 60
+> tok/s needs ~732 GB/s averaged over the whole token. The
+> "unreachable" verdict below rests on the wrong ceiling and is
+> withdrawn; 60 tok/s is very hard but not ruled out by bandwidth.
+
 **60 tok/s single-stream is unreachable on this card at 3.5 bpw.** The
 developer re-confirmed the goal is single-stream decode, not aggregate.
 
