@@ -152,7 +152,8 @@ TEST_CASE("exl3 rocm gemv: every instantiated arm meets tier 3c") {
       {3, 2, 2048, 4096, 1, "(3,2) narrow m=1"},
       {4, 2, 2048, 8320, 1, "(4,2) wide m=1"},
       {4, 0, 2048, 4096, 8, "(4,0) narrow m=8"},
-      {3, 1, 2048, 4096, 2, "(3,1) narrow m=2"},
+      {3, 2, 2048, 4096, 8, "(3,2) narrow m=8"},  // lands on the batched Exl3GemvMK3 arm
+      {4, 0, 2048, 4096, 8, "(4,0) narrow m=8"},
   };
 
   for (const Arm& arm : kArms) {

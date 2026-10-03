@@ -1416,17 +1416,132 @@ const void* GemvKernelFor(int bits, int cb, int mmode, int cfg, bool smem, bool 
         VT_GEMV_GRID(4, 2, false, true)
 #endif
   }
+
 #undef VT_GEMV_GRID
 #undef VT_GEMV_SEL
   return nullptr;
 }
+// Batched-row 3bpw GEMV (bench3.hip M1Km3, verify_m at m=8 vs the scalar
+// transcription). For 2 <= m <= 8 the production fragment arm re-streams the
+// trellis per row and measured 114-138 GB/s; this arm keeps the M1K3v
+// position-ownership mapping, loads and decodes each tile ONCE, and dots the
+// decoded fragment against all M activation rows — the same per-row rounding
+// order as the m=1 arm. Serving at concurrency 8 the m<=8 fragment path is
+// the decode bottleneck; this arm reached ~250-305 GB/s on the qwen shapes.
+// Instantiated per M so the row accumulators stay in registers unrolled.
+template <int cb, int M>
+__global__ __launch_bounds__(512) void Exl3GemvMK3(
+    const half* __restrict__ A, const uint16_t* __restrict__ B, float* __restrict__ C,
+    int size_m, int size_k, int size_n) {
+  (void)size_m;  // dispatch contract: size_m == M
+  constexpr int WK = 16;
+  constexpr int PF = 4;
+  constexpr int COLS = 64;
+  const int warp = threadIdx.x / 32;
+  const int lane = threadIdx.x % 32;
+  const int l7 = lane & 7;
+  const int ntiles = size_n / 16;
+  const int kslices = size_k / 16;
+  const int num_groups = size_n / COLS;
+  const int ksplit = gridDim.y;
+  const int chunk = (kslices + WK * ksplit - 1) / (WK * ksplit);
+  const int ks0 = (blockIdx.y * WK + warp) * chunk;
+  const int myn = max(0, min(chunk, kslices - ks0));
+  const uint32_t* B32 = reinterpret_cast<const uint32_t*>(B);
+  const int w0 = (lane >> 3) * 24 + l7 * 3;
+  const size_t slice_stride = (size_t)ntiles * 24;
+  const int Kh2 = size_k >> 1;
+  const half2* A2 = reinterpret_cast<const half2*>(A);
+  __shared__ float sh_red[WK][COLS];
+  for (int group = blockIdx.x; group < num_groups; group += gridDim.x) {
+    const uint32_t* bp = B32 + (size_t)ks0 * slice_stride + (size_t)group * 96;
+    auto ld_b = [&](int i, uint32_t& x, uint32_t& y, uint32_t& z) {
+      const uint32_t* p = bp + (size_t)i * slice_stride + w0;
+      x = p[0]; y = p[1]; z = p[2];
+    };
+    uint32_t pf[PF][3];
+#pragma unroll
+    for (int d = 0; d < PF; ++d)
+      if (d < myn) ld_b(d, pf[d][0], pf[d][1], pf[d][2]);
+    float accA[M], accB[M];
+#pragma unroll
+    for (int mi = 0; mi < M; ++mi) { accA[mi] = 0.0f; accB[mi] = 0.0f; }
+    for (int ib = 0; ib < myn; ib += PF) {
+#pragma unroll
+      for (int d = 0; d < PF; ++d) {
+        const int i = ib + d;
+        if (i >= myn) break;
+        const uint32_t v0 = pf[d][0], v1 = pf[d][1], v2 = pf[d][2];
+        if (i + PF < myn) ld_b(i + PF, pf[d][0], pf[d][1], pf[d][2]);
+        const int bsrc = (l7 == 0) ? (lane | 7) : (lane - 1);
+        const uint32_t wb = __shfl_sync(0xffffffffffffffffULL, v2, bsrc);
+        const uint32_t w[4] = {wb, v0, v1, v2};
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          FragB fA, fB;
+          uint32_t cw[8];
+#pragma unroll
+          for (int ss = 0; ss < 8; ++ss) {
+            const int sc = j * 8 + ss;
+            const int r0 = ((3 * sc + 755) >> 5) - 23;
+            const int r1 = ((3 * sc + 770) >> 5) - 23;
+            const int s0 = 32 * (((3 * sc + 770) >> 5) + 1) - (3 * sc + 771);
+            cw[ss] = fshift(w[r1], w[r0], s0) & 0xffffu;
+          }
+          decode8<cb>(cw[0], cw[1], cw[2], cw[3], cw[4], cw[5], cw[6], cw[7],
+                      fA, fB);
+          const size_t a_col = (size_t)(ks0 + i) * 8 + j;
+#pragma unroll
+          for (int mi = 0; mi < M; ++mi) {
+            const half2 a01 = A2[(size_t)mi * Kh2 + a_col];
+            const half2 a89 = A2[(size_t)mi * Kh2 + a_col + 4];
+            accA[mi] = amd_mixed_dot(fA[0], a01, accA[mi], false);
+            accA[mi] = amd_mixed_dot(fA[1], a89, accA[mi], false);
+            accB[mi] = amd_mixed_dot(fB[0], a01, accB[mi], false);
+            accB[mi] = amd_mixed_dot(fB[1], a89, accB[mi], false);
+          }
+        }
+      }
+    }
+#pragma unroll
+    for (int mi = 0; mi < M; ++mi) {
+      __syncthreads();
+      sh_red[warp][(lane >> 3) * 16 + l7] = accA[mi];
+      sh_red[warp][(lane >> 3) * 16 + l7 + 8] = accB[mi];
+      __syncthreads();
+      for (int idx = threadIdx.x; idx < COLS; idx += WK * 32) {
+        float sum = 0.0f;
+#pragma unroll
+        for (int wj = 0; wj < WK; ++wj) sum += sh_red[wj][idx];
+        const int col = group * COLS + idx;
+        if (ksplit > 1) atomicAdd(C + (size_t)mi * size_n + col, sum);
+        else C[(size_t)mi * size_n + col] = sum;
+      }
+    }
+    __syncthreads();
+  }
+}
+
+// M dispatch for the batched-row arm. M is a template parameter so the
+// register-file accumulators unroll per instantiation; size_m 2..8 cover the
+// mmode=1 range (kExl3GemvMaxM == 8).
+const void* GemvMK3KernelFor(int cb, int m) {
+  switch (m) {
+    case 2: return (const void*)&Exl3GemvMK3<2, 2>;
+    case 3: return (const void*)&Exl3GemvMK3<2, 3>;
+    case 4: return (const void*)&Exl3GemvMK3<2, 4>;
+    case 5: return (const void*)&Exl3GemvMK3<2, 5>;
+    case 6: return (const void*)&Exl3GemvMK3<2, 6>;
+    case 7: return (const void*)&Exl3GemvMK3<2, 7>;
+    case 8: return (const void*)&Exl3GemvMK3<2, 8>;
+    default: return nullptr;
+  }
+  (void)cb;  // cb=2 (Qwen3.8-3.5bpw arm); cb=1 falls through to the fragment arm
+}
+
 
 int GemvOccupancyRocm(const void* kernel, int block_dim) {
   // exl3_gemv.cu:120-134 + exllamav3-rocm's RDNA correction: the occupancy
-  // query overestimates co-residency on RDNA (reported 3, real 2, on gfx1100),
-  // so the reported count is decremented once. Without grid.sync the number no
-  // longer decides correctness — only which cfg the heuristic picks — and the
-  // correction is kept so the heuristic stays conservative, not adventurous.
   static std::mutex mtx;
   static std::map<const void*, int> cache;
   std::lock_guard<std::mutex> lock(mtx);
@@ -1528,7 +1643,16 @@ bool Exl3GemvTryLaunchRocm(hipStream_t st, const Tensor& a_had, const Tensor& tr
   // still selects the WMMA evaluation arm for A/B completeness.
   const void* kernel;
   int block_dim, cols;
-  if (mmode == 0 && !wmma && kCfgEnv < 0) {
+  if (mmode == 1 && args.bits == 3 && args.codebook == 2 && !wmma &&
+      !smem && kCfgEnv < 0) {
+    // Batched-row arm: m=2..8 decode on 3bpw. The fragment arm re-streams the
+    // trellis per row group; Exl3GemvMK3 decodes each tile once and amortizes
+    // it across all m rows. Measured ~2.2x the fragment arm at m=8 on the
+    // qwen shapes (bench3 own3-m8 vs prod3-m8 rows).
+    kernel = GemvMK3KernelFor(args.codebook, size_m);
+    block_dim = 512;
+    cols = 64;
+  } else if (mmode == 0 && !wmma && kCfgEnv < 0) {
     kernel = GemvM1KernelFor(args.bits, args.codebook);
     block_dim = 512;
     // M1K4's warp owns a four-tile group (64 columns); the dq8 arm's warp
