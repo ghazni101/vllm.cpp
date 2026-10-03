@@ -63,6 +63,7 @@
 #include "vt/rocm/rocm_device_bind.h"
 #include "vt/rocm/rocm_f16_codec.h"
 #include "vt/rocm/rocm_exl3_decode.h"  // Exl3DecodePairCb2Dp4a
+#include "vt/rocm/rocm_exl3_fold.h"
 
 namespace vt::rocm {
 namespace {
@@ -733,6 +734,92 @@ __global__ __launch_bounds__(CFG == 0 ? 512 : 256) void Exl3GemvK(
   }
 }
 
+__device__ __forceinline__ float GemvNegBySignBit(float v) {
+  return __int_as_float(static_cast<int>(__float_as_uint(v) ^ 0x80000000u));
+}
+
+// ─── the output-transform fold (rocm_exl3_fold.h) ───────────────────────────
+//
+// HadK<0, 2>'s per-block arithmetic for one 128-column block, run by one wave
+// of the m=1 GEMV block that finishes the block's last column stripe: lane t
+// holds columns 4t..4t+3, levels 1-2 in-lane, the five xor-partner levels over
+// DPP row_xmask / v_permlanex16 with own-first adds and sign-bit flips, then
+// res = x * r_scale, res * post in f32 and one RN bf16 round — HadXorLane,
+// HadXorLevel and the OutD == 2 store of rocm_exl3.hip, op for op.
+template <int I>
+__device__ __forceinline__ float GemvHadXorLane(float v) {
+  const int x = __float_as_int(v);
+  if constexpr (I == 16)
+    return __int_as_float(
+        __builtin_amdgcn_permlanex16(x, x, 0x76543210, 0xfedcba98, false, false));
+  else
+    return __int_as_float(__builtin_amdgcn_mov_dpp(x, 0x160 + I, 0xf, 0xf, false));
+}
+
+template <int I>
+__device__ __forceinline__ void GemvHadXorLevel(float (&x)[4], int t) {
+  const bool flip = (t & I) != 0;
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    const float par = GemvHadXorLane<I>(x[j]);
+    const float own = flip ? GemvNegBySignBit(x[j]) : x[j];
+    x[j] = own + par;
+  }
+}
+
+__device__ __forceinline__ void GemvHadOutBf16(const float* in, const uint16_t* post,
+                                               uint16_t* out, float r_scale, int t) {
+  const float4 f = *reinterpret_cast<const float4*>(in + 4 * t);
+  const float v[4] = {f.x, f.y, f.z, f.w};
+  const float s0 = v[0] + v[1];
+  const float d0 = v[0] - v[1];
+  const float s1 = v[2] + v[3];
+  const float d1 = v[2] - v[3];
+  float x[4] = {s0 + s1, d0 + d1, s0 - s1, d0 - d1};
+  GemvHadXorLevel<1>(x, t);
+  GemvHadXorLevel<2>(x, t);
+  GemvHadXorLevel<4>(x, t);
+  GemvHadXorLevel<8>(x, t);
+  GemvHadXorLevel<16>(x, t);
+  const uint2 pw = *reinterpret_cast<const uint2*>(post + 4 * t);
+  const uint16_t qs[4] = {static_cast<uint16_t>(pw.x), static_cast<uint16_t>(pw.x >> 16),
+                          static_cast<uint16_t>(pw.y), static_cast<uint16_t>(pw.y >> 16)};
+  uint16_t o[4];
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    const float res = x[j] * r_scale;
+    o[j] = __bfloat16_as_ushort(__float2bfloat16(res * DF16ToF32(qs[j])));
+  }
+  *reinterpret_cast<uint2*>(out + 4 * t) =
+      make_uint2(o[0] | (static_cast<uint32_t>(o[1]) << 16),
+                 o[2] | (static_cast<uint32_t>(o[3]) << 16));
+}
+
+// The m=1 arms' epilogue tail: called by every thread of the block after its
+// stripe of C is stored. Each stripe's writers release (fence) before the
+// block's one counter increment; the block that completes a 128-column block
+// acquires (fence) and runs GemvHadOutBf16 on it, then re-zeroes the counter
+// for the next launch (stream order is the fence there).
+template <int COLS>
+__device__ __forceinline__ void GemvFoldOutTail(const float* C, int group, void* out,
+                                                const uint16_t* post, uint32_t* cnt,
+                                                float r_scale, int warp, int lane) {
+  static_assert(128 % COLS == 0, "a stripe must not straddle a 128-block");
+  __shared__ uint32_t sh_last;
+  __threadfence();
+  __syncthreads();
+  const int hb = (group * COLS) >> 7;
+  if (threadIdx.x == 0)
+    sh_last = atomicAdd(cnt + hb, 1u) == static_cast<uint32_t>(128 / COLS - 1);
+  __syncthreads();
+  if (sh_last && warp == 0) {
+    __threadfence();
+    GemvHadOutBf16(C + hb * 128, post + hb * 128, static_cast<uint16_t*>(out) + hb * 128,
+                   r_scale, lane);
+    if (lane == 0) cnt[hb] = 0;
+  }
+}
+
 // ─── the m=1 direct form (RDNA-specific, spec rocm-exl3-gemv-residual) ──────
 //
 // dq8's output already lands on the layout a one-token decode wants: lane l
@@ -745,12 +832,13 @@ __global__ __launch_bounds__(CFG == 0 ? 512 : 256) void Exl3GemvK(
 // SASS: 296 ds_bpermute + 256 pk_fma + 156 mov_b16 + 124 and per 4-slice),
 // and accumulates in f32 instead of the fragment's f16 — strictly nearer the
 // CPU reference, not looser.
-template <int bits, int cb>
+template <int bits, int cb, bool FOLD>
 __global__ __launch_bounds__(512) void Exl3GemvM1K(
     const half* __restrict__ A, const uint16_t* __restrict__ B, float* __restrict__ C,
-    int size_m, int size_k, int size_n) {
-  (void)size_m;  // m==1 is a launch-time fact; keeping the same arg list as
-                 // Exl3GemvK so the launcher shares one kargs block.
+    int size_m, int size_k, int size_n, void* fold_out, const uint16_t* fold_post,
+    uint32_t* fold_cnt, float fold_scale) {
+  (void)size_m;  // m==1 is a launch-time fact; keeping Exl3GemvK's leading
+                 // arg list so the launcher shares one kargs prefix.
   constexpr int WK = 16;   // k-split (warps per block)
   constexpr int WNT = 2;   // adjacent n-tiles per warp
   constexpr int PF = 2;    // prefetch ring depth (2 beat 1/3/4/6/8 on gfx1100)
@@ -907,6 +995,8 @@ __global__ __launch_bounds__(512) void Exl3GemvM1K(
       else
         C[col] = sum;
     }
+    if constexpr (FOLD)
+      GemvFoldOutTail<COLS>(C, group, fold_out, fold_post, fold_cnt, fold_scale, warp, lane);
     __syncthreads();
   }
 }
@@ -923,10 +1013,11 @@ __global__ __launch_bounds__(512) void Exl3GemvM1K(
 // the epilogue is a block k-fold only — no per-tile xor-shuffles either.
 // Per warp-tile-group: one 512-byte contiguous global_load_dwordx4 stream,
 // one scalar boundary load, then 32 codeword extracts + 16 v_dot2_f32_f16.
-template <int cb>
+template <int cb, bool FOLD>
 __global__ __launch_bounds__(512) void Exl3GemvM1K4(
     const half* __restrict__ A, const uint16_t* __restrict__ B, float* __restrict__ C,
-    int size_m, int size_k, int size_n) {
+    int size_m, int size_k, int size_n, void* fold_out, const uint16_t* fold_post,
+    uint32_t* fold_cnt, float fold_scale) {
   (void)size_m;
   constexpr int WK = 16;   // k-split (warps per block)
   constexpr int PF = 2;    // prefetch ring depth (2 beat 1/3/4/6/8 on gfx1100)
@@ -1033,6 +1124,8 @@ __global__ __launch_bounds__(512) void Exl3GemvM1K4(
       else
         C[col] = sum;
     }
+    if constexpr (FOLD)
+      GemvFoldOutTail<COLS>(C, group, fold_out, fold_post, fold_cnt, fold_scale, warp, lane);
     __syncthreads();
   }
 }
@@ -1054,9 +1147,6 @@ __global__ __launch_bounds__(512) void Exl3GemvM1K4(
 // rocm_f16_codec.h; NegBySignBit/MulF16 are transcribed 1:1 from
 // rocm_exl3.hip (the two files share no TU).
 
-__device__ __forceinline__ float GemvNegBySignBit(float v) {
-  return __int_as_float(static_cast<int>(__float_as_uint(v) ^ 0x80000000u));
-}
 __device__ __forceinline__ uint16_t GemvMulF16(uint16_t a, uint16_t b) {
   return DF32ToF16(DF16ToF32(a) * DF16ToF32(b));
 }
@@ -1378,15 +1468,18 @@ constexpr bool GemvArmInstantiated(int bits, int cb) {
          ((bits == 2 || bits == 3) && (cb == 1 || cb == 2));
 }
 
-const void* GemvM1KernelFor(int bits, int cb) {
+const void* GemvM1KernelFor(int bits, int cb, bool fold) {
   // The direct m=1 arm's instantiation set is the non-WMMA half of upstream's
-  // selector table minus its smem rows (this kernel stages nothing).
+  // selector table minus its smem rows (this kernel stages nothing). `fold`
+  // selects the output-transform epilogue twin of each row.
 #define VT_GEMV_M1(bits_, cb_)                                              \
   if (bits == bits_ && cb == cb_)                                           \
-    return reinterpret_cast<const void*>(&Exl3GemvM1K<bits_, cb_>);
+    return fold ? reinterpret_cast<const void*>(&Exl3GemvM1K<bits_, cb_, true>) \
+                : reinterpret_cast<const void*>(&Exl3GemvM1K<bits_, cb_, false>);
 #define VT_GEMV_M1W4(bits_, cb_)                                            \
   if (bits == bits_ && cb == cb_)                                           \
-    return reinterpret_cast<const void*>(&Exl3GemvM1K4<cb_>);
+    return fold ? reinterpret_cast<const void*>(&Exl3GemvM1K4<cb_, true>)  \
+                : reinterpret_cast<const void*>(&Exl3GemvM1K4<cb_, false>);
   // The wide-load ownership arm is instantiated for the 4 bpw rows only —
   // its codeword-span arithmetic is the 4 bpw window math; 2/3 bpw keep the
   // dq8-mapping arm.
@@ -1612,9 +1705,11 @@ bool GemvWmmaMode() {
 
 // Returns true when the GEMV arm launched. The same decline contract the CUDA
 // arm documents: a false here is a fall-through to Exl3GemmK, never a failure.
+// A non-null `fold` offers the output transform to the m=1 direct arms; it is
+// taken only when fold->applied comes back true.
 bool Exl3GemvTryLaunchRocm(hipStream_t st, const Tensor& a_had, const Tensor& trellis,
                            float* raw, int size_m, int size_k, int size_n, int device,
-                           const Exl3GemmArgs& args) {
+                           const Exl3GemmArgs& args, Exl3GemvOutFold* fold) {
   // exl3_gemv.cu:108-116: the free integer tests first, then the env read.
   if (args.force_gemv == 0) return false;
   if (!GemvArmInstantiated(args.bits, args.codebook)) return false;
@@ -1684,8 +1779,32 @@ bool Exl3GemvTryLaunchRocm(hipStream_t st, const Tensor& a_had, const Tensor& tr
   // lane-pair — ~6x fewer issued instructions per tile (SASS-measured), and
   // f32 accumulation where the fragment arm used f16 pairs. The WMMA env
   // still selects the WMMA evaluation arm for A/B completeness.
+  // Grid-level k-split (the kernel halves its per-warp serial k-chain per
+  // extra blockIdx.y) is a bench lever first: VT_EXL3_GEMV_KSPLIT=N raises
+  // grid.y to N and pays one f32 atomicAdd per (m, stripe col) per slice.
+  // It stays OFF by default until serving measurements pick a value.
+  static const int kKsplitEnv = [] {
+    const char* e = std::getenv("VT_EXL3_GEMV_KSPLIT");
+    return e ? std::atoi(e) : 1;
+  }();
+  const int ksplit = std::max(
+      1, std::min(kKsplitEnv, (size_k / 16) / 16));
+
+  // VT_EXL3_GEMV_FOLD_OUT=0 keeps the output transform as its own HadK
+  // launch — the A/B and test lever for the epilogue fold.
+  static const bool kFoldEnv = [] {
+    const char* e = std::getenv("VT_EXL3_GEMV_FOLD_OUT");
+    return e == nullptr || e[0] != '0';
+  }();
+  // A k-split C is complete only after every slice's atomicAdd, which no
+  // per-stripe counter of 128/cols arrivals can see.
+  const bool fold_ok = fold != nullptr && kFoldEnv && ksplit == 1 &&
+                       fold->out != nullptr && fold->post != nullptr &&
+                       fold->cnt != nullptr && size_n % 128 == 0;
+
   const void* kernel;
   int block_dim, cols;
+  bool m1_direct = false;
   if (mmode == 1 && args.bits == 3 && args.codebook == 2 && !wmma &&
       !smem && kCfgEnv < 0) {
     // Batched-row arm: m=2..8 decode on 3bpw. The fragment arm re-streams the
@@ -1698,7 +1817,8 @@ bool Exl3GemvTryLaunchRocm(hipStream_t st, const Tensor& a_had, const Tensor& tr
   } else if (mmode == 0 && !wmma && kCfgEnv < 0 &&
              (int64_t)size_k * size_n * args.bits / 8 <= INT32_MAX) {
     // The bound is M1BufferRsrc's int num_records.
-    kernel = GemvM1KernelFor(args.bits, args.codebook);
+    kernel = GemvM1KernelFor(args.bits, args.codebook, fold_ok);
+    m1_direct = kernel != nullptr;
     block_dim = 512;
     // M1K4's warp owns a four-tile group (64 columns); the dq8 arm's warp
     // covers two tiles (32).
@@ -1728,16 +1848,6 @@ bool Exl3GemvTryLaunchRocm(hipStream_t st, const Tensor& a_had, const Tensor& tr
   const int grid = GemvGridForGroups(size_n / cols, max_blocks);
   if (grid < 1) return false;
 
-  // Grid-level k-split (the kernel halves its per-warp serial k-chain per
-  // extra blockIdx.y) is a bench lever first: VT_EXL3_GEMV_KSPLIT=N raises
-  // grid.y to N and pays one f32 atomicAdd per (m, stripe col) per slice.
-  // It stays OFF by default until serving measurements pick a value.
-  static const int kKsplitEnv = [] {
-    const char* e = std::getenv("VT_EXL3_GEMV_KSPLIT");
-    return e ? std::atoi(e) : 1;
-  }();
-  const int ksplit = std::max(
-      1, std::min(kKsplitEnv, (size_k / 16) / 16));
   if (ksplit > 1)
     CheckG(hipMemsetAsync(raw, 0, (size_t)size_m * size_n * sizeof(float), st),
            "exl3_gemv ksplit zero");
@@ -1745,15 +1855,25 @@ bool Exl3GemvTryLaunchRocm(hipStream_t st, const Tensor& a_had, const Tensor& tr
   const uint16_t* b_ptr = trellis.Ptr<uint16_t>();
   // Normal launch, not hipLaunchCooperativeKernel — adaptation 1. The kernel
   // pointer table types it as void*, so dispatch by cfg size.
+  // The m=1 direct arms take the four fold arguments after the shared six
+  // (unused in their non-fold twins); the runtime packs only as many entries
+  // as the selected kernel declares, so the six-argument arms ignore them.
+  void* f_out = fold_ok ? fold->out : nullptr;
+  const uint16_t* f_post = fold_ok ? fold->post : nullptr;
+  uint32_t* f_cnt = fold_ok ? fold->cnt : nullptr;
+  float f_scale = fold_ok ? fold->r_scale : 0.0f;
   void* kargs[] = {static_cast<void*>(&a_ptr),  static_cast<void*>(&b_ptr),
                    static_cast<void*>(&raw),    static_cast<void*>(&size_m),
-                   static_cast<void*>(&size_k), static_cast<void*>(&size_n)};
+                   static_cast<void*>(&size_k), static_cast<void*>(&size_n),
+                   static_cast<void*>(&f_out),  static_cast<void*>(&f_post),
+                   static_cast<void*>(&f_cnt),  static_cast<void*>(&f_scale)};
   CheckG(hipLaunchKernel(kernel,
                          dim3(static_cast<unsigned>(grid),
                               static_cast<unsigned>(ksplit)),
                          dim3(static_cast<unsigned>(block_dim)), kargs, 0, st),
          "exl3_gemv launch");
   CheckG(hipGetLastError(), "exl3_gemv launch");
+  if (fold_ok && m1_direct) fold->applied = true;
   return true;
 }
 // Spec gfx1100-exl3-decode-60tps: the fused in-had m=1 arm. Runs the
@@ -1892,7 +2012,7 @@ bool Exl3GemvChunkedTryLaunchRocm(hipStream_t st, const Tensor& a_had,
                    static_cast<size_t>(base) * static_cast<size_t>(size_k) * sizeof(half);
     float* raw_slice = raw + static_cast<size_t>(base) * static_cast<size_t>(size_n);
     if (!Exl3GemvTryLaunchRocm(st, a_slice, trellis, raw_slice, rows, size_k, size_n,
-                               device, args))
+                               device, args, nullptr))
       return false;
   }
   return true;

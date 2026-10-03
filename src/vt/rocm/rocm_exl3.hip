@@ -69,6 +69,7 @@
 #include "vt/rocm/rocm_device_bind.h"
 #include "vt/rocm/rocm_f16_codec.h"
 #include "vt/rocm/rocm_exl3_decode.h"
+#include "vt/rocm/rocm_exl3_fold.h"
 
 namespace vt::rocm {
 // The m<=8 GEMV arm lives in rocm_exl3_gemv.hip (spec
@@ -76,10 +77,11 @@ namespace vt::rocm {
 // geometry, ROCm-ported via exllamav3-rocm. It writes the same f32 `raw`
 // scratch, so step 3 below is unchanged whichever arm runs step 2. A false
 // return is a DECLINE — the same contract the CUDA arm's `Exl3GemvTryLaunch`
-// carries — and the call falls through to `Exl3GemmK`.
+// carries — and the call falls through to `Exl3GemmK`. `fold` offers step 3
+// to the m=1 direct arms (rocm_exl3_fold.h).
 bool Exl3GemvTryLaunchRocm(hipStream_t st, const Tensor& a_had, const Tensor& trellis,
                            float* raw, int size_m, int size_k, int size_n, int device,
-                           const Exl3GemmArgs& args);
+                           const Exl3GemmArgs& args, Exl3GemvOutFold* fold);
 
 // Spec rocm-exl3-gemv-residual: the dot arm (rocm_exl3_dot.hip) — a fused
 // decode+dot kernel at every width 1..8, for shapes the upstream GEMV
@@ -384,6 +386,8 @@ __global__ void Exl3GemmK(float* __restrict__ raw, const uint16_t* __restrict__ 
 struct StreamScratch {
   void* buf = nullptr;
   size_t bytes = 0;
+  uint32_t* cnt = nullptr;  // the output fold's per-128-column counters
+  size_t ncnt = 0;
 };
 
 StreamScratch& ScratchFor(hipStream_t s) {
@@ -400,6 +404,20 @@ float* EnsureRawScratch(size_t need, hipStream_t s) {
     sc.bytes = need;
   }
   return static_cast<float*>(sc.buf);
+}
+
+// Same grow-only, per-stream, never-freed discipline as the raw scratch. The
+// kernels leave every counter zero, so the zeroing memset runs only on growth;
+// a growth inside a capture bakes a memset node that rewrites zeros.
+uint32_t* EnsureFoldCounters(size_t need, hipStream_t s) {
+  StreamScratch& sc = ScratchFor(s);
+  if (need > sc.ncnt) {
+    Check(hipMallocAsync(reinterpret_cast<void**>(&sc.cnt), need * sizeof(uint32_t), s),
+          "fold counters grow");
+    Check(hipMemsetAsync(sc.cnt, 0, need * sizeof(uint32_t), s), "fold counters zero");
+    sc.ncnt = need;
+  }
+  return sc.cnt;
 }
 
 }  // namespace
@@ -493,10 +511,6 @@ void Exl3GemmKernelRocm(Queue& q, Tensor& c, const Tensor& a, const Tensor& trel
   // The fused arm is NOT tried when VT_EXL3_DOT_FIRST is set: that lever asks
   // for the dot arm ahead of every GEMV variant, and the dot arm consumes the
   // already-transformed a_had, so it cannot run ahead of the input transform
-  // the way the fused arm does.
-  // The fused arm is NOT tried when VT_EXL3_DOT_FIRST is set: that lever asks
-  // for the dot arm ahead of every GEMV variant, and the dot arm consumes the
-  // already-transformed a_had, so it cannot run ahead of the input transform
   // the way the fused arm does. It also honours the same fast_paths gate as
   // every fast arm — VT_EXL3_GEMV=0 must still select the transcription.
   if (m == 1 && fast_paths && !(dot_first && dot_shape)) {
@@ -513,15 +527,23 @@ void Exl3GemmKernelRocm(Queue& q, Tensor& c, const Tensor& a, const Tensor& trel
                 kInvSqrt128, m, k, st, a_dt, 1);
   }
 
+  Exl3GemvOutFold fold;
   if (m <= kExl3GemvMaxM) {
     if (dot_first && dot_shape)
       gemv = Exl3DotTryLaunchRocm(st, a_had, trellis, raw, static_cast<int>(m),
                                   static_cast<int>(k), static_cast<int>(n),
                                   q.device.index, args);
-    if (!gemv)
+    if (!gemv) {
+      if (m == 1 && c.dtype == DType::kBF16 && svh.data != nullptr) {
+        fold.out = c.data;
+        fold.post = svh.Ptr<uint16_t>();
+        fold.cnt = EnsureFoldCounters(static_cast<size_t>(n / 128), st);
+        fold.r_scale = kInvSqrt128;
+      }
       gemv = Exl3GemvTryLaunchRocm(st, a_had, trellis, raw, static_cast<int>(m),
                                    static_cast<int>(k), static_cast<int>(n),
-                                   q.device.index, args);
+                                   q.device.index, args, &fold);
+    }
     if (!gemv && fast_paths && dot_shape)
       gemv = Exl3DotTryLaunchRocm(st, a_had, trellis, raw, static_cast<int>(m),
                                   static_cast<int>(k), static_cast<int>(n),
@@ -549,7 +571,9 @@ void Exl3GemmKernelRocm(Queue& q, Tensor& c, const Tensor& a, const Tensor& trel
   }
 
   // 3. the output transform — had_ff for an f32 C, had_fh for an fp16 one, the
-  // same two arms the CPU reference picks between off `c.dtype`.
+  // same two arms the CPU reference picks between off `c.dtype`. Already done
+  // when the m=1 GEMV ran it in its epilogue.
+  if (fold.applied) return;
   const int c_dt = (c.dtype == DType::kBF16) ? 2 : (c.dtype == DType::kF16 ? 1 : 0);
   LaunchHadIO(c.data, raw, nullptr, svh.Ptr<uint16_t>(), kInvSqrt128, m, n, st,
               0, c_dt);
