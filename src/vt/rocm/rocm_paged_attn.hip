@@ -3218,12 +3218,16 @@ void PagedAttentionKernelRocm(Queue& q, Tensor& out, const Tensor& query, const 
   // __syncthreads() walk measuring ~803us/call on the RX 7900 XTX (6.1
   // ms/token across the model's full-attention layers). This arm routes that
   // exact dtype combination through the DecodeGqa geometry (QG=4 fused
-  // q-heads per KV group, warp-strided sequence walk). DEFAULT OFF via
-  // VT_ATTN_DECODE_GQA4=1: correctness-complete but the reduction order
-  // differs from PagedAttnOnline's, so greedy anchors can move at exact ties.
+  // q-heads per KV group, warp-strided sequence walk). On by default: the
+  // arm is correctness-complete and the PagedAttnOnline fallback it replaces
+  // is the generic per-context-token walk (~212us/call, ~3.4ms/token across
+  // the 27B's 16 full-attention layers). Reduction order differs from
+  // PagedAttnOnline's, so greedy anchors can move at exact ties; measured
+  // 22.13 -> 26.24 decode tok/s with golden "The capital of France is" ->
+  // " Paris." parity. VT_ATTN_DECODE_GQA4=0 restores the fallback.
   static const bool decode_gqa4_f32q = [] {
     const char* e = std::getenv("VT_ATTN_DECODE_GQA4");
-    return e != nullptr && e[0] == '1';
+    return e == nullptr || e[0] != '0';  // default ON; =0 disables
   }();
   if (decode_opt && decode_gqa4_f32q && total_q <= hq &&
       query.dtype == DType::kF32 && out.dtype == DType::kF32 &&
