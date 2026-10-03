@@ -157,6 +157,10 @@ TEST_CASE("exl3 rocm gemv: every instantiated arm meets tier 3c") {
       {3, 2, 5120, 17408, 1, "(3,2) gate/up shape m=1"},
       {3, 2, 17408, 5120, 1, "(3,2) down shape m=1"},
       {4, 2, 5120, 10240, 1, "(4,2) in_proj_qkv shape m=1"},
+      // n >= 12288 at 4 bpw: the fused in-had arm (Exl3GemvM1K4Fused) unless
+      // VT_EXL3_FUSED_HAD=0 (the test_exl3_rocm_gemv_unfused ctest entry).
+      {4, 2, 5120, 12288, 1, "(4,2) attn_q shape m=1"},
+      {4, 2, 5120, 17408, 1, "(4,2) gate/up shape m=1"},
       {4, 0, 2048, 4096, 8, "(4,0) narrow m=8"},
       {3, 2, 2048, 4096, 8, "(3,2) narrow m=8"},  // lands on the batched Exl3GemvMK3 arm
       {4, 0, 2048, 4096, 8, "(4,0) narrow m=8"},
