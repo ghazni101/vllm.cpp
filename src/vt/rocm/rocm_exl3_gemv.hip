@@ -1548,6 +1548,21 @@ int GemvOccupancyRocm(const void* kernel, int block_dim) {
   return blocks_per_sm;
 }
 
+// VT_EXL3_GEMV_GRID — 1 launches one block per column group; 0 caps the grid
+// at the occupancy-derived co-resident count (upstream's cooperative-launch
+// sizing, minus the RDNA one-block margin). These are ordinary launches with
+// grid-stride group loops, so co-residency is not required for correctness;
+// the cap only matters for scheduling: with n/cols just above the cap, a few
+// blocks run a second group alone while the rest of the GPU idles.
+int GemvGridForGroups(int groups, int max_coresident) {
+  static const int mode = [] {
+    const char* env = std::getenv("VT_EXL3_GEMV_GRID");
+    return env ? std::atoi(env) : 1;
+  }();
+  if (mode == 1) return std::min(groups, 65535);
+  return std::min(groups, max_coresident);
+}
+
 bool GemvWmmaMode() {
   // VT_ROCM_EXL3_WMMA — documented in docs/ENVIRONMENT.md. Evaluation only:
   // the default (unset/0) is the emulated path the gates measure.
@@ -1673,7 +1688,7 @@ bool Exl3GemvTryLaunchRocm(hipStream_t st, const Tensor& a_had, const Tensor& tr
   if (kernel == nullptr) return false;
 
   const int max_blocks = GemvOccupancyRocm(kernel, block_dim) * num_sms;
-  const int grid = size_n / cols < max_blocks ? size_n / cols : max_blocks;
+  const int grid = GemvGridForGroups(size_n / cols, max_blocks);
   if (grid < 1) return false;
 
   // Grid-level k-split (the kernel halves its per-warp serial k-chain per
@@ -1762,8 +1777,7 @@ bool Exl3GemvM1FusedTryLaunchRocm(hipStream_t st, const void* a_raw,
 
   int max_blocks = GemvOccupancyRocm(kernel, 512);
   if (max_blocks < 1) max_blocks = 1;
-  const int grid = size_n / cols < max_blocks * num_sms ? size_n / cols
-                                                        : max_blocks * num_sms;
+  const int grid = GemvGridForGroups(size_n / cols, max_blocks * num_sms);
   if (grid < 1) return false;
 
   static const int kKsplitEnv = [] {
