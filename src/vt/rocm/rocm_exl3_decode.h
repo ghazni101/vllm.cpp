@@ -99,10 +99,36 @@ __device__ inline float Exl3DecodeCodeword(uint16_t codeword, int codebook) {
 // x in one instruction; __dp4a is not in this HIP's device headers. One
 // packed __hfma2 ends the pair where the scalar arm runs two f32 chains;
 // the CPU exhaustively proves both roundings equal, so bits are unchanged.
+//
+// Only the LOW 16 bits of x0/x1 are read; the high halves may hold anything.
+//
+// gfx11: v_mul_lo_u32 issues at quarter rate and v_dot4_u32_u8 at half rate
+// (measured, review/main/irate.hip), and those two were ~70% of the decode's
+// issue cycles. The codeword is 16 bits, so x*0x83DCD12D mod 2^32 splits into
+//   P      = x * 0xD12D                    exact in 32 bits (v_mad_u32_u16)
+//   P.hi16 = (x * 0x83DC + P.hi16) mod 2^16 (v_mad_u16, op_sel dest-hi keeps
+//                                            P.lo16 — ISA VOP3 OPSEL[3])
+// and the byte sums come from v_sad_u8 (|byte - 0| summed, + acc); the pair's
+// second sum lands in the high half through v_sad_hi_u8, so the packed fp16
+// pattern needs no perm. Six full-rate ops replace 2 mul_lo + 2 dot4 + 1 pack.
+// Bit-identical over all 2^16 codewords with garbage high halves
+// (review/main/hash16.hip, test_exl3_rocm).
 __device__ __forceinline__ half2 Exl3DecodePairCb2Dp4a(uint32_t x0,
                                                         uint32_t x1) {
-  x0 *= 0x83DCD12Du;
-  x1 *= 0x83DCD12Du;
+#if defined(__GFX11__)
+  uint32_t p0, p1, packed;
+  asm("v_mad_u32_u16 %0, %1, 0xd12d, 0" : "=v"(p0) : "v"(x0));
+  asm("v_mad_u32_u16 %0, %1, 0xd12d, 0" : "=v"(p1) : "v"(x1));
+  asm("v_mad_u16 %0, %1, 0x83dc, %0 op_sel:[0,0,1,1]" : "+v"(p0) : "v"(x0));
+  asm("v_mad_u16 %0, %1, 0x83dc, %0 op_sel:[0,0,1,1]" : "+v"(p1) : "v"(x1));
+  asm("v_sad_u8 %0, %1, 0, 0x64006400" : "=v"(packed) : "v"(p0));
+  asm("v_sad_hi_u8 %0, %1, 0, %0" : "+v"(packed) : "v"(p1));
+  const half2 k_inv_h2 = __half2half2(__ushort_as_half(0x1eee));
+  const half2 k_bias_h2 = __half2half2(__ushort_as_half(0xc931));
+  return __hfma2(__builtin_bit_cast(half2, packed), k_inv_h2, k_bias_h2);
+#else
+  x0 = (x0 & 0xffffu) * 0x83DCD12Du;
+  x1 = (x1 & 0xffffu) * 0x83DCD12Du;
   const uint32_t sum0 = __builtin_amdgcn_udot4(x0, 0x01010101u, 0x6400u, false);
   const uint32_t sum1 = __builtin_amdgcn_udot4(x1, 0x01010101u, 0x6400u, false);
   const half2 k_inv_h2 = __half2half2(__ushort_as_half(0x1eee));
@@ -112,6 +138,7 @@ __device__ __forceinline__ half2 Exl3DecodePairCb2Dp4a(uint32_t x0,
     half h;
   } h0{static_cast<uint16_t>(sum0)}, h1{static_cast<uint16_t>(sum1)};
   return __hfma2(__halves2half2(h0.h, h1.h), k_inv_h2, k_bias_h2);
+#endif
 }
 
 // Exl3TileRowMajorIndex (quantize.py:28-42). `t / 8` is the tensor-core lane,

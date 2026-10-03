@@ -67,32 +67,31 @@ constexpr int kDotSpanWords = 5;
 // v_fshr/v_alignbit — so the whole extraction is a shift, two register
 // selects, and the funnel shift itself. Verified codeword-for-codeword
 // against Exl3TileCodeword for every width 1..8 on random tiles.
-__device__ __forceinline__ uint16_t Exl3SpanCodeword(
+// The codeword is the LOW 16 bits of the returned word; the high half is
+// window spill that the mul1 pair decode never reads, so no mask is spent.
+__device__ __forceinline__ uint32_t Exl3SpanCodeword(
     const uint32_t w[kDotSpanWords], int e0, int s, int bits) {
   const int eb = e0 + s * bits;
-  return static_cast<uint16_t>(
-      __funnelshift_r(w[(eb + 15) >> 5], w[eb >> 5], 48 - (eb & 31)));
+  return __funnelshift_r(w[(eb + 15) >> 5], w[eb >> 5], 48 - (eb & 31));
 }
 
 
 // bits==4: e0 = (32*l + 1012) & 31 = 20 for EVERY lane — each window starts
 // at compile-time span bit 20+4s, so the funnel-shift operands resolve to
 // registers at compile time.
-__device__ __forceinline__ uint16_t Exl3SpanCodeword4(
+__device__ __forceinline__ uint32_t Exl3SpanCodeword4(
     const uint32_t w[kDotSpanWords], int s) {
   const int eb = 20 + s * 4;
-  return static_cast<uint16_t>(
-      __funnelshift_r(w[(eb + 15) >> 5], w[eb >> 5], 48 - (eb & 31)));
+  return __funnelshift_r(w[(eb + 15) >> 5], w[eb >> 5], 48 - (eb & 31));
 }
 
 // bits==6: e0 = (48*l + 1526) & 31 = 22 (even lane) or 6 (odd lane) — two
 // compile-time residue patterns selected on lane parity.
-__device__ __forceinline__ uint16_t Exl3SpanCodeword6(
+__device__ __forceinline__ uint32_t Exl3SpanCodeword6(
     const uint32_t w[kDotSpanWords], int lane, int s) {
   const int e0 = 22 - 16 * (lane & 1);
   const int eb = e0 + s * 6;
-  return static_cast<uint16_t>(
-      __funnelshift_r(w[(eb + 15) >> 5], w[eb >> 5], 48 - (eb & 31)));
+  return __funnelshift_r(w[(eb + 15) >> 5], w[eb >> 5], 48 - (eb & 31));
 }
 
 // Coalesced tile fetch for the templated arms: lane l loads tile word l
@@ -145,7 +144,7 @@ __device__ __forceinline__ half2 Exl3DecodePair6(uint32_t cwa, uint32_t cwb,
     // the CPU arm proves both roundings agree over every reachable byte sum.
     return Exl3DecodePairCb2Dp4a(cwa, cwb);
   }
-  uint32_t xa = cwa, xb = cwb;
+  uint32_t xa = cwa & 0xffffu, xb = cwb & 0xffffu;
   if (cb == 0) {
     xa = xa * 89226354u + 64248484u;
     xb = xb * 89226354u + 64248484u;

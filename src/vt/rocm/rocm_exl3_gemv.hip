@@ -143,6 +143,9 @@ __device__ __forceinline__ uint32_t fshift(const uint32_t b, const uint32_t a, i
   return shift < 32 ? __funnelshift_r(b, a, shift) : (a >> (shift - 32));
 }
 
+// Codewords are the LOW 16 bits of w0..w7; the extractors leave window spill
+// in the high halves. The mul1 pair reads only the low half; the other
+// codebooks multiply the whole word, so they mask here.
 template <int cb>
 __device__ __forceinline__ void decode8(uint32_t w0, uint32_t w1, uint32_t w2, uint32_t w3,
                                         uint32_t w4, uint32_t w5, uint32_t w6, uint32_t w7,
@@ -153,10 +156,10 @@ __device__ __forceinline__ void decode8(uint32_t w0, uint32_t w1, uint32_t w2, u
     f1[0] = Exl3DecodePairCb2Dp4a(w4, w5);
     f1[1] = Exl3DecodePairCb2Dp4a(w6, w7);
   } else {
-    f0[0] = decode_mcg_or_3inst_2<cb>(w0, w1);
-    f0[1] = decode_mcg_or_3inst_2<cb>(w2, w3);
-    f1[0] = decode_mcg_or_3inst_2<cb>(w4, w5);
-    f1[1] = decode_mcg_or_3inst_2<cb>(w6, w7);
+    f0[0] = decode_mcg_or_3inst_2<cb>(w0 & 0xffffu, w1 & 0xffffu);
+    f0[1] = decode_mcg_or_3inst_2<cb>(w2 & 0xffffu, w3 & 0xffffu);
+    f1[0] = decode_mcg_or_3inst_2<cb>(w4 & 0xffffu, w5 & 0xffffu);
+    f1[1] = decode_mcg_or_3inst_2<cb>(w6 & 0xffffu, w7 & 0xffffu);
   }
 }
 
@@ -167,14 +170,14 @@ template <int cb>
 __device__ __forceinline__ void dq8_regs_4bits(uint32_t a, uint32_t b, FragB& f0, FragB& f1) {
   uint32_t s, w0, w1, w2, w3, w4, w5, w6, w7;
   s = fshift(b, a, 20);  // FSHF_IMM(s, b, a, 20) — funnelshift_r(b, a, 20), args named (lo,hi)
-  w7 = b & 0xffff;
-  w6 = (b >> 4) & 0xffff;
-  w5 = (b >> 8) & 0xffff;
-  w4 = (b >> 12) & 0xffff;
-  w3 = (b >> 16) & 0xffff;
-  w2 = s & 0xffff;
-  w1 = (s >> 4) & 0xffff;
-  w0 = (s >> 8) & 0xffff;
+  w7 = b;
+  w6 = (b >> 4);
+  w5 = (b >> 8);
+  w4 = (b >> 12);
+  w3 = (b >> 16);
+  w2 = s;
+  w1 = (s >> 4);
+  w0 = (s >> 8);
   decode8<cb>(w0, w1, w2, w3, w4, w5, w6, w7, f0, f1);
 }
 
@@ -184,14 +187,14 @@ __device__ __forceinline__ void dq8_regs_2bits(uint32_t a, uint32_t b, int t_off
                                                FragB& f0, FragB& f1) {
   uint32_t w0, w1, w2, w3, w4, w5, w6, w7;
   b = fshift(b, a, ((~t_offset) & 8) << 1);
-  w7 = b & 0xffff;
-  w6 = (b >> 2) & 0xffff;
-  w5 = (b >> 4) & 0xffff;
-  w4 = (b >> 6) & 0xffff;
-  w3 = (b >> 8) & 0xffff;
-  w2 = (b >> 10) & 0xffff;
-  w1 = (b >> 12) & 0xffff;
-  w0 = (b >> 14) & 0xffff;
+  w7 = b;
+  w6 = (b >> 2);
+  w5 = (b >> 4);
+  w4 = (b >> 6);
+  w3 = (b >> 8);
+  w2 = (b >> 10);
+  w1 = (b >> 12);
+  w0 = (b >> 14);
   decode8<cb>(w0, w1, w2, w3, w4, w5, w6, w7, f0, f1);
 }
 
@@ -209,8 +212,7 @@ __device__ __forceinline__ void dq8_regs_3bits(uint32_t a, uint32_t b, int s2,
   w2 = w3 >> 3;
   w1 = w2 >> 3;
   w0 = w1 >> 3;
-  decode8<cb>(w0 & 0xffff, w1 & 0xffff, w2 & 0xffff, w3 & 0xffff,
-              w4 & 0xffff, w5 & 0xffff, w6 & 0xffff, w7 & 0xffff, f0, f1);
+  decode8<cb>(w0, w1, w2, w3, w4, w5, w6, w7, f0, f1);
 }
 
 // ─── the emulated fp16-accumulate MMA (hip_compat_hip.cuh:424-468, 487-522) ──
@@ -971,7 +973,7 @@ __global__ __launch_bounds__(512) void Exl3GemvM1K4(
             // word is i1's — argument order is (w[i1], w[i0]).
             cw[s] = fshift(w[((4 * sc + 1027) >> 5) - 31],
                            w[((4 * sc + 1012) >> 5) - 31],
-                           (28 - 4 * sc) & 31) & 0xffffu;
+                           (28 - 4 * sc) & 31);
           }
           // decode8 emits f=[w0..w3],f1=[w4..w7]; for s in [8j,8j+8) the f
           // half is column l7 (sub<4) and f1 is column l7+8.
@@ -1142,7 +1144,7 @@ __global__ __launch_bounds__(512) void Exl3GemvM1K4Fused(
             const int sc = j * 8 + s2;
             cw[s2] = fshift(w[((4 * sc + 1027) >> 5) - 31],
                             w[((4 * sc + 1012) >> 5) - 31],
-                            (28 - 4 * sc) & 31) & 0xffffu;
+                            (28 - 4 * sc) & 31);
           }
           decode8<cb>(cw[0], cw[1], cw[2], cw[3], cw[4], cw[5], cw[6], cw[7],
                       fA, fB);
@@ -1477,7 +1479,7 @@ __global__ __launch_bounds__(512) void Exl3GemvMK3(
             const int r0 = ((3 * sc + 755) >> 5) - 23;
             const int r1 = ((3 * sc + 770) >> 5) - 23;
             const int s0 = 32 * (((3 * sc + 770) >> 5) + 1) - (3 * sc + 771);
-            cw[ss] = fshift(w[r1], w[r0], s0) & 0xffffu;
+            cw[ss] = fshift(w[r1], w[r0], s0);
           }
           decode8<cb>(cw[0], cw[1], cw[2], cw[3], cw[4], cw[5], cw[6], cw[7],
                       fA, fB);
