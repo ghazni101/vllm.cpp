@@ -251,8 +251,38 @@ cut to ~4 ms. Both halves of the work are therefore required:
   the shfl — every structural variant of the 3bpw m=1 GEMV is now
   measured and the production arm stands.
 
+## Outcome (2026-10-03)
+
+**60 tok/s single-stream is unreachable on this card at 3.5 bpw.** The
+developer re-confirmed the goal is single-stream decode, not aggregate.
+
+- The 11.59 GB/token of trellis bytes is fixed (no re-quantization). At
+  60 tok/s the weights alone must sustain **695 GB/s** with zero cost for
+  every other kernel — but the fastest structure-free byte stream ever
+  measured on this card (M1K4stream, decode+dot removed) peaks at
+  800–840 GB/s, and every real GEMV arm sits at 560–600 GB/s. Even a
+  *perfect* 840 GB/s GEMV plus zero launch gap and the measured ~7 ms of
+  non-GEMV work caps at ~48 tok/s. 60 needs a lower-byte decode format —
+  a spec-excluded lever.
+- **Final honest single-stream decode: 26.19 tok/s** (median tpot 38.2ms,
+  8-request c1 leg on the corrected head `72aa332ae`). Whole-run 19.7.
+- Regressed-found-in-flow: the bf16 fold `e1982b8aa` silently corrupted
+  greedy decode; reverted at `72aa332ae` (issue
+  ISSUE-LOCAL-01M41E6SXYTRPR7H25XNPAHSTE). Earlier "25.29"/"61 tok/s"
+  numbers on this branch were measured against the folded, corrupt build
+  and are not valid.
+- Landed kernel work that survives on the correct build:
+  `Exl3GemvMK3<cb,M>` batched-row arm for m=2..8 on 3 bpw cb2
+  (`2383afffc`) — batch decode moves 61→72 aggregate tok/s; single-stream
+  unaffected because m=1 does not carry a batch.
+
 ## Owed
 
 - The ~10 ms/token of launch overhead inside the captured graph — the
   graph replays but per-node launch cost remains; grouped/batched kernel
   structure is the fix.
+- If 60 tok/s is a hard product requirement, the only compliant lever is
+  the batch dimension: single-request throughput is bytes-bound, so
+  batched serving (the m=2..8 MK3 arm, 72 tok/s aggregate at s8) is how
+  this hardware serves that rate. A single-stream 60 tok/s needs a
+  checkpoint with fewer bytes per token.
