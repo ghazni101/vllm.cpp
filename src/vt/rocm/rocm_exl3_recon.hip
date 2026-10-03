@@ -378,7 +378,7 @@ half* EnsureReconScratch(size_t bytes, hipStream_t s) {
 // The had_r_128 stages shared with rocm_exl3.hip.
 void Exl3LaunchHadRocm(hipStream_t st, void* out, const void* in, const uint16_t* pre,
                        const uint16_t* post, float r_scale, int64_t rows, int64_t cols,
-                       int in_dt, int out_dt);
+                       bool half_in, bool half_out);
 
 void Exl3ReconstructGemmKernelRocm(Queue& q, Tensor& c, const Tensor& a,
                                    const Tensor& trellis, const Tensor& suh,
@@ -406,7 +406,7 @@ void Exl3ReconstructGemmKernelRocm(Queue& q, Tensor& c, const Tensor& a,
   // file header names why), so the transform always runs, into the caller's
   // a_had scratch.
   Exl3LaunchHadRocm(st, a_had.data, a.data, suh.Ptr<uint16_t>(), nullptr, kInvSqrt128R,
-                    size_m, size_k, /*in_dt=*/1, /*out_dt=*/1);
+                    size_m, size_k, /*half_in=*/true, /*half_out=*/true);
 
   // QUANT-EXL3 W7: an EMPTY w_scratch selects this stream's persistent buffer,
   // resolved before any launch so a refused growth enqueues nothing.
@@ -460,9 +460,9 @@ void Exl3ReconstructGemmKernelRocm(Queue& q, Tensor& c, const Tensor& a,
 
   // exl3.py:213-214. Output Hadamard, in place on c — safe because each
   // 128-block is independent (HadK documents the aliasing).
-  const int c_dt = c.dtype == DType::kF32 ? 0 : 1;
   Exl3LaunchHadRocm(st, c.data, c.data, nullptr, svh.Ptr<uint16_t>(), kInvSqrt128R,
-                    size_m, size_n, c_dt, c_dt);
+                    size_m, size_n, /*half_in=*/c.dtype != DType::kF32,
+                    /*half_out=*/c.dtype != DType::kF32);
 }
 
 }  // namespace vt::rocm

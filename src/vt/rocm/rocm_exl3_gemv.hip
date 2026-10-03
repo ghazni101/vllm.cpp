@@ -50,7 +50,6 @@
 #include <algorithm>
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
-#include <hip/hip_bf16.h>
 
 #include <cstdint>
 #include <cstdlib>
@@ -1032,23 +1031,14 @@ __device__ __forceinline__ float GemvNegBySignBit(float v) {
 __device__ __forceinline__ uint16_t GemvMulF16(uint16_t a, uint16_t b) {
   return DF32ToF16(DF16ToF32(a) * DF16ToF32(b));
 }
-// ABf16 selects the bf16-residual arm: the activation arrives bf16 and is
-// narrowed in-register by the same DF32ToF16(bf16->f32) chain CastF16K<bf16>
-// runs, so the staged a_had is bit-identical to f16-input + a separate cast.
-template <bool ABf16>
-__device__ __forceinline__ void HadBlock128ToH2(const void* __restrict__ a,
+__device__ __forceinline__ void HadBlock128ToH2(const uint16_t* __restrict__ a,
                                               const uint16_t* __restrict__ pre,
                                               int64_t base, half2* out4) {
   const int t = threadIdx.x & 31;
   float v[4];
 #pragma unroll
-  for (int j = 0; j < 4; ++j) {
-    const uint16_t h =
-        ABf16 ? DF32ToF16(__bfloat162float(
-                    static_cast<const __hip_bfloat16*>(a)[base + 4 * t + j]))
-              : static_cast<const uint16_t*>(a)[base + 4 * t + j];
-    v[j] = DF16ToF32(GemvMulF16(h, pre[base + 4 * t + j]));
-  }
+  for (int j = 0; j < 4; ++j)
+    v[j] = DF16ToF32(GemvMulF16(a[base + 4 * t + j], pre[base + 4 * t + j]));
   const float s0 = v[0] + v[1], d0 = v[0] - v[1];
   const float s1 = v[2] + v[3], d1 = v[2] - v[3];
   float x[4] = {s0 + s1, d0 + d1, s0 - s1, d0 - d1};
@@ -1076,9 +1066,9 @@ __device__ __forceinline__ void HadBlock128ToH2(const void* __restrict__ a,
 // `shA` is dynamic LDS sized size_k * 2 bytes; every block stages the same
 // a_had (only its own group columns differ), which is the trade the launch
 // count buys.
-template <int cb, bool ABf16>
+template <int cb>
 __global__ __launch_bounds__(512) void Exl3GemvM1K4Fused(
-    const void* __restrict__ A, const uint16_t* __restrict__ suh,
+    const uint16_t* __restrict__ A, const uint16_t* __restrict__ suh,
     const uint16_t* __restrict__ B, float* __restrict__ C, int size_m,
     int size_k, int size_n) {
   (void)size_m;
@@ -1102,9 +1092,10 @@ __global__ __launch_bounds__(512) void Exl3GemvM1K4Fused(
 
   // In-had phase: warp-jobs over k/128 blocks. Every warp iterates its stride;
   // each produces one 128-column block of a_had into LDS as packed half2s.
+  const uint16_t* ap = A;
   for (int hb = warp; hb < size_k / 128; hb += WK) {
     half2 o2[2];
-    HadBlock128ToH2<ABf16>(A, suh, hb * 128, o2);
+    HadBlock128ToH2(ap, suh, hb * 128, o2);
     shA[hb * 64 + lane * 2] = o2[0];
     shA[hb * 64 + lane * 2 + 1] = o2[1];
   }
@@ -1187,9 +1178,9 @@ __global__ __launch_bounds__(512) void Exl3GemvM1K4Fused(
 // The A read it replaces is `A2[a_col]`/`A2[a_col+4]` (the lane's k quarter),
 // which maps 1:1 onto shA since a_had's layout is column-major-contiguous
 // half2s.
-template <int bits, int cb, bool ABf16>
+template <int bits, int cb>
 __global__ __launch_bounds__(512) void Exl3GemvM1KFused(
-    const void* __restrict__ A, const uint16_t* __restrict__ suh,
+    const uint16_t* __restrict__ A, const uint16_t* __restrict__ suh,
     const uint16_t* __restrict__ B, float* __restrict__ C, int size_m,
     int size_k, int size_n) {
   (void)size_m;
@@ -1214,9 +1205,10 @@ __global__ __launch_bounds__(512) void Exl3GemvM1KFused(
   const int ks0 = (blockIdx.y * WK + warp) * chunk;
   const int myn = max(0, min(chunk, kslices - ks0));
 
+  const uint16_t* ap = A;
   for (int hb = warp; hb < size_k / 128; hb += WK) {
     half2 o2[2];
-    HadBlock128ToH2<ABf16>(A, suh, hb * 128, o2);
+    HadBlock128ToH2(ap, suh, hb * 128, o2);
     shA[hb * 64 + lane * 2] = o2[0];
     shA[hb * 64 + lane * 2 + 1] = o2[1];
   }
@@ -1369,16 +1361,15 @@ const void* GemvM1KernelFor(int bits, int cb) {
 #undef VT_GEMV_M1
   return nullptr;
 }
-template <bool ABf16>
 const void* GemvM1FusedKernelFor(int bits, int cb) {
   // The fused in-had arm's instantiation set mirrors GemvM1KernelFor's: same
   // (bits, cb) coverage, one kernel per row.
 #define VT_GEMV_M1F(bits_, cb_)                                             \
   if (bits == bits_ && cb == cb_)                                           \
-    return reinterpret_cast<const void*>(&Exl3GemvM1KFused<bits_, cb_, ABf16>);
+    return reinterpret_cast<const void*>(&Exl3GemvM1KFused<bits_, cb_>);
 #define VT_GEMV_M1F4(bits_, cb_)                                            \
   if (bits == bits_ && cb == cb_)                                           \
-    return reinterpret_cast<const void*>(&Exl3GemvM1K4Fused<cb_, ABf16>);
+    return reinterpret_cast<const void*>(&Exl3GemvM1K4Fused<cb_>);
   VT_GEMV_M1F4(4, 0) VT_GEMV_M1F4(4, 1) VT_GEMV_M1F4(4, 2)
   VT_GEMV_M1F(2, 1) VT_GEMV_M1F(2, 2)
   VT_GEMV_M1F(3, 1) VT_GEMV_M1F(3, 2)
@@ -1721,7 +1712,7 @@ bool Exl3GemvM1FusedTryLaunchRocm(hipStream_t st, const void* a_raw,
                                   const uint16_t* suh_ptr,
                                   const Tensor& trellis, float* raw,
                                   int size_k, int size_n, int device,
-                                  const Exl3GemmArgs& args, bool a_bf16) {
+                                  const Exl3GemmArgs& args) {
   if (args.force_gemv == 0) return false;
   // Same hard gates as the unfused arm — n%128 included. Without it a
   // shape like n%64==0 && n%128!=0 was accepted and the group loop left
@@ -1757,8 +1748,7 @@ bool Exl3GemvM1FusedTryLaunchRocm(hipStream_t st, const void* a_raw,
          "multiprocessor count");
   if (num_sms < 1) num_sms = 1;
 
-  const void* kernel = a_bf16 ? GemvM1FusedKernelFor<true>(args.bits, args.codebook)
-                              : GemvM1FusedKernelFor<false>(args.bits, args.codebook);
+  const void* kernel = GemvM1FusedKernelFor(args.bits, args.codebook);
   if (kernel == nullptr) return false;
   const int cols = (args.bits == 4) ? 64 : 32;
 
@@ -1792,7 +1782,7 @@ bool Exl3GemvM1FusedTryLaunchRocm(hipStream_t st, const void* a_raw,
     std::fprintf(stderr,
                  "[exl3_gemv] fused m=1 k=%d n=%d bits=%d cb=%d grid=%d lds=%zu\n",
                  size_k, size_n, args.bits, args.codebook, grid, shmem);
-  const void* a_ptr = a_raw;
+  const uint16_t* a_ptr = static_cast<const uint16_t*>(a_raw);
   const uint16_t* b_ptr = trellis.Ptr<uint16_t>();
   int size_m = 1;
   void* kargs[] = {static_cast<void*>(&a_ptr),  static_cast<void*>(&suh_ptr),
