@@ -1786,9 +1786,15 @@ bool Exl3GemvM1FusedTryLaunchRocm(hipStream_t st, const void* a_raw,
   // Exl3GemvTryLaunchRocm plus the separate Had.
   if (args.bits != 4 || size_n < 12288) return false;
   if (!GemvArmInstantiated(args.bits, args.codebook)) return false;
+  // Default OFF since the unfused M1K4 took buffer loads, PF=2 and the
+  // hardware fp16 codec: unfused + HadK now beats this arm on both shapes it
+  // served (gemvbench attn_q 56.3 -> 50.5 us, gate/up_4 78.7 -> 70.1 us;
+  // served tg@32 38.23 -> 39.02 tok/s, same binary, output byte-identical).
+  // The arm is co-residency capped (one a_had staging per block), which
+  // leaves a tail on 192/272-group shapes. VT_EXL3_FUSED_HAD=1 restores it.
   static const int kFuseHadEnv = [] {
     const char* e = std::getenv("VT_EXL3_FUSED_HAD");
-    return e ? std::atoi(e) : 1;
+    return e ? std::atoi(e) : 0;
   }();
   if (kFuseHadEnv != 1) return false;
   if (GemvWmmaMode()) return false;  // fused arm is the dot decode, not WMMA

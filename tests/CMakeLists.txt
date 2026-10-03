@@ -3114,10 +3114,10 @@ vllm_cpp_add_test(test_exl3_rocm vt/test_exl3_rocm.cpp)
 # ROCm. Same always-built rule as its sibling above -- cases skip without a
 # ROCm backend.
 vllm_cpp_add_test(test_exl3_rocm_gemv vt/test_exl3_rocm_gemv.cpp)
-# The same arms with the fused in-had m=1 arm off: every n >= 12288 4 bpw
-# shape then runs the unfused GEMV + separate HadK.
-add_test(NAME test_exl3_rocm_gemv_unfused COMMAND test_exl3_rocm_gemv)
-set_tests_properties(test_exl3_rocm_gemv_unfused PROPERTIES ENVIRONMENT "VT_EXL3_FUSED_HAD=0")
+# The same arms with the opt-in fused in-had m=1 arm on: every n >= 12288
+# 4 bpw shape then runs Exl3GemvM1K4Fused instead of GEMV + separate HadK.
+add_test(NAME test_exl3_rocm_gemv_fused COMMAND test_exl3_rocm_gemv)
+set_tests_properties(test_exl3_rocm_gemv_fused PROPERTIES ENVIRONMENT "VT_EXL3_FUSED_HAD=1")
 # Same spec, slice B: the reconstruct+hipBLAS arm (the M>144 dispatch) on ROCm.
 # The always-built rule applies again -- it skips without a ROCm backend.
 vllm_cpp_add_test(test_exl3_rocm_recon vt/test_exl3_rocm_recon.cpp)
