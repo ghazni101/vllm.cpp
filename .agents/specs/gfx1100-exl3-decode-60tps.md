@@ -276,8 +276,12 @@ developer re-confirmed the goal is single-stream decode, not aggregate.
   *perfect* 840 GB/s GEMV plus zero launch gap and the measured ~7 ms of
   non-GEMV work caps at ~48 tok/s. 60 needs a lower-byte decode format —
   a spec-excluded lever.
-- **Final honest single-stream decode: 26.19 tok/s** (median tpot 38.2ms,
-  8-request c1 leg on the corrected head `72aa332ae`). Whole-run 19.7.
+- **Final honest single-stream decode: 27.43 tok/s** (12-prompt HumanEval
+  leg, decode-only, median tpot 36.46ms, on `6210901c2` — the corrected head
+  plus `25f3398ba` defaulting the GQA4 f32-query attention arm on).
+  Whole-run 23.15. The 26.19 below predated the GQA4 flip; superseded.
+- **26.19 tok/s** (median tpot 38.2ms, 8-request c1 leg on `72aa332ae`,
+  before the GQA4 arm defaulted on). Whole-run 19.7.
 - Regressed-found-in-flow: the bf16 fold `e1982b8aa` silently corrupted
   greedy decode; reverted at `72aa332ae` (issue
   ISSUE-LOCAL-01M41E6SXYTRPR7H25XNPAHSTE). Earlier "25.29"/"61 tok/s"
