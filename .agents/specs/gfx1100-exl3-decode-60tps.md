@@ -251,6 +251,18 @@ cut to ~4 ms. Both halves of the work are therefore required:
   the shfl — every structural variant of the 3bpw m=1 GEMV is now
   measured and the production arm stands.
 
+- 2026-10-03 (GQA4 default ON): the f32-query GQA decode arm
+  (`PagedAttnDecodeGqaF32Q`, gated `VT_ATTN_DECODE_GQA4`, previously default
+  OFF) is now the default for the f32-query/bf16-KV path — the model's served
+  dtype mix. A rocprofv3 220-token census on the corrected head showed
+  `PagedAttnOnline<f32,bf16,f32>` at 747ms/220 tokens (~3.4ms/token) as a
+  per-context-token `__syncthreads()` walk at ~5 GB/s effective. Flipping the
+  arm on: same-leg A/B (12-prompt HumanEval, 128-token, 0.6/0.95/20) OFF
+  25.23 decode / 20.08 whole-run -> ON 27.43 decode / 23.15 whole-run,
+  +8.7% decode. Golden "The capital of France is" -> " Paris." parity holds
+  on the default-ON build. `VT_ATTN_DECODE_GQA4=0` restores the fallback.
+  Commit `25f3398ba`.
+
 ## Outcome (2026-10-03)
 
 **60 tok/s single-stream is unreachable on this card at 3.5 bpw.** The

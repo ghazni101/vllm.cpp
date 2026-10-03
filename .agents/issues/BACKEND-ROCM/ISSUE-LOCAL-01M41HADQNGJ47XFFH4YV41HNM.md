@@ -1,14 +1,14 @@
 ID: ISSUE-LOCAL-01M41HADQNGJ47XFFH4YV41HNM
 Title: f32-query decode attention falls back to PagedAttnOnline on gfx1100
 Row: BACKEND-ROCM
-State: OPEN
+State: CLOSED
 Kind: perf
 GitHub: -
 Mirror: PENDING
 Availability: FULL
 Created: 2026-10-03
 Updated: 2026-10-03
-Closed: -
+Closed: 2026-10-03
 
 ## Problem
 
@@ -16,4 +16,4 @@ Qwen3.8-27B-EXL3 runs attention as f32 query / f32 out over bf16 KV, which exclu
 
 ## Resolution
 
--
+Resolved by 25f3398ba: VT_ATTN_DECODE_GQA4 default ON for the f32-query/bf16-KV path. Same-leg A/B (12-prompt HumanEval, 128 tok): OFF 25.23 decode/20.08 whole-run -> ON 27.43 decode/23.15 whole-run (+8.7% decode). Golden parity holds.
