@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -420,6 +421,146 @@ TEST_CASE("exl3 rocm gemv: 6 bpw takes the reconstruct arm at every m") {
     CHECK(scalar_eq == ref.size());  // bits 6 is still byte-exact off the fast path
     CHECK(rel <= 1.0e-2);            // f32 accumulation, well inside tier 3
     CHECK(fast_diff > 0);
+  }
+
+  vt::GetBackend(vt::DeviceType::kCPU).DestroyQueue(hq);
+}
+
+namespace {
+
+// Raw 16/32-bit output words of one ROCm Exl3Gemm call with the given a / c
+// dtypes (a holds the a_dt bit patterns).
+std::vector<uint32_t> RocmArmDt(vt::Backend& be, const Exl3Fixture& f,
+                                const std::vector<uint16_t>& a, vt::DType a_dt,
+                                vt::DType c_dt, int64_t m, int codebook) {
+  vt::Queue dq = be.CreateQueue();
+  const int64_t k = f.k, n = f.n;
+  const size_t ab = a.size() * sizeof(uint16_t);
+  const size_t bb = f.trellis.size() * sizeof(uint16_t);
+  const size_t cw = c_dt == vt::DType::kF32 ? 4 : 2;
+  std::vector<uint8_t> out(static_cast<size_t>(m * n) * cw, 0);
+
+  void* d_a = be.Alloc(ab);
+  void* d_ah = be.Alloc(ab);
+  void* d_b = be.Alloc(bb);
+  void* d_suh = be.Alloc(f.suh.size() * 2);
+  void* d_svh = be.Alloc(f.svh.size() * 2);
+  void* d_c = be.Alloc(out.size());
+  be.Copy(dq, d_a, a.data(), ab);
+  be.Copy(dq, d_b, f.trellis.data(), bb);
+  be.Copy(dq, d_suh, f.suh.data(), f.suh.size() * 2);
+  be.Copy(dq, d_svh, f.svh.data(), f.svh.size() * 2);
+
+  vt::Tensor ta = vt::Tensor::Contiguous(d_a, a_dt, dq.device, {m, k});
+  vt::Tensor tah = vt::Tensor::Contiguous(d_ah, vt::DType::kF16, dq.device, {m, k});
+  vt::Tensor tb =
+      vt::Tensor::Contiguous(d_b, vt::DType::kI8, dq.device, {k / 16, n / 16, 32 * f.bits});
+  vt::Tensor tsuh = vt::Tensor::Contiguous(d_suh, vt::DType::kF16, dq.device, {k});
+  vt::Tensor tsvh = vt::Tensor::Contiguous(d_svh, vt::DType::kF16, dq.device, {n});
+  vt::Tensor tc = vt::Tensor::Contiguous(d_c, c_dt, dq.device, {m, n});
+  vt::Exl3GemmArgs args;
+  args.bits = f.bits;
+  args.codebook = codebook;
+  vt::Exl3Gemm(dq, tc, ta, tb, tsuh, tsvh, tah, args);
+  be.Synchronize(dq);
+  be.Copy(dq, out.data(), d_c, out.size());
+  be.Synchronize(dq);
+  be.Free(d_a);
+  be.Free(d_ah);
+  be.Free(d_c);
+  be.Free(d_b);
+  be.Free(d_suh);
+  be.Free(d_svh);
+  be.DestroyQueue(dq);
+
+  std::vector<uint32_t> words(static_cast<size_t>(m * n));
+  for (size_t i = 0; i < words.size(); ++i) {
+    if (cw == 4) {
+      std::memcpy(&words[i], out.data() + 4 * i, 4);
+    } else {
+      uint16_t h;
+      std::memcpy(&h, out.data() + 2 * i, 2);
+      words[i] = h;
+    }
+  }
+  return words;
+}
+
+}  // namespace
+
+// The folded casts: on ROCm Exl3Gemm admits a bf16 a (widened and
+// f16-rounded inside the input Hadamard) and a bf16 c (RN-rounded from the
+// f32 output Hadamard). Every m the dispatcher can see — decode, the GEMV
+// chunk loop, the internal reconstruct window (32, 144] and above — must
+// match the f16 pipeline. Where both dtype mixes reach the same kernels
+// (m <= 32) that match is byte-exact: bf16 -> f16 staging then f32 out ->
+// bf16 is the same rounding chain as the fold. Above, the f16 inputs take
+// reconstruct + hipBLAS and bf16 inputs the dtype-aware transcription, so
+// the bound is tier 3c against the CPU arm. A bf16 buffer reinterpreted
+// as f16 (the reverted e1982b8aa defect) lands at relative RMS ~1e3.
+TEST_CASE("exl3 rocm gemv: bf16 a/c fold matches the f16 pipeline at every m") {
+  if (!HasRocmExl3()) {
+    CHECK_FALSE(vt::OpRegistered(vt::OpId::kExl3Gemm, vt::DeviceType::kROCM));
+    return;
+  }
+  vt::Backend& be = vt::GetBackend(vt::DeviceType::kROCM);
+  vt::Queue hq = vt::GetBackend(vt::DeviceType::kCPU).CreateQueue();
+
+  struct Arm {
+    int bits, cb;
+  };
+  for (const Arm arm : {Arm{3, 2}, Arm{4, 2}}) {
+    for (const int64_t m : {1, 2, 8, 16, 32, 33, 64, 144, 145, 160}) {
+      CAPTURE(arm.bits);
+      CAPTURE(m);
+      Exl3Fixture f = MakeFixture(1024, 1536, arm.bits,
+                                  0xBF16u + static_cast<uint32_t>(m * 16 + arm.bits));
+      std::vector<uint16_t> a_bf(static_cast<size_t>(m * f.k));
+      std::vector<uint16_t> a_f16(a_bf.size());
+      Rng rng;
+      for (size_t i = 0; i < a_bf.size(); ++i) {
+        a_bf[i] = vt::F32ToBF16(rng.next(1.0f));
+        a_f16[i] = vt::F32ToF16(vt::BF16ToF32(a_bf[i]));
+      }
+
+      const std::vector<uint16_t> ref = CpuArm(f, hq, a_f16, m, arm.cb);
+      const std::vector<uint32_t> f16_f32 =
+          RocmArmDt(be, f, a_f16, vt::DType::kF16, vt::DType::kF32, m, arm.cb);
+      const std::vector<uint32_t> bf_f32 =
+          RocmArmDt(be, f, a_bf, vt::DType::kBF16, vt::DType::kF32, m, arm.cb);
+      const std::vector<uint32_t> bf_bf =
+          RocmArmDt(be, f, a_bf, vt::DType::kBF16, vt::DType::kBF16, m, arm.cb);
+
+      size_t in_diff = 0, out_diff = 0;
+      double sq_f32 = 0.0, sq_bf = 0.0, rq = 0.0;
+      for (size_t i = 0; i < ref.size(); ++i) {
+        float y;
+        std::memcpy(&y, &f16_f32[i], 4);
+        if (bf_f32[i] != f16_f32[i]) ++in_diff;
+        if (bf_bf[i] != vt::F32ToBF16(y)) ++out_diff;
+        float g32, gbf;
+        std::memcpy(&g32, &bf_f32[i], 4);
+        gbf = vt::BF16ToF32(static_cast<uint16_t>(bf_bf[i]));
+        const double r = vt::F16ToF32(ref[i]);
+        sq_f32 += (g32 - r) * (g32 - r);
+        sq_bf += (gbf - r) * (gbf - r);
+        rq += r * r;
+      }
+      const double rms_ref = std::sqrt(rq / static_cast<double>(ref.size()));
+      const double rel_f32 =
+          std::sqrt(sq_f32 / static_cast<double>(ref.size())) / rms_ref;
+      const double rel_bf = std::sqrt(sq_bf / static_cast<double>(ref.size())) / rms_ref;
+      MESSAGE("(", arm.bits, ",", arm.cb, ") m=", m, ": bf16-in vs f16-in differ at ",
+              in_diff, ", bf16-out vs RN(f32) at ", out_diff, " of ", ref.size(),
+              "; rel RMS vs CPU bf16->f32 ", rel_f32, ", bf16->bf16 ", rel_bf);
+      CHECK(rms_ref > 0.0);
+      CHECK(rel_f32 <= 6.0e-3);
+      CHECK(rel_bf <= 6.0e-3);
+      if (m <= 32) {
+        CHECK(in_diff == 0);
+        CHECK(out_diff == 0);
+      }
+    }
   }
 
   vt::GetBackend(vt::DeviceType::kCPU).DestroyQueue(hq);

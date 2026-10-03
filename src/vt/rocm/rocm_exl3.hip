@@ -57,6 +57,7 @@
 // not encountered. Speed is a later row and this file offers none.
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
+#include <hip/hip_bf16.h>
 
 #include <cstdint>
 #include <mutex>
@@ -95,7 +96,7 @@ bool Exl3GemvM1FusedTryLaunchRocm(hipStream_t st, const void* a_raw,
                                   const uint16_t* suh_ptr,
                                   const Tensor& trellis, float* raw,
                                   int size_k, int size_n, int device,
-                                  const Exl3GemmArgs& args);
+                                  const Exl3GemmArgs& args, bool a_bf16);
 bool Exl3DotChunkedTryLaunchRocm(hipStream_t st, const Tensor& a_had,
                                  const Tensor& trellis, float* raw, int size_m,
                                  int size_k, int size_n, int device,
@@ -117,7 +118,7 @@ void Exl3ReconstructGemmKernelRocm(Queue& q, Tensor& c, const Tensor& a,
 // fused path uses; anything else is refused rather than silently widened.
 void Exl3LaunchHadRocm(hipStream_t st, void* out, const void* in, const uint16_t* pre,
                        const uint16_t* post, float r_scale, int64_t rows, int64_t cols,
-                       bool half_in, bool half_out);
+                       int in_dt, int out_dt);
 
 namespace {
 
@@ -167,7 +168,12 @@ __device__ inline uint16_t MulF16(uint16_t a, uint16_t b) {
 // element is written while any lane may still read it. Upstream says the same of
 // its own kernel ("Works inplace if y == x", hadamard.cu:86) and Exl3Gemm's
 // contract permits `a_had` to alias `a`.
-template <bool HalfIn, bool HalfOut>
+// InD/OutD are element dtype codes: 0 = f32, 1 = f16, 2 = bf16. bf16 exists
+// because the EXL3 linear callers sit on a bf16 residual stream: folding the
+// CastF16 stage into the load (DF32ToF16(bf16->f32) is bit-identical to
+// CastF16K<bf16>) and the CastBf16 into the store (__float2bfloat16, the same
+// op CastBf16K runs) erases two elementwise launches per call.
+template <int InD, int OutD>
 __global__ void HadK(void* __restrict__ out, const void* __restrict__ in,
                      const uint16_t* __restrict__ pre, const uint16_t* __restrict__ post,
                      float r_scale, int64_t nblocks, int64_t blocks_per_row, int64_t cols,
@@ -194,9 +200,17 @@ __global__ void HadK(void* __restrict__ out, const void* __restrict__ in,
       const int64_t soff = sbase + 4 * t + j;
       if (!live) {
         v[j] = 0.0f;
-      } else if (HalfIn) {
+      } else if (InD == 1) {
         const uint16_t* p = static_cast<const uint16_t*>(in);
         const uint16_t w = pre != nullptr ? MulF16(p[off], pre[soff]) : p[off];
+        v[j] = DF16ToF32(w);
+      } else if (InD == 2) {
+        // bf16 source: fold the caller's CastF16 into the load — widen then
+        // DF32ToF16 round, the exact chain CastF16K<bf16> runs, so the f16
+        // value the transform sees is bit-identical.
+        const __hip_bfloat16* p = static_cast<const __hip_bfloat16*>(in);
+        const uint16_t h = DF32ToF16(__bfloat162float(p[off]));
+        const uint16_t w = pre != nullptr ? MulF16(h, pre[soff]) : h;
         v[j] = DF16ToF32(w);
       } else {
         const float* p = static_cast<const float*>(in);
@@ -242,10 +256,16 @@ __global__ void HadK(void* __restrict__ out, const void* __restrict__ in,
         const float res = sh[ty][j][t] * r_scale;
         const int64_t off = base + 4 * t + j;
         const int64_t soff = sbase + 4 * t + j;
-        if (HalfOut) {
+        if (OutD == 1) {
           uint16_t* o = static_cast<uint16_t*>(out);
           const uint16_t r = DF32ToF16(res);
           o[off] = post != nullptr ? MulF16(r, post[soff]) : r;
+        } else if (OutD == 2) {
+          // bf16 destination: one RN round of res*post, bit-identical to the
+          // separate CastBf16K the caller would run on the f32 form.
+          __hip_bfloat16* o = static_cast<__hip_bfloat16*>(out);
+          const float r = post != nullptr ? res * DF16ToF32(post[soff]) : res;
+          o[off] = __float2bfloat16(r);
         } else {
           float* o = static_cast<float*>(out);
           o[off] = post != nullptr ? res * DF16ToF32(post[soff]) : res;
@@ -256,18 +276,33 @@ __global__ void HadK(void* __restrict__ out, const void* __restrict__ in,
   }
 }
 
-template <bool HalfIn, bool HalfOut>
-void LaunchHad(void* out, const void* in, const uint16_t* pre, const uint16_t* post,
-               float r_scale, int64_t rows, int64_t cols, hipStream_t st) {
+void LaunchHadIO(void* out, const void* in, const uint16_t* pre, const uint16_t* post,
+                 float r_scale, int64_t rows, int64_t cols, hipStream_t st,
+                 int in_dt, int out_dt) {
   const int64_t blocks_per_row = cols / 128;
   const int64_t nblocks = rows * blocks_per_row;
   if (nblocks <= 0) return;
   const int64_t total_groups = (nblocks + 3) / 4;
   const unsigned grid =
       static_cast<unsigned>(total_groups > 65535 ? 65535 : total_groups);
-  HadK<HalfIn, HalfOut><<<grid, dim3(32, 4), 0, st>>>(out, in, pre, post, r_scale, nblocks,
-                                                      blocks_per_row, cols, total_groups);
-  Check(hipGetLastError(), "had_r_128");
+#define VT_HAD_LAUNCH(I_, O_)                                               \
+  if (in_dt == I_ && out_dt == O_) {                                        \
+    HadK<I_, O_><<<grid, dim3(32, 4), 0, st>>>(out, in, pre, post, r_scale, \
+                                             nblocks, blocks_per_row, cols, \
+                                             total_groups);                 \
+    Check(hipGetLastError(), "had_r_128");                                  \
+    return;                                                                 \
+  }
+  // Every instantiated pair. In-set is the callers' real dtype set (f32 raw
+  // scratch, f16 a_had path, bf16 residual); out-set is the same plus the
+  // refused f16->f32 diagonal, which Exl3LaunchHadRocm still reports.
+  VT_HAD_LAUNCH(1, 1) VT_HAD_LAUNCH(0, 0) VT_HAD_LAUNCH(0, 1)
+  VT_HAD_LAUNCH(2, 1) VT_HAD_LAUNCH(0, 2) VT_HAD_LAUNCH(2, 2)
+  VT_HAD_LAUNCH(1, 2)
+#undef VT_HAD_LAUNCH
+  throw std::runtime_error("vt rocm exl3: had_r_128 has no arm for dtype pair (" +
+                           std::to_string(in_dt) + ", " + std::to_string(out_dt) +
+                           ") — 0=f32 1=f16 2=bf16");
 }
 
 // ─── step 2: the tiled GEMM against the decoded trellis ──────────────────────
@@ -351,18 +386,15 @@ float* EnsureRawScratch(size_t need, hipStream_t s) {
 
 void Exl3LaunchHadRocm(hipStream_t st, void* out, const void* in, const uint16_t* pre,
                        const uint16_t* post, float r_scale, int64_t rows, int64_t cols,
-                       bool half_in, bool half_out) {
-  if (half_in && half_out) {
-    LaunchHad<true, true>(out, in, pre, post, r_scale, rows, cols, st);
-  } else if (!half_in && half_out) {
-    LaunchHad<false, true>(out, in, pre, post, r_scale, rows, cols, st);
-  } else if (!half_in && !half_out) {
-    LaunchHad<false, false>(out, in, pre, post, r_scale, rows, cols, st);
-  } else {
+                       int in_dt, int out_dt) {
+  // in_dt/out_dt: 0=f32 1=f16 2=bf16 — the dtype codes HadK templated on.
+  if (in_dt == 1 && out_dt == 0) {
     throw std::runtime_error(
-        "vt rocm exl3: had_r_128 has no f16-in/f32-out arm; the three instantiated "
-        "pairs are (f16,f16), (f32,f32) and (f32,f16)");
+        "vt rocm exl3: had_r_128 has no f16-in/f32-out arm; the instantiated "
+        "pairs are (f16,f16), (f32,f32), (f32,f16), (bf16,f16), (f32,bf16), "
+        "(bf16,bf16) and (f16,bf16)");
   }
+  LaunchHadIO(out, in, pre, post, r_scale, rows, cols, st, in_dt, out_dt);
 }
 
 // The fused chain, step for step as Exl3GemmKernelCpu runs it:
@@ -406,8 +438,13 @@ void Exl3GemmKernelRocm(Queue& q, Tensor& c, const Tensor& a, const Tensor& trel
   // m<=8+chunks to recon was tried first and measured ~40 ms/token on the
   // lm_head (decode to fp16 scratch + hipBLAS is 2.5x the trellis traffic).
   const bool dot_shape = (k % 128 == 0) && (n % 128 == 0);
-  const bool want_recon =
-      fast_paths && args.force_gemv <= 0 && m > 32 && dot_shape;
+  // The reconstruct arm's Hadamards and hipBLAS GEMM are f16-in, f16/f32-out
+  // only; a bf16 a or c (admitted by ops.cpp for the folded casts) takes the
+  // Exl3GemmK route below, whose Hadamards carry the dtype codes.
+  const bool recon_dtypes = a.dtype == DType::kF16 &&
+                            (c.dtype == DType::kF16 || c.dtype == DType::kF32);
+  const bool want_recon = fast_paths && args.force_gemv <= 0 && m > 32 &&
+                          dot_shape && recon_dtypes;
   if (want_recon) {
     // Mid-m above the chunked cap: B would be re-read per 8-row chunk, so
     // past 32 rows the one-pass decode + hipBLAS GEMM wins.
@@ -445,11 +482,16 @@ void Exl3GemmKernelRocm(Queue& q, Tensor& c, const Tensor& a, const Tensor& trel
   if (m == 1 && fast_paths && !(dot_first && dot_shape)) {
     gemv = Exl3GemvM1FusedTryLaunchRocm(
         st, a.data, suh.data ? suh.Ptr<uint16_t>() : nullptr, trellis, raw,
-        static_cast<int>(k), static_cast<int>(n), q.device.index, args);
+        static_cast<int>(k), static_cast<int>(n), q.device.index, args,
+        a.dtype == DType::kBF16);
   }
-  if (!gemv)
-    LaunchHad<true, true>(a_had.data, a.data, suh.Ptr<uint16_t>(), nullptr,
-                          kInvSqrt128, m, k, st);
+  if (!gemv) {
+    // bf16 a arrives only on this backend (ops.cpp gates the dtype on ROCm);
+    // the bf16-in arm folds the caller's CastF16 bit-identically.
+    const int a_dt = (a.dtype == DType::kBF16) ? 2 : 1;
+    LaunchHadIO(a_had.data, a.data, suh.Ptr<uint16_t>(), nullptr,
+                kInvSqrt128, m, k, st, a_dt, 1);
+  }
 
   if (m <= kExl3GemvMaxM) {
     if (dot_first && dot_shape)
@@ -488,10 +530,9 @@ void Exl3GemmKernelRocm(Queue& q, Tensor& c, const Tensor& a, const Tensor& trel
 
   // 3. the output transform — had_ff for an f32 C, had_fh for an fp16 one, the
   // same two arms the CPU reference picks between off `c.dtype`.
-  if (c.dtype == DType::kF32)
-    LaunchHad<false, false>(c.data, raw, nullptr, svh.Ptr<uint16_t>(), kInvSqrt128, m, n, st);
-  else
-    LaunchHad<false, true>(c.data, raw, nullptr, svh.Ptr<uint16_t>(), kInvSqrt128, m, n, st);
+  const int c_dt = (c.dtype == DType::kBF16) ? 2 : (c.dtype == DType::kF16 ? 1 : 0);
+  LaunchHadIO(c.data, raw, nullptr, svh.Ptr<uint16_t>(), kInvSqrt128, m, n, st,
+              0, c_dt);
 }
 
 }  // namespace vt::rocm
