@@ -158,63 +158,90 @@ __device__ inline uint16_t MulF16(uint16_t a, uint16_t b) {
 
 // ─── step 1 and step 3: had_r_128 ────────────────────────────────────────────
 //
-// One 32-lane group per 128-block, four groups per workgroup, `h[4][32]` in LDS.
-// Lane t holds the four values of columns 4t..4t+3, so lane bit `i` carries
-// Hadamard level 4*i and levels 4..64 are exactly the five xor-partner steps —
-// which is why this is ShuffleHadWarp and not a rewritten butterfly.
+// One wave32 per 128-block, four waves per workgroup. Lane t holds the four
+// values of columns 4t..4t+3, so lane bit `i` carries Hadamard level 4*i and
+// levels 4..64 are exactly the five xor-partner steps — ShuffleHadWarp. The
+// partners are exchanged in registers: DPP row_xmask for xor 1/2/4/8 and
+// v_permlanex16 for xor 16 (ISA §7.7.1), so a block needs no LDS and no
+// barrier; each lane's per-element operations (own-first adds, sign-bit
+// flips) are the LDS formulation's, in the same order.
 //
-// IN-PLACE IS SAFE, and by construction rather than by luck: every lane loads
-// its four inputs BEFORE the first barrier and stores AFTER the last one, so no
-// element is written while any lane may still read it. Upstream says the same of
-// its own kernel ("Works inplace if y == x", hadamard.cu:86) and Exl3Gemm's
-// contract permits `a_had` to alias `a`.
+// IN-PLACE IS SAFE: a wave owns its whole 128-block, and every lane's four
+// loads precede the first exchange, which no store can overtake. Upstream
+// says the same of its own kernel ("Works inplace if y == x",
+// hadamard.cu:86) and Exl3Gemm's contract permits `a_had` to alias `a`.
 // InD/OutD are element dtype codes: 0 = f32, 1 = f16, 2 = bf16. bf16 exists
 // because the EXL3 linear callers sit on a bf16 residual stream: folding the
 // CastF16 stage into the load (DF32ToF16(bf16->f32) is bit-identical to
 // CastF16K<bf16>) and the CastBf16 into the store (__float2bfloat16, the same
 // op CastBf16K runs) erases two elementwise launches per call.
+// Lane t ^ I's value of v, in registers.
+template <int I>
+__device__ __forceinline__ float HadXorLane(float v) {
+  const int x = __float_as_int(v);
+  if constexpr (I == 16)
+    return __int_as_float(
+        __builtin_amdgcn_permlanex16(x, x, 0x76543210, 0xfedcba98, false, false));
+  else
+    return __int_as_float(__builtin_amdgcn_mov_dpp(x, 0x160 + I, 0xf, 0xf, false));
+}
+
+template <int I>
+__device__ __forceinline__ void HadXorLevel(float (&x)[4], int t) {
+  const bool flip = (t & I) != 0;
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    const float par = HadXorLane<I>(x[j]);
+    const float own = flip ? NegBySignBit(x[j]) : x[j];
+    x[j] = own + par;  // own FIRST, as the host adds
+  }
+}
+
+__device__ __forceinline__ void Unpack4x16(uint2 w, uint16_t (&h)[4]) {
+  h[0] = static_cast<uint16_t>(w.x);
+  h[1] = static_cast<uint16_t>(w.x >> 16);
+  h[2] = static_cast<uint16_t>(w.y);
+  h[3] = static_cast<uint16_t>(w.y >> 16);
+}
+
 template <int InD, int OutD>
 __global__ void HadK(void* __restrict__ out, const void* __restrict__ in,
                      const uint16_t* __restrict__ pre, const uint16_t* __restrict__ post,
                      float r_scale, int64_t nblocks, int64_t blocks_per_row, int64_t cols,
                      int64_t total_groups) {
-  __shared__ float sh[4][4][32];  // [group][j][lane] — 2 KiB
   const int ty = static_cast<int>(threadIdx.y);
   const int t = static_cast<int>(threadIdx.x);
 
   for (int64_t g = blockIdx.x; g < total_groups; g += gridDim.x) {
     const int64_t gb = g * 4 + ty;
-    const bool live = gb < nblocks;
-    const int64_t row = live ? gb / blocks_per_row : 0;
-    const int64_t blk = live ? gb % blocks_per_row : 0;
-    const int64_t base = row * cols + blk * 128;
-    const int64_t sbase = blk * 128;  // the scale vectors are indexed by COLUMN
+    if (gb >= nblocks) continue;  // wave-uniform: a wave is one 128-block
+    const int64_t row = gb / blocks_per_row;
+    const int64_t blk = gb % blocks_per_row;
+    const int64_t base = row * cols + blk * 128 + 4 * t;
+    const int64_t sbase = blk * 128 + 4 * t;  // the scale vectors are indexed by COLUMN
 
     // load + pre-scale (hadamard_inner.cuh:109-114 for the half arm, :167-174
     // for the float arm: an fp16 multiply BEFORE the widen, versus a widen and
     // an f32 multiply).
+    uint16_t ps[4] = {0, 0, 0, 0};
+    if (pre != nullptr) Unpack4x16(*reinterpret_cast<const uint2*>(pre + sbase), ps);
     float v[4];
+    if constexpr (InD == 0) {
+      const float4 f = *reinterpret_cast<const float4*>(static_cast<const float*>(in) + base);
+      const float fv[4] = {f.x, f.y, f.z, f.w};
 #pragma unroll
-    for (int j = 0; j < 4; ++j) {
-      const int64_t off = base + 4 * t + j;
-      const int64_t soff = sbase + 4 * t + j;
-      if (!live) {
-        v[j] = 0.0f;
-      } else if (InD == 1) {
-        const uint16_t* p = static_cast<const uint16_t*>(in);
-        const uint16_t w = pre != nullptr ? MulF16(p[off], pre[soff]) : p[off];
-        v[j] = DF16ToF32(w);
-      } else if (InD == 2) {
+      for (int j = 0; j < 4; ++j) v[j] = pre != nullptr ? fv[j] * DF16ToF32(ps[j]) : fv[j];
+    } else {
+      uint16_t h[4];
+      Unpack4x16(*reinterpret_cast<const uint2*>(static_cast<const uint16_t*>(in) + base), h);
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
         // bf16 source: fold the caller's CastF16 into the load — widen then
         // DF32ToF16 round, the exact chain CastF16K<bf16> runs, so the f16
         // value the transform sees is bit-identical.
-        const __hip_bfloat16* p = static_cast<const __hip_bfloat16*>(in);
-        const uint16_t h = DF32ToF16(__bfloat162float(p[off]));
-        const uint16_t w = pre != nullptr ? MulF16(h, pre[soff]) : h;
+        if constexpr (InD == 2) h[j] = DF32ToF16(__uint_as_float(static_cast<uint32_t>(h[j]) << 16));
+        const uint16_t w = pre != nullptr ? MulF16(h[j], ps[j]) : h[j];
         v[j] = DF16ToF32(w);
-      } else {
-        const float* p = static_cast<const float*>(in);
-        v[j] = pre != nullptr ? p[off] * DF16ToF32(pre[soff]) : p[off];
       }
     }
 
@@ -224,55 +251,48 @@ __global__ void HadK(void* __restrict__ out, const void* __restrict__ in,
     const float d0 = v[0] - v[1];
     const float s1 = v[2] + v[3];
     const float d1 = v[2] - v[3];
-    __syncthreads();  // every load above is now complete, so an aliased write is safe
-    sh[ty][0][t] = s0 + s1;
-    sh[ty][1][t] = d0 + d1;
-    sh[ty][2][t] = s0 - s1;
-    sh[ty][3][t] = d0 - d1;
+    float x[4] = {s0 + s1, d0 + d1, s0 - s1, d0 - d1};
 
     // levels 4..64: ShuffleHadWarp, five xor-partner steps.
-    for (int i = 1; i < 32; i <<= 1) {
-      __syncthreads();
-      const int p = t ^ i;
-      const bool flip = (t & i) != 0;
-      float own[4], par[4];
-#pragma unroll
-      for (int j = 0; j < 4; ++j) {
-        own[j] = flip ? NegBySignBit(sh[ty][j][t]) : sh[ty][j][t];
-        par[j] = sh[ty][j][p];
-      }
-      __syncthreads();
-#pragma unroll
-      for (int j = 0; j < 4; ++j) sh[ty][j][t] = own[j] + par[j];  // own FIRST, as the host adds
-    }
-    __syncthreads();
+    HadXorLevel<1>(x, t);
+    HadXorLevel<2>(x, t);
+    HadXorLevel<4>(x, t);
+    HadXorLevel<8>(x, t);
+    HadXorLevel<16>(x, t);
 
     // r_scale, then the store and the post-scale. Both half-output inners round
     // FIRST and apply the post scale as an fp16 multiply afterwards
     // (hadamard_inner.cuh:137-146); the float arms multiply in f32.
-    if (live) {
+    uint16_t qs[4] = {0, 0, 0, 0};
+    if (post != nullptr) Unpack4x16(*reinterpret_cast<const uint2*>(post + sbase), qs);
+    if constexpr (OutD == 0) {
+      float o[4];
 #pragma unroll
       for (int j = 0; j < 4; ++j) {
-        const float res = sh[ty][j][t] * r_scale;
-        const int64_t off = base + 4 * t + j;
-        const int64_t soff = sbase + 4 * t + j;
-        if (OutD == 1) {
-          uint16_t* o = static_cast<uint16_t*>(out);
+        const float res = x[j] * r_scale;
+        o[j] = post != nullptr ? res * DF16ToF32(qs[j]) : res;
+      }
+      *reinterpret_cast<float4*>(static_cast<float*>(out) + base) =
+          make_float4(o[0], o[1], o[2], o[3]);
+    } else {
+      uint16_t o[4];
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        const float res = x[j] * r_scale;
+        if constexpr (OutD == 1) {
           const uint16_t r = DF32ToF16(res);
-          o[off] = post != nullptr ? MulF16(r, post[soff]) : r;
-        } else if (OutD == 2) {
+          o[j] = post != nullptr ? MulF16(r, qs[j]) : r;
+        } else {
           // bf16 destination: one RN round of res*post, bit-identical to the
           // separate CastBf16K the caller would run on the f32 form.
-          __hip_bfloat16* o = static_cast<__hip_bfloat16*>(out);
-          const float r = post != nullptr ? res * DF16ToF32(post[soff]) : res;
-          o[off] = __float2bfloat16(r);
-        } else {
-          float* o = static_cast<float*>(out);
-          o[off] = post != nullptr ? res * DF16ToF32(post[soff]) : res;
+          const float r = post != nullptr ? res * DF16ToF32(qs[j]) : res;
+          o[j] = __bfloat16_as_ushort(__float2bfloat16(r));
         }
       }
+      *reinterpret_cast<uint2*>(static_cast<uint16_t*>(out) + base) =
+          make_uint2(o[0] | (static_cast<uint32_t>(o[1]) << 16),
+                     o[2] | (static_cast<uint32_t>(o[3]) << 16));
     }
-    __syncthreads();  // the next `g` overwrites sh
   }
 }
 
