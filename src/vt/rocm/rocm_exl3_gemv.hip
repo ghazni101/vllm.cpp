@@ -753,7 +753,7 @@ __global__ __launch_bounds__(512) void Exl3GemvM1K(
                  // Exl3GemvK so the launcher shares one kargs block.
   constexpr int WK = 16;   // k-split (warps per block)
   constexpr int WNT = 2;   // adjacent n-tiles per warp
-  constexpr int PF = 4;    // prefetch ring depth
+  constexpr int PF = 2;    // prefetch ring depth (2 beat 1/3/4/6/8 on gfx1100)
   constexpr int COLS = WNT * 16;
 
   constexpr int TWORDS = 8 * bits;                  // uint32 per 16x16 tile
@@ -929,7 +929,7 @@ __global__ __launch_bounds__(512) void Exl3GemvM1K4(
     int size_m, int size_k, int size_n) {
   (void)size_m;
   constexpr int WK = 16;   // k-split (warps per block)
-  constexpr int PF = 4;    // prefetch ring depth
+  constexpr int PF = 2;    // prefetch ring depth (2 beat 1/3/4/6/8 on gfx1100)
   constexpr int COLS = 64; // one warp covers 4 tiles = 64 columns
 
   const int warp = __builtin_amdgcn_readfirstlane(threadIdx.x / 32);
