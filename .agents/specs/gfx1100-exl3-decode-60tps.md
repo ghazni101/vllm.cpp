@@ -301,6 +301,72 @@ developer re-confirmed the goal is single-stream decode, not aggregate.
   (`2383afffc`) — batch decode moves 61→72 aggregate tok/s; single-stream
   unaffected because m=1 does not carry a batch.
 
+## Outcome (2026-10-04)
+
+Headline: **40.72 decode tok/s at ctx 32 / 40.13 at ctx 2048** (greedy,
+128 streamed tokens, same server, `pptg.py`; pp512 501.3, pp2048 407.6),
+against 27.43 measured on 2026-10-03. Three commits:
+
+- `369348d21` folds the bf16 output transform into the m=1 GEMV epilogue
+  (new `src/vt/rocm/rocm_exl3_fold.h`), removing one `HadK<2,1>` launch per
+  m=1 bf16 projection. Served 38.6-39.0 -> 40.47 decode. Gates: the 128-token
+  greedy continuation is byte-identical with `VT_EXL3_GEMV_FOLD_OUT=0` vs `=1`
+  (the standard this row adopted after `e1982b8aa`), and
+  `test_exl3_rocm_gemv`'s bf16 fold case demands byte-identical output at m<=32.
+- `bef2d0d5f` adds `VT_EXL3_GEMV_OCC=1`, the occupancy diagnostic both GEMV
+  campaigns below used.
+- `852816b18` gives the 3 bpw m=1 arm a four-tile (64-column) form at n >= 8192
+  with PF=3 on long per-warp k-chunks. Bit-identical (the WK=16 cross-warp fold
+  and each column's slice-order k-chain are unchanged): gemvbench 5120x17408
+  68.4 -> 63.5 us / 488 -> 526 GB/s (+7.7%), 17408x5120 neutral; served
+  interleaved 2x2 A/B 40.31, 39.89 -> 40.53, 40.90 (+1.5%) at ctx 32 and
+  39.76, 39.36 -> 39.97, 40.28 (+1.4%) at ctx 2048.
+
+Census at this head (rocprofv3, 199 decode tokens): 27.19 ms span, 21.8 ms
+busy, 1396 kernels/token; GEMV 16.27 ms (74% of busy: M1K4 9.10, M1K3 7.16);
+gap 5.28 ms, with 96% of the 1396 gaps at a 3.0-3.4 us floor. The two arms
+stream 10.6 GB of trellis per token = 651 GB/s aggregate, 68% of the 960 GB/s
+read roofline.
+
+Both kernel campaigns closed the same way, with a load-only clone of the arm
+as the instrument (identical buffer loads and prefetch ring, decode replaced
+by an XOR fold):
+
+- 4 bpw `Exl3GemvM1K4<2,true>` (86-88 VGPR, 2 blocks/CU): load-only
+  815/784/842/720/391 GB/s on 5120x10240 / 5120x17408 / 17408x5120 /
+  6144x5120 / 5120x1024. The access pattern caps at 82-88% of the roofline and
+  the decode chain costs a further 8-12% on the wide shapes. Occupancy is not
+  the lever: 2/3/4 co-resident blocks per CU measure 78.6/79.6/79.1 us.
+- 3 bpw `Exl3GemvM1K<3,2,true>`: load-only 731 GB/s (5120x17408) and 655
+  (17408x5120). The adopted four-tile form recovers most of the first shape's
+  decode-side stall; the second now sits within 5-8% of its pattern ceiling.
+  A contiguous-b128 3 bpw rewrite is falsified under bit-identity (the 24-of-32
+  lane ownership makes every window word a cross-lane exchange).
+- The remaining 4 bpw win (`nt_combof`: shfl-sourced boundary word, 2xb128 A
+  loads, nontemporal B loads) is bit-identical and worth 5120x17408 66.3 ->
+  63.5 us plus 5-7% at n >= 10240, i.e. ~0.25 ms/token — below the served A/B
+  noise floor, and it needs a second instantiation set plus an n gate.
+  Recorded with its harness under
+  `~/agent-artifacts/exl3-perf-gfx1100/review/main/exp/m1k4/`, not adopted.
+
+The dispatch floor is hardware, not host and not the tracer: a captured graph
+of N trivial kernels costs 2.68 us/node at N = 1000-2000 (5.4 us at N=100, the
+launch tail), byte-for-byte the same as eager launches, while one kernel doing
+the same 1400 units of work costs 0.034 us/unit (~65x cheaper). 1396
+kernels/token therefore carry ~3.7 ms of irreducible dispatch. The 399 input
+`HadK` launches cannot be hoisted or shared either: `suh` is per-weight, so no
+two projections in a layer share an `a_had`. Probe:
+`~/agent-artifacts/exl3-perf-gfx1100/review/main/nodecost.hip`.
+
+Concurrency scaling (same binary, warm, 128 tokens): ctx-1 aggregate 40.7 tok/s,
+c2 40.7, c4 77.9, c8 134.8. The super-linear growth past c4 is the batched step
+amortizing the trellis read, so the single-stream step is weight-bandwidth-bound
+and fully serial — there is no idle slack to reclaim. 60 tok/s single-stream
+would need those 10.6 GB to move at ~830-850 GB/s (86-89% of the read roofline,
+which the arms' own load-only pattern does not reach on the wide shapes) while
+the ~4 ms of non-GEMV work and ~3.7 ms of dispatch both collapse. The levers
+measured here move the pair (GEMV rate, dispatch) to 40.7 / 40.1 tok/s.
+
 ## Owed
 
 - The ~10 ms/token of launch overhead inside the captured graph — the
