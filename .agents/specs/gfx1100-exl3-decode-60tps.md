@@ -367,6 +367,35 @@ which the arms' own load-only pattern does not reach on the wide shapes) while
 the ~4 ms of non-GEMV work and ~3.7 ms of dispatch both collapse. The levers
 measured here move the pair (GEMV rate, dispatch) to 40.7 / 40.1 tok/s.
 
+`edd7765b6` closes the session's last kernel lever, in the m=1 6 bpw dot arm --
+this checkpoint's entire lm_head, ~1.65 ms of the step. The inner loop rebuilt a
+64-bit `(size_t)kt * ntiles * words32` address chain per tile load and carried
+the codebook dispatch inside the loop; the k-walk pointer now roves (consecutive
+kt of one tile column are a full k-row, 2.98 MB here, apart) and the codebook is
+fixed at compile time (`Exl3DecodePair6C<2>` is `Exl3DecodePairCb2Dp4a`, the
+function the runtime dispatch calls for cb == 2). Interleaved gemvbench, both
+binaries alternating in one session: 1646.7 / 1659.7 / 1657.4 us ->
+1447.1 / 1452.8 / 1450.6 us (-12.3%), output hash identical between the two
+binaries. Served: the 128-token greedy continuation is byte-identical across the
+unpatched, the untrimmed and the trimmed build (8 runs, one md5); final landed
+head 41.37 tok/s at ctx 32 and 40.73 at ctx 2048, pp512 498.8, pp2048 407.4,
+golden/midm/chat outputs correct. `test_exl3_rocm` 7/7.
+
+**Instrument limits, recorded because the remaining work's claims rest on
+them.** (a) End-to-end tok/s A/Bs on this box drift ~1.7% session to session --
+the *same* pre-patch binary measured 40.55 and 41.24 tok/s in two sessions --
+which is above the ~0.8% that a 1.65 ms arm can move, so two interleaved A/Bs of
+the dot-arm change disagreed in sign at ctx 32 (+0.7%, then -0.7%). (b) The
+rocprofv3 per-kernel duration for this shape is not stable across censuses: the
+same unpatched kernel read 1479.7 us and 1295.7 us. (c) gemvbench's lm_head FNV
+hash is NOT comparable across libraries -- the dot arm's f32 accumulation is
+contraction-sensitive, so one source produced 7599484fa49ed690 and
+60e2c08061e6d05c in different builds while every 3 bpw and 4 bpw shape hash
+stayed fixed across every build. Only same-session interleaved binaries and the
+served token-exact test are valid instruments for this arm. **Owed:** pin the
+dot arm's accumulation the way the GEMV fold pins its epilogue with `__fmul_rn`,
+so the arm's output is build-stable and its hash becomes usable again.
+
 ## Owed
 
 - The ~10 ms/token of launch overhead inside the captured graph — the
