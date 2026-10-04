@@ -293,9 +293,14 @@ void GdnPostConvKernelRocm(Queue& q, Tensor& q_out, Tensor& k_out, Tensor& v_out
     using Tqkv = decltype(qkv_tag);
     using Tconv = decltype(conv_tag);
     using Tgate = decltype(gate_tag);
-    if (dk <= 1024 && GdnPostConvRowEnabled()) {
-      const size_t shmem =
-          (static_cast<size_t>(kBlock / 32) * 2 * dk + 2 * (kBlock / 32)) * sizeof(float);
+    // The row arm stages kWarps*2*dk floats plus the inv pair; gate on the
+    // computed size, not a dk constant — dk=1024 overshoots the 64 KiB
+    // per-workgroup LDS limit by 64 B (16384+16 floats) and must fall through
+    // to the chunked kernel instead of throwing at launch.
+    const size_t shmem =
+        (static_cast<size_t>(kBlock / 32) * 2 * dk + 2 * (kBlock / 32)) *
+        sizeof(float);
+    if (shmem <= 64 * 1024 && GdnPostConvRowEnabled()) {
       GdnPostConvRowK<Tqkv, Tconv, Tgate><<<static_cast<unsigned>(t), kBlock, shmem, s>>>(
           q_out.Ptr<Tqkv>(), k_out.Ptr<Tqkv>(), v_out.Ptr<Tqkv>(), g_out.Ptr<float>(),
           beta_out.Ptr<float>(), conv.Ptr<Tconv>(), araw.Ptr<Tgate>(), braw.Ptr<Tgate>(),

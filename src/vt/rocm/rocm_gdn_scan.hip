@@ -19,6 +19,7 @@
 // EXACT.
 
 #include <hip/hip_runtime.h>
+#include "rocm_env.h"
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp16.h>
 
@@ -284,10 +285,7 @@ void LaunchGdnScanState(hipStream_t s, Tensor& out, const Tensor& q_in,
   // warp-per-row cooperative mapping. Default ON: measured +1.7 tok/s
   // decode end-to-end with the sibling coop arms on gfx1100 (Qwen3.8-27B
   // EXL3, 2026-10-02). `VT_GDN_SCAN_COOP=0` keeps the donor walk.
-  static const bool scan_coop = [] {
-    const char* e = std::getenv("VT_GDN_SCAN_COOP");
-    return e == nullptr || std::string(e) != "0";
-  }();
+  static const bool scan_coop = EnvBoolStrict("VT_GDN_SCAN_COOP", true);
   // Register-fused arm (same mapping, one state pass, bit-identical to the
   // coop arm — see the kernel header): serves decode (qsl == nullptr) AND
   // varlen prefill (qsl != nullptr) — the kernel handles qsl, state_idx,
@@ -297,13 +295,10 @@ void LaunchGdnScanState(hipStream_t s, Tensor& out, const Tensor& q_in,
   // the decode row split (0 disables the fused arm entirely, both modes);
   // VT_GDN_SCAN_ZSPLIT_PREFILL sets the prefill split (0 keeps prefill on
   // the coop arm).
-  static const int kZsplitEnv = [] {
-    const char* e = std::getenv("VT_GDN_SCAN_ZSPLIT");
-    const int v = e ? std::atoi(e) : 4;
-    // gridDim.z is capped at 65535 and a split wider than dv only wastes idle
-    // blocks — clamp rather than launch invalid.
-    return std::max(0, std::min(v, 65535));
-  }();
+  // gridDim.z is capped at 65535 and a split wider than dv only wastes idle
+  // blocks — clamp rather than launch invalid.
+  static const int kZsplitEnv =
+      std::max(0, std::min(EnvIntStrict("VT_GDN_SCAN_ZSPLIT", 4), 65535));
   // Prefill z-split default 8: measured on gfx1100 (hk=16, hv=48, dk=dv=128,
   // f32 state) — T>=7 favors z=8 (1.9 us/tok vs coop 14-16), tiny walks
   // (T<=4) favor z=4. gdn_bench.hip, review/GdnPrefillScan/REPORT.md.
@@ -311,8 +306,7 @@ void LaunchGdnScanState(hipStream_t s, Tensor& out, const Tensor& q_in,
   // on the captured decode path) so a test process can A/B the two arms.
   const int zsplit_prefill = [qsl] {
     if (qsl == nullptr) return 0;
-    const char* e = std::getenv("VT_GDN_SCAN_ZSPLIT_PREFILL");
-    const int v = e ? std::atoi(e) : 8;
+    const int v = EnvIntStrict("VT_GDN_SCAN_ZSPLIT_PREFILL", 8);
     return std::max(0, std::min(v, 65535));
   }();
   const int64_t t_total = q_in.shape[0];

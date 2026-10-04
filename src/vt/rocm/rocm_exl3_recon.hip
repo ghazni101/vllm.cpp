@@ -26,6 +26,7 @@
 // M the op serves, where the CUDA arm's M>=1024 fused kernel is owed
 // separately. The N > 32768 slice loop mirrors upstream's own structure.
 #include <hip/hip_runtime.h>
+#include "rocm_env.h"
 #include <hip/hip_fp16.h>
 #include <hipblas/hipblas.h>
 
@@ -35,6 +36,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <mutex>
 #include <stdexcept>
@@ -115,10 +117,7 @@ struct ReconLtHandle {
 };
 
 static bool ReconLtDisabled() {
-  static const bool off = [] {
-    const char* e = std::getenv("VT_EXL3_RECON_NO_LT");
-    return e && e[0] == '1';
-  }();
+  static const bool off = EnvBoolStrict("VT_EXL3_RECON_NO_LT", false);
   return off;
 }
 
@@ -130,12 +129,16 @@ static bool HgemmLtRowMajor(hipStream_t s, void* C, const void* A, const void* W
   // Layout key: shapes + output dtype + ldc. Algorithms are cached; the
   // heuristic call is per new shape only.
   const hipDataType c_dt = c_f32 ? HIP_R_32F : HIP_R_16F;
+  int dev = -1;
+  if (hipGetDevice(&dev) != hipSuccess) dev = -1;
   struct LtKey {
     int m, n, k;
     int64_t ldc;
     hipDataType c;
+    int dev;
     bool operator==(const LtKey& o) const {
-      return m == o.m && n == o.n && k == o.k && ldc == o.ldc && c == o.c;
+      return m == o.m && n == o.n && k == o.k && ldc == o.ldc && c == o.c &&
+             dev == o.dev;
     }
   };
   struct LtKeyHash {
@@ -143,13 +146,14 @@ static bool HgemmLtRowMajor(hipStream_t s, void* C, const void* A, const void* W
       return (static_cast<size_t>(x.m) * 1315423911u) ^
              (static_cast<size_t>(x.n) * 2654435761u) ^
              (static_cast<size_t>(x.k) * 97531u) ^
-             (static_cast<size_t>(x.ldc) * 40503u) ^ static_cast<size_t>(x.c);
+             (static_cast<size_t>(x.ldc) * 40503u) ^ static_cast<size_t>(x.c) ^
+             (static_cast<size_t>(x.dev) * 31u);
     }
   };
   static thread_local std::unordered_map<LtKey, hipblasLtMatmulAlgo_t, LtKeyHash>
       cache;
   static thread_local std::unordered_map<LtKey, size_t, LtKeyHash> ws_sizes;
-  const LtKey key{m, n, k, ldc, c_dt};
+  const LtKey key{m, n, k, ldc, c_dt, dev};
 
   // Column-major views, matching HgemmRowMajor's OP_N/OP_N contraction:
   // C_cm(N,M) = W_cm(N,K) @ A_cm(K,M). ldc is C's column stride (M in a

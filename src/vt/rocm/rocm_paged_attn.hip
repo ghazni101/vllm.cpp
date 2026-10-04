@@ -6,6 +6,8 @@
 
 #include "rocm_rdna3_attn_decode.h"
 #include "rocm_rdna3_dot2.h"
+#include "rocm_env.h"
+#include "vt/rocm/rocm_device_bind.h"
 // Compile the same rocWMMA BF16 tiles for the admitted RDNA3 and RDNA4 targets.
 // Keep this set aligned with GcnArchNameHasSharedKAttentionWmma at host dispatch.
 #if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1200__) || defined(__gfx1201__)
@@ -1213,6 +1215,15 @@ float* EnsureGqaSplitScratch(size_t need, hipStream_t s) {
   std::lock_guard<std::mutex> lk(mu);
   auto& sc = pools[s];
   if (need > sc.second) {
+    if (StreamIsCapturing(s)) {
+      // A grow inside graph capture would bake a one-shot alloc node whose
+      // freed pointer the replay still dereferences — refuse loudly instead.
+      throw std::runtime_error(
+          "vt rocm paged_attn: gqa split scratch growth under stream capture "
+          "(grow the pool once outside capture, or pre-size num_splits)");
+    }
+    if (sc.first != nullptr)
+      Check(hipFreeAsync(sc.first, s), "gqa split scratch free");
     Check(hipMallocAsync(&sc.first, need, s), "gqa split scratch grow");
     sc.second = need;
   }
@@ -3305,10 +3316,8 @@ void PagedAttentionKernelRocm(Queue& q, Tensor& out, const Tensor& query, const 
   // PagedAttnOnline's, so greedy anchors can move at exact ties; measured
   // 22.13 -> 26.24 decode tok/s with golden "The capital of France is" ->
   // " Paris." parity. VT_ATTN_DECODE_GQA4=0 restores the fallback.
-  static const bool decode_gqa4_f32q = [] {
-    const char* e = std::getenv("VT_ATTN_DECODE_GQA4");
-    return e == nullptr || e[0] != '0';  // default ON; =0 disables
-  }();
+  // default ON; =0 disables
+  static const bool decode_gqa4_f32q = EnvBoolStrict("VT_ATTN_DECODE_GQA4", true);
   if (decode_opt && decode_gqa4_f32q && total_q <= hq &&
       query.dtype == DType::kF32 && out.dtype == DType::kF32 &&
       ((k_cache.dtype == DType::kBF16 && v_cache.dtype == DType::kBF16) ||
@@ -3338,8 +3347,7 @@ void PagedAttentionKernelRocm(Queue& q, Tensor& out, const Tensor& query, const 
     // short contexts keep all work in split 0. VT_ATTN_GQA4_SPLITS=1 restores
     // the single-CTA walk.
     static const int gqa4_splits = [] {
-      const char* e = std::getenv("VT_ATTN_GQA4_SPLITS");
-      const int v = e != nullptr ? std::atoi(e) : 16;
+      const int v = EnvIntStrict("VT_ATTN_GQA4_SPLITS", 16);
       return v < 1 ? 1 : (v > 64 ? 64 : v);
     }();
     const int num_splits = gqa4_splits;
@@ -3396,11 +3404,8 @@ void PagedAttentionKernelRocm(Queue& q, Tensor& out, const Tensor& query, const 
   // PagedAttnOnline<float, __hip_bfloat16, float> measured 22-24% of a
   // 2k-token prefill on gfx1101). Same kernel + z-tiling the fp8 arm uses,
   // bf16 KV instead of fp8. total_q>=64 mirrors the fp8 admission.
-  static const bool bf16kv_prefill_sharedk = [] {
-    const char* e = std::getenv("VT_ATTN_PREFILL_F32Q_B16KV");
-    if (!e) return true;  // default ON
-    return e[0] != '0';
-  }();
+  static const bool bf16kv_prefill_sharedk =
+      EnvBoolStrict("VT_ATTN_PREFILL_F32Q_B16KV", true);
   const bool f32q_bf16kv_prefill =
       bf16kv_prefill_sharedk && query.dtype == DType::kF32 &&
       out.dtype == DType::kF32 && k_cache.dtype == DType::kBF16 &&

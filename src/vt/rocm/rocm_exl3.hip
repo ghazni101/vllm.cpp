@@ -56,10 +56,13 @@
 // against a 64 KiB budget. The blockers above are not worked around; they are
 // not encountered. Speed is a later row and this file offers none.
 #include <hip/hip_runtime.h>
+#include "rocm_env.h"
 #include <hip/hip_fp16.h>
 #include <hip/hip_bf16.h>
 
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -315,12 +318,11 @@ void LaunchHadIO(void* out, const void* in, const uint16_t* pre, const uint16_t*
     Check(hipGetLastError(), "had_r_128");                                  \
     return;                                                                 \
   }
-  // Every instantiated pair. In-set is the callers' real dtype set (f32 raw
-  // scratch, f16 a_had path, bf16 residual); out-set is the same plus the
-  // refused f16->f32 diagonal, which Exl3LaunchHadRocm still reports.
+  // Every instantiated pair — the callers' real dtype set: f32 raw scratch
+  // in/out, f16 a_had, bf16 residual. Anything else (f16->f32 included)
+  // throws below.
   VT_HAD_LAUNCH(1, 1) VT_HAD_LAUNCH(0, 0) VT_HAD_LAUNCH(0, 1)
-  VT_HAD_LAUNCH(2, 1) VT_HAD_LAUNCH(0, 2) VT_HAD_LAUNCH(2, 2)
-  VT_HAD_LAUNCH(1, 2)
+  VT_HAD_LAUNCH(2, 1) VT_HAD_LAUNCH(0, 2)
 #undef VT_HAD_LAUNCH
   throw std::runtime_error("vt rocm exl3: had_r_128 has no arm for dtype pair (" +
                            std::to_string(in_dt) + ", " + std::to_string(out_dt) +
@@ -400,6 +402,9 @@ StreamScratch& ScratchFor(hipStream_t s) {
 float* EnsureRawScratch(size_t need, hipStream_t s) {
   StreamScratch& sc = ScratchFor(s);
   if (need > sc.bytes) {
+    // Stream-ordered free of the superseded buffer: queued behind the work
+    // that still references it, so a grow mid-launch is safe.
+    if (sc.buf != nullptr) Check(hipFreeAsync(sc.buf, s), "raw scratch free");
     Check(hipMallocAsync(&sc.buf, need, s), "raw scratch grow");
     sc.bytes = need;
   }
@@ -412,6 +417,8 @@ float* EnsureRawScratch(size_t need, hipStream_t s) {
 uint32_t* EnsureFoldCounters(size_t need, hipStream_t s) {
   StreamScratch& sc = ScratchFor(s);
   if (need > sc.ncnt) {
+    if (sc.cnt != nullptr)
+      Check(hipFreeAsync(sc.cnt, s), "fold counters free");
     Check(hipMallocAsync(reinterpret_cast<void**>(&sc.cnt), need * sizeof(uint32_t), s),
           "fold counters grow");
     Check(hipMemsetAsync(sc.cnt, 0, need * sizeof(uint32_t), s), "fold counters zero");
@@ -426,12 +433,7 @@ void Exl3LaunchHadRocm(hipStream_t st, void* out, const void* in, const uint16_t
                        const uint16_t* post, float r_scale, int64_t rows, int64_t cols,
                        int in_dt, int out_dt) {
   // in_dt/out_dt: 0=f32 1=f16 2=bf16 — the dtype codes HadK templated on.
-  if (in_dt == 1 && out_dt == 0) {
-    throw std::runtime_error(
-        "vt rocm exl3: had_r_128 has no f16-in/f32-out arm; the instantiated "
-        "pairs are (f16,f16), (f32,f32), (f32,f16), (bf16,f16), (f32,bf16), "
-        "(bf16,bf16) and (f16,bf16)");
-  }
+  // Every uninstantiated pair (f16->f32 included) throws out of LaunchHadIO.
   LaunchHadIO(out, in, pre, post, r_scale, rows, cols, st, in_dt, out_dt);
 }
 
@@ -503,10 +505,8 @@ void Exl3GemmKernelRocm(Queue& q, Tensor& c, const Tensor& a, const Tensor& trel
   // word once and carries no prefetch-ring bookkeeping) can be compared
   // against the emulated-fragment arm on real serving. Default keeps
   // upstream's order.
-  static const bool kDotFirstEnv = [] {
-    const char* env = std::getenv("VT_EXL3_DOT_FIRST");
-    return env && std::atoi(env) != 0;
-  }();
+  static const bool kDotFirstEnv =
+      EnvIntStrict("VT_EXL3_DOT_FIRST", 0) != 0;
   const bool dot_first = fast_paths && kDotFirstEnv;
   // The fused arm is NOT tried when VT_EXL3_DOT_FIRST is set: that lever asks
   // for the dot arm ahead of every GEMV variant, and the dot arm consumes the

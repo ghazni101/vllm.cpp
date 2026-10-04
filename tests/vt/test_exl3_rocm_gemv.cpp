@@ -152,6 +152,15 @@ TEST_CASE("exl3 rocm gemv: every instantiated arm meets tier 3c") {
       {3, 1, 2048, 4096, 1, "(3,1) narrow m=1"},
       {3, 2, 2048, 4096, 1, "(3,2) narrow m=1"},
       {4, 2, 2048, 8320, 1, "(4,2) wide m=1"},
+      // Wide-arm boundaries: n=8192 sits exactly on the narrow/wide envelope
+      // cut (size_k <= 2048 && size_n <= 8192 resolves cfg 0); n=8064 is the
+      // largest narrow n.
+      {4, 2, 2048, 8192, 1, "(4,2) n=8192 boundary m=1"},
+      {4, 2, 2048, 8064, 1, "(4,2) n=8064 narrow edge m=1"},
+      // k=8960 = 8*1024 + 768: a non-1024-multiple k feeds the K-tail path
+      // both m=1 arms take past the main unrolled stride.
+      {4, 2, 8960, 4096, 1, "(4,2) k-remainder m=1"},
+      {3, 2, 8960, 4096, 1, "(3,2) k-remainder m=1"},
       // Qwen3.8-27B serving shapes: n/cols past the co-resident cap (grid
       // policy) and the long-k down projection.
       {3, 2, 5120, 17408, 1, "(3,2) gate/up shape m=1"},
@@ -164,6 +173,8 @@ TEST_CASE("exl3 rocm gemv: every instantiated arm meets tier 3c") {
       {4, 2, 5120, 17408, 1, "(4,2) gate/up shape m=1"},
       {4, 0, 2048, 4096, 8, "(4,0) narrow m=8"},
       {3, 2, 2048, 4096, 8, "(3,2) narrow m=8"},  // lands on the batched Exl3GemvMK3 arm
+      {4, 0, 2048, 4096, 2, "(4,0) narrow m=2"},   // smallest batched MK3 m
+      {4, 0, 2048, 4096, 5, "(4,0) narrow m=5"},   // odd m inside the MK3 rows range
       {4, 0, 2048, 4096, 8, "(4,0) narrow m=8"},
   };
 

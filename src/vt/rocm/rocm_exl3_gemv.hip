@@ -49,6 +49,7 @@
 // on both arms.
 #include <algorithm>
 #include <hip/hip_runtime.h>
+#include "rocm_env.h"
 #include <hip/hip_fp16.h>
 #include <hip/hip_bf16.h>
 
@@ -1083,8 +1084,9 @@ __global__ __launch_bounds__(512) void Exl3GemvM1K4(
             __builtin_amdgcn_raw_buffer_load_b32(b_rsrc, wprev * 4, gbyte + i * sstride, 0);
 
         // Window for group-codeword s (tile codeword t = 32*l7 + s): from
-        // Exl3TileCodeword, words (i0,i1) map to regs [(4s+1008)>>5, (4s+1023)>>5]
-        // relative to word 4*l7-1, and s0 = (28 - 4s) & 31.
+        // Exl3TileCodeword (b0 = 4t + 1012, b1 = 4t + 1028), words (i0,i1) map
+        // to regs [(4s+1012)>>5, (4s+1027)>>5] relative to word 4*l7-1, and
+        // s0 = (28 - 4s) & 31.
         uint32_t w[5] = {wb, v.x, v.y, v.z, v.w};
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
@@ -1469,10 +1471,9 @@ constexpr bool GemvArmInstantiated(int bits, int cb) {
   // Upstream's selector table (exl3_gemv.cu SEL_GRID list), read as a
   // predicate: 4 bpw decodes all three codebooks, 2 and 3 bpw instantiate
   // cb 1/2 only (cb 0 at those widths is refused upstream, exl3_gemv.cu:113).
-  // ROCm extension: 6 bpw m=1 — this checkpoint's lm_head — is served by the
-  // span-decode m1 kernel; upstream has no 6 bpw arm at all.
+  // 6 bpw (this checkpoint's lm_head) has no arm here — the dot kernel in
+  // rocm_exl3_dot.hip serves it.
   return (bits == 4 && (cb == 0 || cb == 1 || cb == 2)) ||
-         ((bits == 2 || bits == 3) && (cb == 1 || cb == 2)) ||
          ((bits == 2 || bits == 3) && (cb == 1 || cb == 2));
 }
 
@@ -1484,10 +1485,7 @@ constexpr bool GemvArmInstantiated(int bits, int cb) {
 constexpr int kGemvM1LongChunk = 40;  // 16-row k-slices per warp
 bool GemvM1K3Wide(int bits, int size_n) {
   if (bits != 3) return false;
-  static const int mode = [] {
-    const char* e = std::getenv("VT_EXL3_M1K3_WNT");
-    return e ? std::atoi(e) : 0;
-  }();
+  static const int mode = EnvIntStrict("VT_EXL3_M1K3_WNT", 0);
   if (mode == 2) return false;
   return size_n >= 8192;
 }
@@ -1542,9 +1540,8 @@ const void* GemvM1FusedKernelFor(int bits, int cb) {
 #define VT_GEMV_M1F4(bits_, cb_)                                            \
   if (bits == bits_ && cb == cb_)                                           \
     return reinterpret_cast<const void*>(&Exl3GemvM1K4Fused<cb_, ABf16>);
+  // Only 4 bpw rows instantiate: the call site gates the arm on bits == 4.
   VT_GEMV_M1F4(4, 0) VT_GEMV_M1F4(4, 1) VT_GEMV_M1F4(4, 2)
-  VT_GEMV_M1F(2, 1) VT_GEMV_M1F(2, 2)
-  VT_GEMV_M1F(3, 1) VT_GEMV_M1F(3, 2)
 #undef VT_GEMV_M1F4
 #undef VT_GEMV_M1F
   return nullptr;
@@ -1688,7 +1685,10 @@ __global__ __launch_bounds__(512) void Exl3GemvMK3(
 // M dispatch for the batched-row arm. M is a template parameter so the
 // register-file accumulators unroll per instantiation; size_m 2..8 cover the
 // mmode=1 range (kExl3GemvMaxM == 8).
-const void* GemvMK3KernelFor(int cb, int m) {
+const void* GemvMK3KernelFor(int m) {
+  // cb=2 only (the mul1 pair decoder is the templated row): the caller's
+  // `args.codebook == 2` gate is the contract — a future cb here serves the
+  // cb=2 window constants through the wrong codebook with no compile error.
   switch (m) {
     case 2: return (const void*)&Exl3GemvMK3<2, 2>;
     case 3: return (const void*)&Exl3GemvMK3<2, 3>;
@@ -1699,22 +1699,28 @@ const void* GemvMK3KernelFor(int cb, int m) {
     case 8: return (const void*)&Exl3GemvMK3<2, 8>;
     default: return nullptr;
   }
-  (void)cb;  // cb=2 (Qwen3.8-3.5bpw arm); cb=1 falls through to the fragment arm
 }
 
 
-int GemvOccupancyRocm(const void* kernel, int block_dim) {
+int GemvOccupancyRocm(const void* kernel, int block_dim, size_t dyn_smem = 0) {
   // exl3_gemv.cu:120-134 + exllamav3-rocm's RDNA correction: the occupancy
+  // query must see the kernel's real dynamic-LDS request — a fused arm that
+  // stages size_k halves under-counts co-residency when queried at 0.
   static std::mutex mtx;
-  static std::map<const void*, int> cache;
+  static std::map<std::pair<const void*, size_t>, int> cache;
   std::lock_guard<std::mutex> lock(mtx);
-  auto it = cache.find(kernel);
+  const auto key = std::make_pair(kernel, dyn_smem);
+  auto it = cache.find(key);
   if (it != cache.end()) return it->second;
   int blocks_per_sm = 0;
-  CheckG(hipOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm, kernel, block_dim, 0),
-         "hipOccupancyMaxActiveBlocksPerMultiprocessor exl3_gemv");
+  // A failed query is a decline (0), not a throw — this file's contract is
+  // that false/fallback paths never surface as hard errors.
+  if (hipOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm, kernel,
+                                                   block_dim, dyn_smem) !=
+      hipSuccess)
+    blocks_per_sm = 0;
   if (blocks_per_sm > 1) blocks_per_sm -= 1;
-  cache[kernel] = blocks_per_sm;
+  cache[key] = blocks_per_sm;
   return blocks_per_sm;
 }
 
@@ -1725,10 +1731,7 @@ int GemvOccupancyRocm(const void* kernel, int block_dim) {
 // the cap only matters for scheduling: with n/cols just above the cap, a few
 // blocks run a second group alone while the rest of the GPU idles.
 int GemvGridForGroups(int groups, int max_coresident) {
-  static const int mode = [] {
-    const char* env = std::getenv("VT_EXL3_GEMV_GRID");
-    return env ? std::atoi(env) : 1;
-  }();
+  static const int mode = EnvIntStrict("VT_EXL3_GEMV_GRID", 1);
   if (mode == 1) return std::min(groups, 65535);
   return std::min(groups, max_coresident);
 }
@@ -1736,10 +1739,7 @@ int GemvGridForGroups(int groups, int max_coresident) {
 bool GemvWmmaMode() {
   // VT_ROCM_EXL3_WMMA — documented in docs/ENVIRONMENT.md. Evaluation only:
   // the default (unset/0) is the emulated path the gates measure.
-  static const int mode = [] {
-    const char* env = std::getenv("VT_ROCM_EXL3_WMMA");
-    return env ? std::atoi(env) : 0;
-  }();
+  static const int mode = EnvIntStrict("VT_ROCM_EXL3_WMMA", 0);
   return mode == 1;
 }
 
@@ -1755,17 +1755,16 @@ bool Exl3GemvTryLaunchRocm(hipStream_t st, const Tensor& a_had, const Tensor& tr
   // exl3_gemv.cu:108-116: the free integer tests first, then the env read.
   if (args.force_gemv == 0) return false;
   if (!GemvArmInstantiated(args.bits, args.codebook)) return false;
-  // The m1 arm is the only fast arm for bits > 4: Exl3GemvHardEligible's
-  // bits<=4 test mirrors upstream's fragment kernel, not the span decoder.
   if (!Exl3GemvHardEligible(size_m, size_k, size_n, args.bits, args.codebook,
-                            /*has_su_sv=*/true) &&
-      !(size_m == 1 && args.bits >= 5 && args.bits <= 8 &&
-        size_k % 128 == 0 && size_n % 128 == 0))
+                            /*has_su_sv=*/true))
     return false;
   const int mode = args.force_gemv > 0 ? 2 : Exl3GemvMode();
   if (mode == 0) return false;
   const int mmode = size_m == 1 ? 0 : 1;
-  const bool smem = Exl3GemvSmemMode() == 1;
+  // smem staging is instantiated for 2 and 3 bpw only (GemvKernelFor); a
+  // forced SMEM=1 on 4 bpw must not decline the whole arm.
+  const bool smem = Exl3GemvSmemMode() == 1 &&
+                    (args.bits == 2 || args.bits == 3);
   const bool wmma = GemvWmmaMode();
 
   // wave32 is structural: the A/B fragment gathers and the bits-3 24-lane
@@ -1782,19 +1781,11 @@ bool Exl3GemvTryLaunchRocm(hipStream_t st, const Tensor& a_had, const Tensor& tr
   if (num_sms < 1) num_sms = 1;
 
   const void* narrow = GemvKernelFor(args.bits, args.codebook, mmode, 0, smem, wmma);
-  // bits>4 has no fragment arm at all — narrow is null there, the cfg
-  // heuristic is meaningless for it, and only the m=1 span arm can serve it
-  // (the m1 branch below); other ms fall to the dot/transcription arms in
-  // the caller.
-  if (narrow == nullptr && !(mmode == 0 && args.bits >= 5 && args.bits <= 8))
-    return false;
+  if (narrow == nullptr) return false;
 
   // VT_EXL3_GEMV_CFG forces the upstream cfg choice — a tuning probe, not a
   // contract: 0 is the 512-thread narrow arm, 1 the 256-thread WNT=4 arm.
-  static const int kCfgEnv = [] {
-    const char* e = std::getenv("VT_EXL3_GEMV_CFG");
-    return e ? std::atoi(e) : -1;
-  }();
+  static const int kCfgEnv = EnvIntStrict("VT_EXL3_GEMV_CFG", -1);
 
   int cfg = 0;
   if (narrow != nullptr) {
@@ -1825,19 +1816,13 @@ bool Exl3GemvTryLaunchRocm(hipStream_t st, const Tensor& a_had, const Tensor& tr
   // extra blockIdx.y) is a bench lever first: VT_EXL3_GEMV_KSPLIT=N raises
   // grid.y to N and pays one f32 atomicAdd per (m, stripe col) per slice.
   // It stays OFF by default until serving measurements pick a value.
-  static const int kKsplitEnv = [] {
-    const char* e = std::getenv("VT_EXL3_GEMV_KSPLIT");
-    return e ? std::atoi(e) : 1;
-  }();
+  static const int kKsplitEnv = EnvIntStrict("VT_EXL3_GEMV_KSPLIT", 1);
   const int ksplit = std::max(
       1, std::min(kKsplitEnv, (size_k / 16) / 16));
 
   // VT_EXL3_GEMV_FOLD_OUT=0 keeps the output transform as its own HadK
   // launch — the A/B and test lever for the epilogue fold.
-  static const bool kFoldEnv = [] {
-    const char* e = std::getenv("VT_EXL3_GEMV_FOLD_OUT");
-    return e == nullptr || e[0] != '0';
-  }();
+  static const bool kFoldEnv = EnvBoolStrict("VT_EXL3_GEMV_FOLD_OUT", true);
   // A k-split C is complete only after every slice's atomicAdd, which no
   // per-stripe counter of 128/cols arrivals can see.
   const bool fold_ok = fold != nullptr && kFoldEnv && ksplit == 1 &&
@@ -1853,7 +1838,7 @@ bool Exl3GemvTryLaunchRocm(hipStream_t st, const Tensor& a_had, const Tensor& tr
     // trellis per row group; Exl3GemvMK3 decodes each tile once and amortizes
     // it across all m rows. Measured ~2.2x the fragment arm at m=8 on the
     // qwen shapes (bench3 own3-m8 vs prod3-m8 rows).
-    kernel = GemvMK3KernelFor(args.codebook, size_m);
+    kernel = GemvMK3KernelFor(size_m);
     block_dim = 512;
     cols = 64;
   } else if (mmode == 0 && !wmma && kCfgEnv < 0 &&
@@ -1901,6 +1886,9 @@ bool Exl3GemvTryLaunchRocm(hipStream_t st, const Tensor& a_had, const Tensor& tr
                  size_m, size_k, size_n, args.bits, args.codebook, block_dim,
                  occ_blocks);
 
+  // 0 blocks/SM means the kernel's LDS footprint can never launch on this
+  // part — decline to the transcription rather than fail in CheckG.
+  if (occ_blocks < 1) return false;
   const int max_blocks = occ_blocks * num_sms;
   const int grid = GemvGridForGroups(size_n / cols, max_blocks);
   if (grid < 1) return false;
@@ -1969,10 +1957,7 @@ bool Exl3GemvM1FusedTryLaunchRocm(hipStream_t st, const void* a_raw,
   // served tg@32 38.23 -> 39.02 tok/s, same binary, output byte-identical).
   // The arm is co-residency capped (one a_had staging per block), which
   // leaves a tail on 192/272-group shapes. VT_EXL3_FUSED_HAD=1 restores it.
-  static const int kFuseHadEnv = [] {
-    const char* e = std::getenv("VT_EXL3_FUSED_HAD");
-    return e ? std::atoi(e) : 0;
-  }();
+  static const int kFuseHadEnv = EnvIntStrict("VT_EXL3_FUSED_HAD", 0);
   if (kFuseHadEnv != 1) return false;
   if (GemvWmmaMode()) return false;  // fused arm is the dot decode, not WMMA
 
@@ -1996,7 +1981,7 @@ bool Exl3GemvM1FusedTryLaunchRocm(hipStream_t st, const void* a_raw,
   const size_t shmem = static_cast<size_t>(size_k) * sizeof(uint16_t);
   if (shmem > 48 * 1024) return false;
 
-  int max_blocks = GemvOccupancyRocm(kernel, 512);
+  int max_blocks = GemvOccupancyRocm(kernel, 512, shmem);
   if (max_blocks < 1) max_blocks = 1;
   // Capped at co-residency regardless of VT_EXL3_GEMV_GRID: every block
   // re-stages the whole a_had row in LDS, so extra blocks add staging work
@@ -2005,10 +1990,7 @@ bool Exl3GemvM1FusedTryLaunchRocm(hipStream_t st, const void* a_raw,
   const int grid = std::min(groups, max_blocks * num_sms);
   if (grid < 1) return false;
 
-  static const int kKsplitEnv = [] {
-    const char* e = std::getenv("VT_EXL3_GEMV_KSPLIT");
-    return e ? std::atoi(e) : 1;
-  }();
+  static const int kKsplitEnv = EnvIntStrict("VT_EXL3_GEMV_KSPLIT", 1);
   const int ksplit = std::max(1, std::min(kKsplitEnv, (size_k / 16) / 16));
   if (ksplit > 1)
     CheckG(hipMemsetAsync(raw, 0, (size_t)size_n * sizeof(float), st),
@@ -2038,42 +2020,5 @@ bool Exl3GemvM1FusedTryLaunchRocm(hipStream_t st, const void* a_raw,
   CheckG(hipGetLastError(), "exl3_gemv fused-had launch");
   return true;
 }
-
-// ─── spec rocm-exl3-gemv-residual: the residual dispatch surface ─────────────
-//
-// Exl3GemmKernelRocm needs two more facts from this TU: whether the shape
-// itself can take the GEMV arm regardless of m (the chunked launcher feeds it
-// 8-row slices), and a chunked variant for 8 < m <= 32. Both stay inside
-// Exl3GemvMode() != 0 — VT_EXL3_GEMV=0 selects the transcription for EVERY
-// shape on this backend, which is what the byte-exact gate relies on.
-
-bool Exl3GemvShapeEligibleRocm(int size_k, int size_n, int bits, int cb) {
-  // The m term of Exl3GemvHardEligible is evaluated per chunk (always <= 8),
-  // so shape eligibility is the predicate with m=1.
-  return GemvArmInstantiated(bits, cb) &&
-         Exl3GemvHardEligible(1, size_k, size_n, bits, cb, /*has_su_sv=*/true);
-}
-
-bool Exl3GemvChunkedTryLaunchRocm(hipStream_t st, const Tensor& a_had,
-                                  const Tensor& trellis, float* raw, int size_m,
-                                  int size_k, int size_n, int device,
-                                  const Exl3GemmArgs& args) {
-  // Every chunk runs upstream's own m<=8 arm (mmode 1) on an 8-row slice of
-  // a_had and raw. B is re-read per chunk — upstream's own trade-off for
-  // mmode 1 — so the caller caps this path at m <= 32, above which the
-  // reconstruct arm's one-pass decode + hipBLAS GEMM is the right shape.
-  for (int base = 0; base < size_m; base += kGemvMaxM) {
-    const int rows = std::min(kGemvMaxM, size_m - base);
-    Tensor a_slice = a_had;
-    a_slice.data = static_cast<char*>(a_had.data) +
-                   static_cast<size_t>(base) * static_cast<size_t>(size_k) * sizeof(half);
-    float* raw_slice = raw + static_cast<size_t>(base) * static_cast<size_t>(size_n);
-    if (!Exl3GemvTryLaunchRocm(st, a_slice, trellis, raw_slice, rows, size_k, size_n,
-                               device, args, nullptr))
-      return false;
-  }
-  return true;
-}
-
 
 }  // namespace vt::rocm

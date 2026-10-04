@@ -3114,6 +3114,7 @@ vllm_cpp_add_test(test_exl3_rocm vt/test_exl3_rocm.cpp)
 # ROCm. Same always-built rule as its sibling above -- cases skip without a
 # ROCm backend.
 vllm_cpp_add_test(test_exl3_rocm_gemv vt/test_exl3_rocm_gemv.cpp)
+vllm_cpp_add_test(scratch_lenprobe vt/scratch_lenprobe.cpp)
 # The same arms with the opt-in fused in-had m=1 arm on: every n >= 12288
 # 4 bpw shape then runs Exl3GemvM1K4Fused instead of GEMV + separate HadK.
 add_test(NAME test_exl3_rocm_gemv_fused COMMAND test_exl3_rocm_gemv)
@@ -3543,6 +3544,12 @@ vllm_cpp_add_test(test_ops_fused_norm_rope vt/test_ops_fused_norm_rope.cpp)
 vllm_cpp_add_test(test_compiled_gemma vt/test_compiled_gemma.cpp)
 vllm_cpp_add_test(test_ops_gdn vt/test_ops_gdn.cpp)
 target_include_directories(test_ops_gdn PRIVATE ${CMAKE_SOURCE_DIR}/src)
+# The ROCm decode zsplit arm is a process-once env knob; the default run
+# covers zsplit=4 (and this suite's own setenv'd variants where the knob is
+# per-case). A pinned zsplit=1 run exercises the degenerate single-column
+# split on the fused decode path.
+add_test(NAME test_ops_gdn_rocm_zsplit1 COMMAND test_ops_gdn)
+set_tests_properties(test_ops_gdn_rocm_zsplit1 PROPERTIES ENVIRONMENT "VT_GDN_SCAN_ZSPLIT=1")
 if(VLLM_CPP_TRITON)
   # A separate process guarantees this race test reaches the generated module
   # loaders before another gate-shape GDN case can warm them.

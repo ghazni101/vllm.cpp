@@ -27,6 +27,7 @@
 // tail-biting 16-bit window, `+ 256*bits` wrap), lifted to a per-lane
 // 4-word register span so each lane touches each tile once.
 #include <hip/hip_runtime.h>
+#include "rocm_env.h"
 #include <hip/hip_fp16.h>
 
 #include <algorithm>
@@ -100,12 +101,6 @@ __device__ __forceinline__ uint32_t Exl3SpanCodeword6(
 // in-warp shuffles of the words its neighbours hold — every tile byte is
 // fetched exactly once, unlike the per-lane span load which reads each
 // shared word four or five times.
-template <int BITS>
-struct DotTileWords {
-  // For BITS==4: w[j] for j in 0..2 fetched by shuffling tile word
-  // (i00+j) & 31 from lane (i00+j)&31 — i.e. the lane that loaded it.
-  // For BITS==6: word index w spans 0..47; lanes 0..15 also hold w+16.
-};
 
 // Fetch tile word `word` (a runtime index into the tile) from whichever
 // lane loaded it. BITS==4: word is already < 32, so one shuffle. BITS==6:
@@ -201,9 +196,7 @@ __device__ __forceinline__ uint32_t LoadH2(const half* p) {
 // warp owns the SAME tile and a disjoint k-slice; the epilogue folds the
 // eight warp partials through LDS (a plain store when the host k-split is
 // 1, atomicAdd when several blocks each produced a partial).
-// NW: warps per block. The lane mapping is wave32 either way; a second
-// instantiation at 512 halves each warp's k-walk for shapes that already
-// have enough blocks (the lm_head's 16000).
+// NW: warps per block, 8 throughout — the only instantiation (block 256).
 template <int BITS, int NW = 8, int CBT = -1>
 __global__ __launch_bounds__(NW * 32) void Exl3DotKImpl(
     const half* __restrict__ A, const uint16_t* __restrict__ B,
@@ -251,21 +244,20 @@ __global__ __launch_bounds__(NW * 32) void Exl3DotKImpl(
         // every shared word four or five times.
         uint32_t ring[4][2] = {};
         uint32_t aring[4][2] = {};  // A pairs (a01, a89) for the same slot
-        uint32_t adump0, adump1;
-        auto ld_tile = [&](int kt, uint32_t& o0, uint32_t& o1,
-                           uint32_t& a0, uint32_t& a1) {
+        auto ld_tile_b = [&](int kt, uint32_t& o0, uint32_t& o1) {
           const uint32_t* tp =
               B32 + ((size_t)kt * ntiles + tile) * words32;
           o0 = tp[lane];
           if constexpr (BITS == 6)
             o1 = (lane < 16) ? tp[lane + 32] : 0u;
+        };
+        auto ld_tile = [&](int kt, uint32_t& o0, uint32_t& o1,
+                           uint32_t& a0, uint32_t& a1) {
+          ld_tile_b(kt, o0, o1);
           if (size_m == 1 && BITS == 6) {
             a0 = LoadH2(A + kt * 16 + r0);
             a1 = LoadH2(A + kt * 16 + r0 + 8);
           }
-        };
-        auto ld_tile3 = [&](int kt, uint32_t& o0, uint32_t& o1) {
-          ld_tile(kt, o0, o1, adump0, adump1);
         };
 #pragma unroll
         for (int d = 0; d < 4; ++d)
@@ -330,9 +322,11 @@ __global__ __launch_bounds__(NW * 32) void Exl3DotKImpl(
             if (lane < 16) sh_tile[warp][48 + 32 + lane] = c1b;
             __syncwarp();
             const int i0v = i00 % words32;
-            uint32_t wa[5], wb[5];
+            // Exl3SpanCodeword6's widest index is (eb+15)>>5 = 2 for s<=7 —
+            // three words carry the whole 16-bit codeword span.
+            uint32_t wa[3], wb[3];
 #pragma unroll
-            for (int u = 0; u < 5; ++u) {
+            for (int u = 0; u < 3; ++u) {
               wa[u] = sh_tile[warp][(i0v + u) % words32];
               wb[u] = sh_tile[warp][48 + (i0v + u) % words32];
             }
@@ -379,9 +373,9 @@ __global__ __launch_bounds__(NW * 32) void Exl3DotKImpl(
             if (lane < 16) sh_tile[warp][32 + lane] = c1;
             __syncwarp();
             const int i0v = i00 % words32;
-            uint32_t w[5];
+            uint32_t w[3];
 #pragma unroll
-            for (int u = 0; u < 5; ++u)
+            for (int u = 0; u < 3; ++u)
               w[u] = sh_tile[warp][(i0v + u) % words32];
             __syncwarp();
             half2 wv2[4];
@@ -405,7 +399,7 @@ __global__ __launch_bounds__(NW * 32) void Exl3DotKImpl(
               ring[d][0] = ring[d + 1][0];
               ring[d][1] = ring[d + 1][1];
             }
-            if (kt + 4 < kt1) ld_tile3(kt + 4, ring[3][0], ring[3][1]);
+            if (kt + 4 < kt1) ld_tile_b(kt + 4, ring[3][0], ring[3][1]);
 
             // Assemble the lane's three-word span from the warp's words.
             const int i0v = i00 % words32;  // span word 0's tile index
@@ -557,13 +551,15 @@ bool Exl3DotTryLaunchRocm(hipStream_t st, const Tensor& a_had, const Tensor& tre
   // ksplit block-level slices for deeper parallelism on narrow shapes. The
   // atomic tail needs a zeroed C, which is why raw scratch zeroing happens
   // here and not in the kernel.
-  static const int kKsplitEnv = [] {
-    const char* e = std::getenv("VT_EXL3_DOT_KSPLIT");
-    return e ? std::atoi(e) : 0;
-  }();
+  static const int kKsplitEnv = EnvIntStrict("VT_EXL3_DOT_KSPLIT", 0);
   int ksplit = 1;
   while (ntiles * ksplit < 128 && (size_k / 16) / (ksplit * 2) >= 8) ksplit <<= 1;
-  if (kKsplitEnv > 0) ksplit = kKsplitEnv;  // tuning probe, not a contract
+  if (kKsplitEnv > 0) {
+    // Tuning probe, not a contract — still capped: an unbounded split makes
+    // ntiles*ksplit grid.x and the in-kernel kslice*NW bounds overflow int.
+    const int cap = std::max(1, static_cast<int>((size_k / 16) / 8));
+    ksplit = std::min(kKsplitEnv, std::min(cap, 1 << 20));
+  }
   if (ksplit > 1)
     CheckD(hipMemsetAsync(raw, 0, (size_t)size_m * size_n * sizeof(float), st),
            "exl3_dot zero");
@@ -594,6 +590,7 @@ bool Exl3DotTryLaunchRocm(hipStream_t st, const Tensor& a_had, const Tensor& tre
                          dim3(static_cast<unsigned>(ntiles * ksplit)),
                          dim3(block_sz), kargs, 0, st),
          "exl3_dot launch");
+  CheckD(hipGetLastError(), "exl3_dot launch");
   return true;
 }
 
