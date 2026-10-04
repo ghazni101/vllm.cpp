@@ -159,6 +159,16 @@ __device__ __forceinline__ half2 Exl3DecodePair6(uint32_t cwa, uint32_t cwb,
   return __hadd2(__lows2half2(ha, hb), __highs2half2(ha, hb));
 }
 
+// Codebook-resolved twin of Exl3DecodePair6 for the one codebook the served
+// 6 bpw row uses: the cb dispatch leaves the m=1 loop body and the pair decode
+// is `Exl3DecodePairCb2Dp4a` directly. Every other codebook keeps the
+// runtime-cb form, so the cb 0/1 arithmetic is not duplicated here.
+template <int CBS>
+__device__ __forceinline__ half2 Exl3DecodePair6C(uint32_t cwa, uint32_t cwb) {
+  static_assert(CBS == 2, "only the mul1 codebook has a compile-time twin");
+  return Exl3DecodePairCb2Dp4a(cwa, cwb);
+}
+
 // Two adjacent fp16 activations as one u32 load. RowMajorIndex places each
 // lane's k-rows at r0+{0,1} and r0+{8,9}, both adjacent pairs — so the m-loop
 // reads two u32 words per (tile, m) instead of eight scalar f16 loads.
@@ -194,7 +204,7 @@ __device__ __forceinline__ uint32_t LoadH2(const half* p) {
 // NW: warps per block. The lane mapping is wave32 either way; a second
 // instantiation at 512 halves each warp's k-walk for shapes that already
 // have enough blocks (the lm_head's 16000).
-template <int BITS, int NW = 8>
+template <int BITS, int NW = 8, int CBT = -1>
 __global__ __launch_bounds__(NW * 32) void Exl3DotKImpl(
     const half* __restrict__ A, const uint16_t* __restrict__ B,
     float* __restrict__ C, int size_m, int size_k, int size_n, int bits_rt, int cb,
@@ -268,6 +278,28 @@ __global__ __launch_bounds__(NW * 32) void Exl3DotKImpl(
           // per loop iteration leaves the warp issue-idle on ALU latency.
           // Two tiles per iteration give the scheduler two independent
           // chains; the ring already covers their loads.
+          // Roving pointers: consecutive kt of one tile column sit ntiles
+          // tiles apart (a full k-ROW — 2.98 MB at the lm_head), so the
+          // per-load (size_t)kt * ntiles * words32 mad chain collapses to a
+          // pointer add. Same addresses, same words, same math.
+          const size_t krow = (size_t)ntiles * words32;
+          const uint32_t* tp0 = B32 + ((size_t)kt0 * ntiles + tile) * words32;
+          const half* ap0 = A + (size_t)kt0 * 16 + r0;
+          const uint32_t* tpf = tp0 + 4 * krow;
+          const half* apf = ap0 + 4 * 16;
+          auto ld_tile_r = [&](const uint32_t* tp, const half* ap, uint32_t& o0,
+                               uint32_t& o1, uint32_t& a0, uint32_t& a1) {
+            o0 = tp[lane];
+            o1 = (lane < 16) ? tp[lane + 32] : 0u;
+            a0 = LoadH2(ap);
+            a1 = LoadH2(ap + 8);
+          };
+          auto dec6 = [&](uint32_t a, uint32_t b) -> half2 {
+            if constexpr (CBT >= 0)
+              return Exl3DecodePair6C<CBT>(a, b);
+            else
+              return Exl3DecodePair6(a, b, cb);
+          };
           int kt = kt0;
           for (; kt + 1 < kt1; kt += 2) {
             uint32_t c0a = ring[0][0], c1a = ring[0][1];
@@ -285,9 +317,12 @@ __global__ __launch_bounds__(NW * 32) void Exl3DotKImpl(
               aring[d][1] = aring[d + 2][1];
             }
             if (kt + 4 < kt1)
-              ld_tile(kt + 4, ring[2][0], ring[2][1], aring[2][0], aring[2][1]);
+              ld_tile_r(tpf, apf, ring[2][0], ring[2][1], aring[2][0], aring[2][1]);
             if (kt + 5 < kt1)
-              ld_tile(kt + 5, ring[3][0], ring[3][1], aring[3][0], aring[3][1]);
+              ld_tile_r(tpf + krow, apf + 16, ring[3][0], ring[3][1], aring[3][0],
+                        aring[3][1]);
+            tpf += 2 * krow;
+            apf += 32;
 
             sh_tile[warp][lane] = c0a;
             if (lane < 16) sh_tile[warp][32 + lane] = c1a;
@@ -306,12 +341,10 @@ __global__ __launch_bounds__(NW * 32) void Exl3DotKImpl(
             half2 wv2a[4], wv2b[4];
 #pragma unroll
             for (int q = 0; q < 4; ++q) {
-              wv2a[q] = Exl3DecodePair6(Exl3SpanCodeword6(wa, lane, 2 * q),
-                                        Exl3SpanCodeword6(wa, lane, 2 * q + 1),
-                                        cb);
-              wv2b[q] = Exl3DecodePair6(Exl3SpanCodeword6(wb, lane, 2 * q),
-                                        Exl3SpanCodeword6(wb, lane, 2 * q + 1),
-                                        cb);
+              wv2a[q] = dec6(Exl3SpanCodeword6(wa, lane, 2 * q),
+                             Exl3SpanCodeword6(wa, lane, 2 * q + 1));
+              wv2b[q] = dec6(Exl3SpanCodeword6(wb, lane, 2 * q),
+                             Exl3SpanCodeword6(wb, lane, 2 * q + 1));
             }
 
             const half2 a01a = __builtin_bit_cast(half2, a0a);
@@ -339,7 +372,9 @@ __global__ __launch_bounds__(NW * 32) void Exl3DotKImpl(
             }
             aring[3][0] = a0t; aring[3][1] = a1t;  // placeholder, load below
             if (kt + 4 < kt1)
-              ld_tile(kt + 4, ring[3][0], ring[3][1], aring[3][0], aring[3][1]);
+              ld_tile_r(tpf, apf, ring[3][0], ring[3][1], aring[3][0], aring[3][1]);
+            tpf += krow;
+            apf += 16;
             sh_tile[warp][lane] = c0;
             if (lane < 16) sh_tile[warp][32 + lane] = c1;
             __syncwarp();
@@ -352,9 +387,8 @@ __global__ __launch_bounds__(NW * 32) void Exl3DotKImpl(
             half2 wv2[4];
 #pragma unroll
             for (int q = 0; q < 4; ++q)
-              wv2[q] = Exl3DecodePair6(Exl3SpanCodeword6(w, lane, 2 * q),
-                                       Exl3SpanCodeword6(w, lane, 2 * q + 1),
-                                       cb);
+              wv2[q] = dec6(Exl3SpanCodeword6(w, lane, 2 * q),
+                            Exl3SpanCodeword6(w, lane, 2 * q + 1));
             const half2 a01 = __builtin_bit_cast(half2, a0t);
             const half2 a89 = __builtin_bit_cast(half2, a1t);
             acc[0][0] = amd_mixed_dot(wv2[0], a01, acc[0][0], false);
@@ -549,6 +583,8 @@ bool Exl3DotTryLaunchRocm(hipStream_t st, const Tensor& a_had, const Tensor& tre
   unsigned block_sz = 256;
   if (bits == 4) {
     kernel = reinterpret_cast<const void*>(&Exl3DotKImpl<4, 8>);
+  } else if (bits == 6 && cb == 2) {
+    kernel = reinterpret_cast<const void*>(&Exl3DotKImpl<6, 8, 2>);
   } else if (bits == 6) {
     kernel = reinterpret_cast<const void*>(&Exl3DotKImpl<6, 8>);
   } else {
