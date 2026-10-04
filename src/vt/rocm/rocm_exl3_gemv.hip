@@ -832,7 +832,7 @@ __device__ __forceinline__ void GemvFoldOutTail(const float* C, int group, void*
 // SASS: 296 ds_bpermute + 256 pk_fma + 156 mov_b16 + 124 and per 4-slice),
 // and accumulates in f32 instead of the fragment's f16 — strictly nearer the
 // CPU reference, not looser.
-template <int bits, int cb, bool FOLD>
+template <int bits, int cb, bool FOLD, int WNT_ = 2, int PF_ = 2>
 __global__ __launch_bounds__(512) void Exl3GemvM1K(
     const half* __restrict__ A, const uint16_t* __restrict__ B, float* __restrict__ C,
     int size_m, int size_k, int size_n, void* fold_out, const uint16_t* fold_post,
@@ -840,8 +840,16 @@ __global__ __launch_bounds__(512) void Exl3GemvM1K(
   (void)size_m;  // m==1 is a launch-time fact; keeping Exl3GemvK's leading
                  // arg list so the launcher shares one kargs prefix.
   constexpr int WK = 16;   // k-split (warps per block)
-  constexpr int WNT = 2;   // adjacent n-tiles per warp
-  constexpr int PF = 2;    // prefetch ring depth (2 beat 1/3/4/6/8 on gfx1100)
+  // Adjacent n-tiles per warp. The 3 bpw row takes WNT=4 where it measures
+  // faster: eight independent v_dot2 accumulator chains per warp instead of
+  // four, and the per-slice A half-pairs are reused across twice the trellis
+  // words. Bench3/gemvbench on gfx1100: k=5120 n=17408 640 -> 696 GB/s
+  // (+8.8%), k=17408 n=5120 423 -> 606 GB/s (+42%), occupancy 4 -> 3
+  // blocks/CU (50 -> 82-86 VGPR, 2 -> 4 KiB smem). The 2 bpw row and the
+  // 4 bpw wide-load arm keep their own widths.
+  constexpr int WNT = WNT_;
+  constexpr int PF = PF_;  // prefetch ring depth (2 beat 1/3/4/6/8 on gfx1100;
+                           // 3 for the 3 bpw row on long per-warp k-chunks)
   constexpr int COLS = WNT * 16;
 
   constexpr int TWORDS = 8 * bits;                  // uint32 per 16x16 tile
@@ -1468,14 +1476,40 @@ constexpr bool GemvArmInstantiated(int bits, int cb) {
          ((bits == 2 || bits == 3) && (cb == 1 || cb == 2));
 }
 
-const void* GemvM1KernelFor(int bits, int cb, bool fold) {
+// 3 bpw m=1 arm shape policy (see the WNT note on Exl3GemvM1K). Both switches
+// are measured: the deeper prefetch ring pays only where the per-warp k-chunk
+// is long, and the wide (64-column) form is taken where the extra ILP beats
+// the shorter grid it leaves. `VT_EXL3_M1K3_WNT=2` restores the narrow form
+// as the same-binary A/B.
+constexpr int kGemvM1LongChunk = 40;  // 16-row k-slices per warp
+bool GemvM1K3Wide(int bits, int size_n) {
+  if (bits != 3) return false;
+  static const int mode = [] {
+    const char* e = std::getenv("VT_EXL3_M1K3_WNT");
+    return e ? std::atoi(e) : 0;
+  }();
+  if (mode == 2) return false;
+  return size_n >= 8192;
+}
+bool GemvM1K3Pf3(int bits, int size_k, int ksplit) {
+  if (bits != 3) return false;
+  const int kslices = size_k / 16;
+  const int chunk = (kslices + 16 * ksplit - 1) / (16 * ksplit);
+  return chunk >= kGemvM1LongChunk;
+}
+
+const void* GemvM1KernelFor(int bits, int cb, bool fold, int size_k, int size_n,
+                            int ksplit) {
   // The direct m=1 arm's instantiation set is the non-WMMA half of upstream's
   // selector table minus its smem rows (this kernel stages nothing). `fold`
   // selects the output-transform epilogue twin of each row.
-#define VT_GEMV_M1(bits_, cb_)                                              \
+#define VT_GEMV_M1N(bits_, cb_, wnt_, pf_)                                  \
   if (bits == bits_ && cb == cb_)                                           \
-    return fold ? reinterpret_cast<const void*>(&Exl3GemvM1K<bits_, cb_, true>) \
-                : reinterpret_cast<const void*>(&Exl3GemvM1K<bits_, cb_, false>);
+    return fold                                                            \
+               ? reinterpret_cast<const void*>(                             \
+                     &Exl3GemvM1K<bits_, cb_, true, wnt_, pf_>)              \
+               : reinterpret_cast<const void*>(                             \
+                     &Exl3GemvM1K<bits_, cb_, false, wnt_, pf_>);
 #define VT_GEMV_M1W4(bits_, cb_)                                            \
   if (bits == bits_ && cb == cb_)                                           \
     return fold ? reinterpret_cast<const void*>(&Exl3GemvM1K4<cb_, true>)  \
@@ -1484,10 +1518,18 @@ const void* GemvM1KernelFor(int bits, int cb, bool fold) {
   // its codeword-span arithmetic is the 4 bpw window math; 2/3 bpw keep the
   // dq8-mapping arm.
   VT_GEMV_M1W4(4, 0) VT_GEMV_M1W4(4, 1) VT_GEMV_M1W4(4, 2)
-  VT_GEMV_M1(2, 1) VT_GEMV_M1(2, 2)
-  VT_GEMV_M1(3, 1) VT_GEMV_M1(3, 2)
+  VT_GEMV_M1N(2, 1, 2, 2) VT_GEMV_M1N(2, 2, 2, 2)
+  if (GemvM1K3Wide(bits, size_n)) {
+    if (GemvM1K3Pf3(bits, size_k, ksplit)) {
+      VT_GEMV_M1N(3, 1, 4, 3) VT_GEMV_M1N(3, 2, 4, 3)
+    } else {
+      VT_GEMV_M1N(3, 1, 4, 2) VT_GEMV_M1N(3, 2, 4, 2)
+    }
+  } else {
+    VT_GEMV_M1N(3, 1, 2, 2) VT_GEMV_M1N(3, 2, 2, 2)
+  }
 #undef VT_GEMV_M1W4
-#undef VT_GEMV_M1
+#undef VT_GEMV_M1N
   return nullptr;
 }
 template <bool ABf16>
@@ -1817,12 +1859,14 @@ bool Exl3GemvTryLaunchRocm(hipStream_t st, const Tensor& a_had, const Tensor& tr
   } else if (mmode == 0 && !wmma && kCfgEnv < 0 &&
              (int64_t)size_k * size_n * args.bits / 8 <= INT32_MAX) {
     // The bound is M1BufferRsrc's int num_records.
-    kernel = GemvM1KernelFor(args.bits, args.codebook, fold_ok);
+    kernel = GemvM1KernelFor(args.bits, args.codebook, fold_ok, size_k, size_n,
+                             ksplit);
     m1_direct = kernel != nullptr;
     block_dim = 512;
-    // M1K4's warp owns a four-tile group (64 columns); the dq8 arm's warp
-    // covers two tiles (32).
-    cols = (args.bits == 4) ? 64 : 32;
+    // The wide-load arms' warp owns a four-tile group (64 columns); the narrow
+    // dq8 arm covers two tiles (32). The 3 bpw row follows GemvM1K3Wide's
+    // choice, so cols and the selected kernel can never disagree.
+    cols = (args.bits == 4 || GemvM1K3Wide(args.bits, size_n)) ? 64 : 32;
   } else {
     kernel = cfg == 0 ? narrow
                       : GemvKernelFor(args.bits, args.codebook, mmode, cfg, smem,
