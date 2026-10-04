@@ -1844,7 +1844,20 @@ bool Exl3GemvTryLaunchRocm(hipStream_t st, const Tensor& a_had, const Tensor& tr
                  block_dim);
   if (kernel == nullptr) return false;
 
-  const int max_blocks = GemvOccupancyRocm(kernel, block_dim) * num_sms;
+  // Lab diagnostic: VT_EXL3_GEMV_OCC=1 prints the resolved occupancy once per
+  // (kernel, block) pair alongside the launch line. Off by default.
+  static const bool kOcc = [] {
+    const char* e = std::getenv("VT_EXL3_GEMV_OCC");
+    return e != nullptr && e[0] == '1';
+  }();
+  const int occ_blocks = GemvOccupancyRocm(kernel, block_dim);
+  if (kOcc)
+    std::fprintf(stderr,
+                 "[exl3_gemv occ] m=%d k=%d n=%d bits=%d cb=%d block=%d occ=%d\n",
+                 size_m, size_k, size_n, args.bits, args.codebook, block_dim,
+                 occ_blocks);
+
+  const int max_blocks = occ_blocks * num_sms;
   const int grid = GemvGridForGroups(size_n / cols, max_blocks);
   if (grid < 1) return false;
 
