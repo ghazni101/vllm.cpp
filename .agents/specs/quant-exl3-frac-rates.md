@@ -11,8 +11,10 @@ Oracle pin: `exllamav3` @ image `exllamav3-rocm:git-679835b7-rocm10.0.0` —
 vLLM implements no EXL3 at the parity pin; the format is mirrored from the
 registered secondary oracle. This image is the first pinned revision carrying
 `exllamav3_ext/quant/frac.cu` + `dq8_half` (the earlier `git-584dd44f` pin
-predates them). Gateability is owed under `## Owed` until the container
-demonstrably loads the checkpoint below.
+predates them). Gateability was measured 2026-10-05 on gfx1100: the image
+loads this checkpoint and greedy-decodes coherent output (~24 tok/s); token
+goldens for the E2E gate are `orca_golden_{0,1}.json` beside this spec, and
+the evidence is recorded in `.agents/oracles/exllamav3.md`'s AMD addendum.
 
 ## The gap
 
@@ -96,6 +98,9 @@ falls to the generic path).
   oracle image `exllamav3-rocm:git-679835b7-rocm10.0.0`, identical prompt and
   sampling. Token-exact is the gate; a distributional waiver needs an explicit
   recorded reason.
+  The prompts are exactly the two the goldens were captured against: a
+  Fibonacci-function request and a two-sentence hash-map explanation under
+  the ChatML `chatml` format with "You are a helpful assistant."
 
 ## Risks
 
@@ -120,8 +125,9 @@ falls to the generic path).
 
 ## Owed
 
-- Oracle gateability measurement for `git-679835b7` on this checkpoint (the
-  pin file under `.agents/oracles/` records `gateable = no` until run).
+- ~~Oracle gateability~~ DONE 2026-10-05: image `git-679835b7` loads and
+  serves OrcaSAQ-3.21bpw on gfx1100; goldens `orca_golden_{0,1}.json`; see
+  `.agents/oracles/exllamav3.md` AMD addendum.
 - Frac GEMV m=1 arm (`rocm_exl3_gemv.hip`) and frac reconstruct arm
   (`rocm_exl3_recon.hip`).
 - CUDA frac arm (`cuda_exl3.cu`) and the corresponding CUDA dispatch rows.
