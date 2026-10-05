@@ -99,3 +99,17 @@ is bits==5's runtime e0, handled without spilling the window array) and
 measures 3.98 ms/token (~600 GB/s). Residual gap to the oracle is the
 launch-bound ceiling (88k kernel dispatches per 60 tokens through the
 captured graph) — the same class ISSUE-GH-2164 names for gfx1100.
+
+2026-10-05 (later) — the earlier "fixed by 005e113a8" note was WRONG for the
+serving path. The step-index mix only reaches the sampler through
+SamplingMetadata.num_computed_tokens, and make_sampling_metadata's cache
+(only rebuilt on sampling_metadata_dirty_, i.e. batch mutations) froze that
+field at the admission value for the request's whole decode — so the fresh
+noise never arrived and the loop survived. Commit 9be3c294b refreshes the
+field on every call. Evidence the fix engages: the SC-4.00bpw chatty loop
+prompts (voxel pagoda / business website) hit a 235x and 104x 8-gram repeat
+at default sampling on the pre-fix binary and run clean (rep8x1) after;
+on 3.5bpw the same prompt went 2/5 loops -> 0/6. The exllamav3 oracle stays
+0/9 — the attractor is real in the checkpoint (aligned logits), but the
+frozen-noise pump is what reliably locked it in. Resolution stands: engine
+defect, now actually fixed.
