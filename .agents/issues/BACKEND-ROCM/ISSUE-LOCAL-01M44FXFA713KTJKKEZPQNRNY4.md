@@ -79,3 +79,23 @@ requests stay byte-identical, and all five sampler tests pass
 test_dspark_sample, test_rocm_sample_scratch). The earlier oracle-logit
 parity evidence stands — the FORWARD was always correct; the defect was
 in what the sampler did with the distribution.
+
+2026-10-05 perf — served-decode speed on this checkpoint is NOT a code
+regression; it is the 5 bpw arm gap plus a bytes-bound model. Measured on
+the SAME binary (HEAD+fix): 3.5bpw checkpoint 30.2 tok/s, SC 4.00bpw
+(mixed 3/4/5/6 bpw, ~14 GB) 27.8 tok/s after the fix below. Every prior
+binary measured — vllmcpp:git-head (85f2d8ea8), tip-rocm-exl3perf
+(ecd81113c), and a fresh rebuild of 85f2d8ea8 — runs the 3.5bpw
+checkpoint at ~18 tok/s, so HEAD is the FASTEST binary this branch has
+had; the ~40 tok/s the user remembered is the exllamav3 oracle's rate
+(38.5 tok/s measured on this checkpoint), not a vllm.cpp figure.
+
+rocprofv3 decode census (60 tokens, graph captured): device-busy 23.5
+ms/token; argmax-to-argmax 29.3 ms. The 5 bpw generic arm
+(Exl3DotKImpl<0,8>) alone was 13.84 ms/token — per-lane span loads
+re-reading each tile word 4-5x. Commit 3e86169ce instantiates the
+coalesced <5,8> / <5,8,2> rows (shared with the 6 bpw arm; the new shape
+is bits==5's runtime e0, handled without spilling the window array) and
+measures 3.98 ms/token (~600 GB/s). Residual gap to the oracle is the
+launch-bound ceiling (88k kernel dispatches per 60 tokens through the
+captured graph) — the same class ISSUE-GH-2164 names for gfx1100.
