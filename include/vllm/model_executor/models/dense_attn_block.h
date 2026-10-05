@@ -321,6 +321,16 @@ inline Tensor ResidentWeight(Dev d, const OwnedTensor& w, std::vector<int64_t> s
 
 // y[M,N] = x[M,K] @ dequant(w), with `out_dtype` the CALLER's choice.
 //
+// The reconstruct routing decision, split out so a host test can pin it
+// (tests/vt/test_exl3_matmul_dispatch.cpp): a frac tensor (`w.half`, K+0.5
+// rate) has NO reconstruct arm (spec quant-exl3-frac-rates.md `## Owed`), so it
+// must serve through the cooperative `Exl3Gemm` at every M — the model seam
+// mirrors `rocm_exl3.hip` `want_recon`'s `!args.half`.
+inline bool Exl3WantsReconstruct(int64_t m, const Exl3Weight& w,
+                                 bool reconstruct_registered) {
+  return m > 144 && !w.half && reconstruct_registered;
+}
+
 // The activation is staged to fp16 because `vt::Exl3Gemm` reads it as fp16 and
 // nothing else — the CPU arm calls `HadRows(HadIo::kHalfHalf, ...)` on `a`
 // (`cpu_exl3_kernels.cpp:205`) and the device arm stages `a_had` in fp16, since
@@ -349,9 +359,12 @@ inline DBuf Exl3MatmulD(Dev d, const vt::Tensor& x, const Exl3Weight& w,
   // separate passes — so on ROCm a bf16 activation and a bf16 request skip
   // both staging launches. The reconstruct arm (M > 144, its own Hadamard
   // path) still wants the f16 staging, as does every other backend.
+  // A frac tensor (`w.half`, K+0.5 rate) has NO reconstruct arm (spec
+  // quant-exl3-frac-rates.md `## Owed`), so it never routes there — the model
+  // seam mirrors `rocm_exl3.hip` `want_recon`'s `!args.half`.
   const bool use_reconstruct_check =
-      M > 144 &&
-      vt::OpRegistered(vt::OpId::kExl3ReconstructGemm, d.q.device.type);
+      vllm::dense_attn::Exl3WantsReconstruct(
+          M, w, vt::OpRegistered(vt::OpId::kExl3ReconstructGemm, d.q.device.type));
   const bool rocm_direct_bf16 =
       d.q.device.type == vt::DeviceType::kROCM && !use_reconstruct_check;
   DBuf a_owned;

@@ -3114,7 +3114,6 @@ vllm_cpp_add_test(test_exl3_rocm vt/test_exl3_rocm.cpp)
 # ROCm. Same always-built rule as its sibling above -- cases skip without a
 # ROCm backend.
 vllm_cpp_add_test(test_exl3_rocm_gemv vt/test_exl3_rocm_gemv.cpp)
-vllm_cpp_add_test(scratch_lenprobe vt/scratch_lenprobe.cpp)
 # The same arms with the opt-in fused in-had m=1 arm on: every n >= 12288
 # 4 bpw shape then runs Exl3GemvM1K4Fused instead of GEMV + separate HadK.
 add_test(NAME test_exl3_rocm_gemv_fused COMMAND test_exl3_rocm_gemv)
