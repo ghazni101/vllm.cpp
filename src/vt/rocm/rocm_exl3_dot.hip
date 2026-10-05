@@ -87,12 +87,28 @@ __device__ __forceinline__ uint32_t Exl3SpanCodeword4(
 }
 
 // bits==6: e0 = (48*l + 1526) & 31 = 22 (even lane) or 6 (odd lane) — two
-// compile-time residue patterns selected on lane parity.
+// compile-time residue patterns selected on lane parity. bits==5: e0 =
+// (40*l + 1269) & 31 = (8*l - 11) & 31 — four patterns ({21,29,5,13} for
+// l%4 = 0..3), runtime e0 but still a three-word window. The `bits`
+// arithmetic is compile-time; only the window base varies.
+template <int BITS>
 __device__ __forceinline__ uint32_t Exl3SpanCodeword6(
     const uint32_t w[kDotSpanWords], int lane, int s) {
-  const int e0 = 22 - 16 * (lane & 1);
-  const int eb = e0 + s * 6;
+  const int e0 = BITS == 6 ? 22 - 16 * (lane & 1)
+                           : (BITS == 5 ? (8 * lane - 11) & 31 : 0);
+  const int eb = e0 + s * BITS;
   return __funnelshift_r(w[(eb + 15) >> 5], w[eb >> 5], 48 - (eb & 31));
+}
+
+// The same extraction with the two words fetched by the caller: for
+// bits==5, e0 is a runtime value (four lane patterns), so indexing a
+// register array w[] by eb>>5 would spill it to scratch. The caller fetches
+// the tile words the window needs and passes them as w_lo = span word eb>>5
+// and w_hi = span word (eb+15)>>5.
+__device__ __forceinline__ uint32_t Exl3SpanCodewordDyn(
+    uint32_t w_lo, uint32_t w_hi, int e0, int s, int bits) {
+  const int eb = e0 + s * bits;
+  return __funnelshift_r(w_hi, w_lo, 48 - (eb & 31));
 }
 
 // Coalesced tile fetch for the templated arms: lane l loads tile word l
@@ -186,7 +202,7 @@ __device__ __forceinline__ uint32_t LoadH2(const half* p) {
 // A is read straight from global: a row is at most 8*size_k*2 bytes and
 // stays L1/L2-resident across the n loop, so the per-tile activation reads
 // are hits, not traffic.
-// BITS is a template parameter: the checkpoint's 4 and 6 bpw decode with
+// BITS is a template parameter: the checkpoint's 4, 5 and 6 bpw decode with
 // compile-time shifts, and the generic arm (BITS==0) keeps runtime `bits`
 // for every width the templated instantiations do not cover.
 // Block = 256 threads (8 warps), ONE 16-column tile per block: the eight
@@ -238,7 +254,7 @@ __global__ __launch_bounds__(NW * 32) void Exl3DotKImpl(
     // tile = blockIdx.x % ntiles over a grid of ntiles*ksplit blocks, so
     // every block owns a valid tile; no guard is needed here.
     {
-      if constexpr (BITS == 4 || BITS == 6) {
+      if constexpr (BITS == 4 || BITS == 5 || BITS == 6) {
         // Coalesced fetch: the warp reads the tile's words32 u32s exactly
         // once — lane l holds word l, plus word 32+l for bits==6 — and the
         // lane's codeword span is assembled by shuffling its neighbours'
@@ -250,13 +266,13 @@ __global__ __launch_bounds__(NW * 32) void Exl3DotKImpl(
           const uint32_t* tp =
               B32 + ((size_t)kt * ntiles + tile) * words32;
           o0 = tp[lane];
-          if constexpr (BITS == 6)
-            o1 = (lane < 16) ? tp[lane + 32] : 0u;
+          if constexpr (BITS > 4)
+            o1 = (lane < BITS * 8 - 32) ? tp[lane + 32] : 0u;
         };
         auto ld_tile = [&](int kt, uint32_t& o0, uint32_t& o1,
                            uint32_t& a0, uint32_t& a1) {
           ld_tile_b(kt, o0, o1);
-          if (size_m == 1 && BITS == 6) {
+          if (size_m == 1 && BITS > 4) {
             a0 = LoadH2(A + kt * 16 + r0);
             a1 = LoadH2(A + kt * 16 + r0 + 8);
           }
@@ -266,7 +282,7 @@ __global__ __launch_bounds__(NW * 32) void Exl3DotKImpl(
           if (kt0 + d < kt1)
             ld_tile(kt0 + d, ring[d][0], ring[d][1], aring[d][0], aring[d][1]);
 
-        if (size_m == 1 && BITS == 6) {
+        if (size_m == 1 && BITS > 4) {
           // m=1 (the lm_head): decode is a per-lane serial chain — 8 codewords
           // per tile through funnel-shift + Exl3DecodeCodeword — so one tile
           // per loop iteration leaves the warp issue-idle on ALU latency.
@@ -284,7 +300,7 @@ __global__ __launch_bounds__(NW * 32) void Exl3DotKImpl(
           auto ld_tile_r = [&](const uint32_t* tp, const half* ap, uint32_t& o0,
                                uint32_t& o1, uint32_t& a0, uint32_t& a1) {
             o0 = tp[lane];
-            o1 = (lane < 16) ? tp[lane + 32] : 0u;
+            o1 = (lane < BITS * 8 - 32) ? tp[lane + 32] : 0u;
             a0 = LoadH2(ap);
             a1 = LoadH2(ap + 8);
           };
@@ -319,29 +335,62 @@ __global__ __launch_bounds__(NW * 32) void Exl3DotKImpl(
             apf += 32;
 
             sh_tile[warp][lane] = c0a;
-            if (lane < 16) sh_tile[warp][32 + lane] = c1a;
+            if (lane < BITS * 8 - 32) sh_tile[warp][32 + lane] = c1a;
             sh_tile[warp][48 + lane] = c0b;
-            if (lane < 16) sh_tile[warp][48 + 32 + lane] = c1b;
+            if (lane < BITS * 8 - 32) sh_tile[warp][48 + 32 + lane] = c1b;
             __syncwarp();
             const int i0v = i00 % words32;
             // Exl3SpanCodeword6's widest index is (eb+15)>>5 = 2 for s<=7 —
             // three words carry the whole 16-bit codeword span.
-            uint32_t wa[3], wb[3];
+            [[maybe_unused]] uint32_t wa[3], wb[3];
+            if constexpr (BITS != 5) {
 #pragma unroll
-            for (int u = 0; u < 3; ++u) {
-              wa[u] = sh_tile[warp][(i0v + u) % words32];
-              wb[u] = sh_tile[warp][48 + (i0v + u) % words32];
+              for (int u = 0; u < 3; ++u) {
+                wa[u] = sh_tile[warp][(i0v + u) % words32];
+                wb[u] = sh_tile[warp][48 + (i0v + u) % words32];
+              }
             }
             __syncwarp();
 
             half2 wv2a[4], wv2b[4];
 #pragma unroll
             for (int q = 0; q < 4; ++q) {
-              wv2a[q] = dec6(Exl3SpanCodeword6(wa, lane, 2 * q),
-                             Exl3SpanCodeword6(wa, lane, 2 * q + 1));
-              wv2b[q] = dec6(Exl3SpanCodeword6(wb, lane, 2 * q),
-                             Exl3SpanCodeword6(wb, lane, 2 * q + 1));
+              if constexpr (BITS == 5) {
+                // Runtime e0: fetch each codeword's two window words
+                // straight from LDS — indexing a register array by eb>>5
+                // would spill it, and ds_read is ~4 cycles bank-conflict
+                // free here.
+                const int ea = e0 + 2 * q * 5;
+                const int eaa = e0 + (2 * q + 1) * 5;
+                wv2a[q] = dec6(
+                    Exl3SpanCodewordDyn(
+                        sh_tile[warp][(i0v + (ea >> 5)) % 40],
+                        sh_tile[warp][(i0v + ((ea + 15) >> 5)) % 40],
+                        e0, 2 * q, 5),
+                    Exl3SpanCodewordDyn(
+                        sh_tile[warp][(i0v + (eaa >> 5)) % 40],
+                        sh_tile[warp][(i0v + ((eaa + 15) >> 5)) % 40],
+                        e0, 2 * q + 1, 5));
+                wv2b[q] = dec6(
+                    Exl3SpanCodewordDyn(
+                        sh_tile[warp][48 + (i0v + (ea >> 5)) % 40],
+                        sh_tile[warp][48 + (i0v + ((ea + 15) >> 5)) % 40],
+                        e0, 2 * q, 5),
+                    Exl3SpanCodewordDyn(
+                        sh_tile[warp][48 + (i0v + (eaa >> 5)) % 40],
+                        sh_tile[warp][48 + (i0v + ((eaa + 15) >> 5)) % 40],
+                        e0, 2 * q + 1, 5));
+              } else {
+                wv2a[q] = dec6(Exl3SpanCodeword6<BITS>(wa, lane, 2 * q),
+                               Exl3SpanCodeword6<BITS>(wa, lane, 2 * q + 1));
+                wv2b[q] = dec6(Exl3SpanCodeword6<BITS>(wb, lane, 2 * q),
+                               Exl3SpanCodeword6<BITS>(wb, lane, 2 * q + 1));
+              }
             }
+            // bits==5 reads sh_tile inside the decode loop above, past the
+            // last syncwarp — one more barrier before the next iteration's
+            // staging writes can begin.
+            if constexpr (BITS == 5) __syncwarp();
 
             const half2 a01a = __builtin_bit_cast(half2, a0a);
             const half2 a89a = __builtin_bit_cast(half2, a1a);
@@ -372,19 +421,38 @@ __global__ __launch_bounds__(NW * 32) void Exl3DotKImpl(
             tpf += krow;
             apf += 16;
             sh_tile[warp][lane] = c0;
-            if (lane < 16) sh_tile[warp][32 + lane] = c1;
+            if (lane < BITS * 8 - 32) sh_tile[warp][32 + lane] = c1;
             __syncwarp();
             const int i0v = i00 % words32;
-            uint32_t w[3];
+            [[maybe_unused]] uint32_t w[3];
+            if constexpr (BITS != 5) {
 #pragma unroll
-            for (int u = 0; u < 3; ++u)
-              w[u] = sh_tile[warp][(i0v + u) % words32];
+              for (int u = 0; u < 3; ++u)
+                w[u] = sh_tile[warp][(i0v + u) % words32];
+            }
             __syncwarp();
             half2 wv2[4];
 #pragma unroll
-            for (int q = 0; q < 4; ++q)
-              wv2[q] = dec6(Exl3SpanCodeword6(w, lane, 2 * q),
-                            Exl3SpanCodeword6(w, lane, 2 * q + 1));
+            for (int q = 0; q < 4; ++q) {
+              if constexpr (BITS == 5) {
+                const int ea = e0 + 2 * q * 5;
+                const int eaa = e0 + (2 * q + 1) * 5;
+                wv2[q] = dec6(
+                    Exl3SpanCodewordDyn(
+                        sh_tile[warp][(i0v + (ea >> 5)) % 40],
+                        sh_tile[warp][(i0v + ((ea + 15) >> 5)) % 40],
+                        e0, 2 * q, 5),
+                    Exl3SpanCodewordDyn(
+                        sh_tile[warp][(i0v + (eaa >> 5)) % 40],
+                        sh_tile[warp][(i0v + ((eaa + 15) >> 5)) % 40],
+                        e0, 2 * q + 1, 5));
+              } else {
+                wv2[q] = dec6(Exl3SpanCodeword6<BITS>(w, lane, 2 * q),
+                              Exl3SpanCodeword6<BITS>(w, lane, 2 * q + 1));
+              }
+            }
+            if constexpr (BITS == 5)
+              __syncwarp();  // sh_tile read above, written next iter
             const half2 a01 = __builtin_bit_cast(half2, a0t);
             const half2 a89 = __builtin_bit_cast(half2, a1t);
             acc[0][0] = amd_mixed_dot(wv2[0], a01, acc[0][0], false);
@@ -405,19 +473,32 @@ __global__ __launch_bounds__(NW * 32) void Exl3DotKImpl(
 
             // Assemble the lane's three-word span from the warp's words.
             const int i0v = i00 % words32;  // span word 0's tile index
-            uint32_t w[3];
-            w[0] = DotFetchWord<BITS>(c0, c1, i0v);
-            w[1] = DotFetchWord<BITS>(c0, c1, (i0v + 1) % words32);
-            w[2] = DotFetchWord<BITS>(c0, c1, (i0v + 2) % words32);
+            [[maybe_unused]] uint32_t w[3];
+            if constexpr (BITS != 5) {
+              w[0] = DotFetchWord<BITS>(c0, c1, i0v);
+              w[1] = DotFetchWord<BITS>(c0, c1, (i0v + 1) % words32);
+              w[2] = DotFetchWord<BITS>(c0, c1, (i0v + 2) % words32);
+            }
 
             float wv[8];
 #pragma unroll
             for (int s = 0; s < 8; ++s) {
               uint16_t cw;
-              if constexpr (BITS == 4)
+              if constexpr (BITS == 4) {
                 cw = Exl3SpanCodeword4(w, s);
-              else
-                cw = Exl3SpanCodeword6(w, lane, s);
+              } else if constexpr (BITS == 5) {
+                // Runtime e0: fetch the codeword's two window words via
+                // shuffles rather than indexing a register array — a dynamic
+                // w[] index would spill the array to scratch.
+                const int eb = e0 + s * 5;
+                const uint32_t wl =
+                    DotFetchWord<BITS>(c0, c1, (i0v + (eb >> 5)) % words32);
+                const uint32_t wh = DotFetchWord<BITS>(
+                    c0, c1, (i0v + ((eb + 15) >> 5)) % words32);
+                cw = Exl3SpanCodewordDyn(wl, wh, e0, s, 5);
+              } else {
+                cw = Exl3SpanCodeword6<BITS>(w, lane, s);
+              }
               wv[s] = Exl3DecodeCodeword(cw, cb);
             }
             // Decoded weights are f16-exact (Exl3DecodeCodeword returns an
@@ -581,6 +662,10 @@ bool Exl3DotTryLaunchRocm(hipStream_t st, const Tensor& a_had, const Tensor& tre
   unsigned block_sz = 256;
   if (bits == 4) {
     kernel = reinterpret_cast<const void*>(&Exl3DotKImpl<4, 8>);
+  } else if (bits == 5 && cb == 2) {
+    kernel = reinterpret_cast<const void*>(&Exl3DotKImpl<5, 8, 2>);
+  } else if (bits == 5) {
+    kernel = reinterpret_cast<const void*>(&Exl3DotKImpl<5, 8>);
   } else if (bits == 6 && cb == 2) {
     kernel = reinterpret_cast<const void*>(&Exl3DotKImpl<6, 8, 2>);
   } else if (bits == 6) {

@@ -441,6 +441,55 @@ TEST_CASE("exl3 rocm gemv: 6 bpw takes the reconstruct arm at every m") {
   vt::GetBackend(vt::DeviceType::kCPU).DestroyQueue(hq);
 }
 
+TEST_CASE("exl3 rocm gemv: 5 bpw takes the coalesced dot arm") {
+  if (!HasRocmExl3()) {
+    CHECK_FALSE(vt::OpRegistered(vt::OpId::kExl3Gemm, vt::DeviceType::kROCM));
+    return;
+  }
+  vt::Backend& be = vt::GetBackend(vt::DeviceType::kROCM);
+  vt::Queue hq = vt::GetBackend(vt::DeviceType::kCPU).CreateQueue();
+
+  // The Qwen3.8-27B-SC_4.00bpw checkpoint stores 66 tensors (2.36 GB,
+  // including the lm_head) at 5 bpw cb 2 — outside upstream's GEMV envelope
+  // (bits 2..4). The coalesced Exl3DotKImpl<5> arm is the fast path; its f32
+  // accumulation puts it inside the same bound as the 6 bpw row above.
+  // m=1 is decode (the hot lm_head shape), m=8 the GEMV boundary, m=21 a
+  // prefill shape that chunked dispatch slices.
+  for (const int64_t m : {1, 8, 21}) {
+    CAPTURE(m);
+    Exl3Fixture f = MakeFixture(256, 4096, 5, 0x5EED0u + static_cast<uint32_t>(m));
+    std::vector<uint16_t> a(static_cast<size_t>(m * f.k));
+    Rng rng;
+    for (auto& v : a) v = vt::F32ToF16(rng.next(1.0f));
+
+    const std::vector<uint16_t> ref = CpuArm(f, hq, a, m, /*codebook=*/2);
+    const std::vector<uint16_t> scalar = RocmArm(be, f, a, m, 2, /*force_gemv=*/0);
+    const std::vector<uint16_t> got = RocmArm(be, f, a, m, 2, /*force_gemv=*/-1);
+
+    size_t scalar_eq = 0, fast_diff = 0;
+    double sq = 0.0, rq = 0.0;
+    for (size_t i = 0; i < ref.size(); ++i) {
+      if (scalar[i] == ref[i]) ++scalar_eq;
+      if (got[i] != scalar[i]) ++fast_diff;
+      const double r = vt::F16ToF32(ref[i]);
+      const double g = vt::F16ToF32(got[i]);
+      sq += (g - r) * (g - r);
+      rq += r * r;
+    }
+    const double rel =
+        std::sqrt(sq / static_cast<double>(ref.size())) /
+        std::sqrt(rq / static_cast<double>(ref.size()));
+    MESSAGE("bits=5 cb=2 m=", m, ": rel RMS ", rel,
+            ", dot arm differs from the transcription at ", fast_diff, " of ",
+            ref.size());
+    CHECK(scalar_eq == ref.size());  // bits 5 is still byte-exact off the fast path
+    CHECK(rel <= 1.0e-2);            // f32 accumulation, well inside tier 3
+    CHECK(fast_diff > 0);
+  }
+
+  vt::GetBackend(vt::DeviceType::kCPU).DestroyQueue(hq);
+}
+
 namespace {
 
 // Raw 16/32-bit output words of one ROCm Exl3Gemm call with the given a / c
