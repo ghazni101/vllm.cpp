@@ -506,6 +506,13 @@ SamplingMetadata InputBatch::build_sampling_metadata() const {
     }
   }
 
+  // num_computed_tokens -> the sampler's per-row step index. It advances by
+  // one per decode step, which is what makes the coordinate-hashed Gumbel
+  // noise fresh per draw instead of frozen across the whole decode (upstream
+  // gets the same freshness from the torch.Generator advancing).
+  md.num_computed_tokens.assign(num_computed_tokens_cpu.begin(),
+                                num_computed_tokens_cpu.begin() + nn);
+
   // ─── ROAD-V1-C7 SAMPLE-CORE / SAMPLE-LOGPROBS / SAMPLE-LOGIT-FILTERS ───────
   // max_num_logprobs (gpu_input_batch.py:950 / :1150-1151): max requested count
   // across the batch, or None. Default (no request asked) => None => the sampler
