@@ -118,7 +118,8 @@ std::unique_ptr<LoadedModel> LoadQwen3_5DenseModel(
   }
   return std::make_unique<Qwen3_5DenseLoadedModel>(
       registration,
-      LoadQwen3_5Dense(*source.safetensors, config, source.load_queue));
+      LoadQwen3_5Dense(*source.safetensors, config, source.load_queue,
+                       source.multimodal));
 }
 
 void PrepareQwen3_5Dense(LoadedModel& model, const HfConfig& config,

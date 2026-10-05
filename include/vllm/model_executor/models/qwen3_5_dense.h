@@ -35,6 +35,7 @@
 
 #include "vllm/model_executor/layers/quantization/fp8_block_quant.h"
 #include "vllm/model_executor/models/qwen3_5_weights.h"  // OwnedTensor, Gdn/FullAttn weights, TensorResolver
+#include "vllm/config/multimodal.h"                  // MultiModalConfig (the tower-skip borrow)
 #include "vllm/model_executor/models/qwen3_vl_vision.h"  // MODEL-QWEN35-DENSE-VL-EXL3: the dense arm's tower
 #include "vllm/transformers_utils/hf_config.h"
 #include "vt/device.h"
@@ -335,9 +336,19 @@ Qwen3_5DenseLayerWeights LoadQwen3_5DenseLayer(
 // and image/video merger are DEFERRED (notes §0.1). The checkpoint's MTP
 // head is intentionally loaded on demand by LoadQwen3_5MTP when speculative
 // decoding is enabled; it is not part of the always-resident target weights.
+//
+// `mm_config` is the engine's multimodal limits, BORROWED for the load (the
+// same borrow ModelSource::multimodal carries). When every modality the tower
+// serves is at zero (`SkipTowerForModalities`, interfaces.py:293 — the
+// `--language-model-only` case), the tower is NOT read: `has_visual` stays
+// false and the load is byte-identical to a text-only checkpoint. An
+// EXL3-quantized tower is exactly the case that needs this — the 4.00bpw SC
+// checkpoint ships `model.visual.*` in trellis format, which
+// LoadQwen3VLVisionWeights must refuse because it reads BF16.
 Qwen3_5DenseWeights LoadQwen3_5Dense(const std::vector<SafetensorsFile>& shards,
-                                     const HfConfig& config,
-                                     vt::Queue* load_queue = nullptr);
+                                      const HfConfig& config,
+                                      vt::Queue* load_queue = nullptr,
+                                      const MultiModalConfig* mm_config = nullptr);
 
 // Host-lifetime helpers for ordinary dense CUDA models. The release function
 // drops only tensors whose authoritative raw/F32 device representation exists;

@@ -20,6 +20,7 @@
 #include "vllm/model_executor/layers/quantization/modelopt_mixed_precision.h"
 #include "vllm/model_executor/models/dense_fp8_block_gemm.h"
 #include "vllm/model_executor/models/dense_weight_loaders.h"
+#include "vllm/model_executor/models/interfaces.h"
 #include "vllm/platforms/interface.h"
 #include "vt/backend.h"
 #include "vt/dtype.h"
@@ -1007,7 +1008,8 @@ Qwen3_5DenseLayerWeights LoadQwen3_5DenseLayer(
 
 Qwen3_5DenseWeights LoadQwen3_5Dense(const std::vector<SafetensorsFile>& shards,
                                      const HfConfig& config,
-                                     vt::Queue* load_queue) {
+                                     vt::Queue* load_queue,
+                                     const MultiModalConfig* mm_config) {
   std::unordered_map<std::string, const SafetensorsFile*> where;
   std::vector<std::string> all_names;
   for (const SafetensorsFile& shard : shards) {
@@ -1181,7 +1183,15 @@ Qwen3_5DenseWeights LoadQwen3_5Dense(const std::vector<SafetensorsFile>& shards,
   // incomplete is a loud refusal naming the first missing tensor, never a
   // quiet text-only model. A text-only checkpoint takes none of this:
   // `has_visual` stays false and the load is byte-identical (spec gate 2).
-  if (HasQwen3_5DenseVisionTower(shards)) {
+  // #607 L3 mirror (interfaces.py:293): `--language-model-only` — or an
+  // engine that zeroed every image/video limit — must NOT pay for the tower,
+  // exactly as the standalone Qwen3-VL arm already skips it. The check runs
+  // before HasQwen3_5DenseVisionTower's read is attempted because a SKIPPED
+  // tower may be un-readable: the 4.00bpw SC checkpoint ships
+  // `model.visual.*` in trellis EXL3, which LoadQwen3VLVisionWeights' BF16
+  // assert would fatal on even though the user never asked for vision.
+  if (HasQwen3_5DenseVisionTower(shards) &&
+      !SkipTowerForModalities(mm_config, {"image", "video"})) {
     w.visual = LoadQwen3_5DenseVision(shards, config);
     w.visual_cfg = Qwen3_5DenseVisionConfig(config);
     w.has_visual = true;
