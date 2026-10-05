@@ -396,6 +396,9 @@ inline DBuf Exl3MatmulD(Dev d, const vt::Tensor& x, const Exl3Weight& w,
   vt::Exl3GemmArgs args;
   args.bits = w.Bits();
   args.codebook = w.codebook;
+  // Per-TENSOR, never per model: a mixed-rate checkpoint ships integer and
+  // half-integer (K+0.5) trellises side by side (BACKEND-ROCM frac rates).
+  args.half = w.half;
 
   auto run_gemm = [&](vt::Tensor& out) {
     if (use_reconstruct) {

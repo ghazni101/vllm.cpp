@@ -345,10 +345,13 @@ void LaunchHadIO(void* out, const void* in, const uint16_t* pre, const uint16_t*
 // catch.
 __global__ void Exl3GemmK(float* __restrict__ raw, const uint16_t* __restrict__ ah,
                           const uint16_t* __restrict__ trellis, int64_t m, int64_t k,
-                          int64_t n, int bits, int codebook) {
+                          int64_t n, int bits, int codebook, int half_flag) {
   __shared__ float tile[256];  // 1 KiB
   const int64_t tiles_n = n / 16;
-  const int64_t tile_words = 16 * static_cast<int64_t>(bits);
+  // A frac tile (K+0.5, mul1) is 16*KA+8 uint16 words; the reader switches
+  // with it. `half_flag` is validated on the host (codebook == 2, KA 1..7).
+  const int64_t tile_words =
+      16 * static_cast<int64_t>(bits) + (half_flag ? 8 : 0);
   const int64_t tj = blockIdx.x;
   const int tid = static_cast<int>(threadIdx.x);
   const int64_t row = static_cast<int64_t>(blockIdx.y) * 16 + tid / 16;
@@ -359,8 +362,9 @@ __global__ void Exl3GemmK(float* __restrict__ raw, const uint16_t* __restrict__ 
   for (int64_t ti = 0; ti < k / 16; ++ti) {
     const uint16_t* tp = trellis + (ti * tiles_n + tj) * tile_words;
     __syncthreads();  // the previous iteration's readers are done with `tile`
-    tile[Exl3TileRowMajorIndex(tid)] =
-        Exl3DecodeCodeword(Exl3TileCodeword(tp, bits, tid), codebook);
+    const uint16_t cw = half_flag ? Exl3FracTileCodeword(tp, bits, tid)
+                                  : Exl3TileCodeword(tp, bits, tid);
+    tile[Exl3TileRowMajorIndex(tid)] = Exl3DecodeCodeword(cw, codebook);
     __syncthreads();
     if (live) {
       const uint16_t* arow = ah + row * k + ti * 16;
@@ -461,6 +465,15 @@ void Exl3GemmKernelRocm(Queue& q, Tensor& c, const Tensor& a, const Tensor& trel
                " is not implemented (0 == 3INST, 1 == MCG, 2 == mul1). Upstream defines "
                "no other value: `decode_3inst<cb>` (codebook.cuh:56-90) has arms for 0, "
                "1 and 2 and falls off the end for anything else.");
+  // HALF-INTEGER rate (BACKEND-ROCM frac rates): K+0.5 is mul1-only, and the
+  // GEMV/m1-fused arms below carry no frac instantiation — a frac tensor must
+  // not fall into an integer-(KA, 2) GEMV arm, which would pass every existing
+  // gate and decode the wrong bitstream. It routes to the dot arm, and past
+  // the dot arm's shape envelope to Exl3GemmK (whose decode reads the frac
+  // windows through Exl3FracTileCodeword).
+  VT_CHECK(!args.half || args.codebook == 2,
+           "vt rocm exl3: a half-integer rate (K+0.5) requires the mul1 codebook (2); "
+           "got codebook " + std::to_string(args.codebook));
 
   hipStream_t st = AsStream(q);
 
@@ -483,8 +496,11 @@ void Exl3GemmKernelRocm(Queue& q, Tensor& c, const Tensor& a, const Tensor& trel
   // Exl3GemmK route below, whose Hadamards carry the dtype codes.
   const bool recon_dtypes = a.dtype == DType::kF16 &&
                             (c.dtype == DType::kF16 || c.dtype == DType::kF32);
+  // No frac reconstruct arm (spec ## Owed): a half-integer rate must not reach
+  // ReconstructDecodeSliceK, which would decode the frac bitstream as integer
+  // KA. Exl3GemmK decodes it correctly.
   const bool want_recon = fast_paths && args.force_gemv <= 0 && m > 32 &&
-                          dot_shape && recon_dtypes;
+                          dot_shape && recon_dtypes && !args.half;
   if (want_recon) {
     // Mid-m above the chunked cap: B would be re-read per 8-row chunk, so
     // past 32 rows the one-pass decode + hipBLAS GEMM wins.
@@ -513,7 +529,7 @@ void Exl3GemmKernelRocm(Queue& q, Tensor& c, const Tensor& a, const Tensor& trel
   // already-transformed a_had, so it cannot run ahead of the input transform
   // the way the fused arm does. It also honours the same fast_paths gate as
   // every fast arm — VT_EXL3_GEMV=0 must still select the transcription.
-  if (m == 1 && fast_paths && !(dot_first && dot_shape)) {
+  if (m == 1 && fast_paths && !args.half && !(dot_first && dot_shape)) {
     gemv = Exl3GemvM1FusedTryLaunchRocm(
         st, a.data, suh.data ? suh.Ptr<uint16_t>() : nullptr, trellis, raw,
         static_cast<int>(k), static_cast<int>(n), q.device.index, args,
@@ -564,9 +580,10 @@ void Exl3GemmKernelRocm(Queue& q, Tensor& c, const Tensor& a, const Tensor& trel
   if (!gemv) {
     const unsigned gx = static_cast<unsigned>(n / 16);
     const unsigned gy = static_cast<unsigned>((m + 15) / 16);
+    const int half_flag = args.half ? 1 : 0;
     Exl3GemmK<<<dim3(gx, gy), 256, 0, st>>>(raw, a_had.Ptr<uint16_t>(),
                                            trellis.Ptr<uint16_t>(), m, k, n, args.bits,
-                                           args.codebook);
+                                           args.codebook, half_flag);
     Check(hipGetLastError(), "exl3_gemm");
   }
 

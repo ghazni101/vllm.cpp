@@ -38,6 +38,7 @@ namespace {
 
 using exl3_test::Exl3Fixture;
 using exl3_test::MakeFixture;
+using exl3_test::MakeHalfFixture;
 using exl3_test::Rng;
 using exl3_test::UlpF16;
 
@@ -51,20 +52,23 @@ bool HasRocmExl3() {
 }
 
 std::vector<uint16_t> CpuArm(const Exl3Fixture& f, vt::Queue& hq,
-                             const std::vector<uint16_t>& a, int64_t m, int codebook) {
+                             const std::vector<uint16_t>& a, int64_t m, int codebook,
+                             /*bool half=*/bool use_half = false) {
   const int64_t k = f.k, n = f.n;
   std::vector<uint16_t> out(static_cast<size_t>(m * n), 0);
   std::vector<uint16_t> a_had_h(static_cast<size_t>(m * k), 0);
   vt::Exl3GemmArgs args;
   args.bits = f.bits;
   args.codebook = codebook;
+  args.half = use_half;
   vt::Tensor ta = vt::Tensor::Contiguous(const_cast<uint16_t*>(a.data()), vt::DType::kF16,
                                        hq.device, {m, k});
   vt::Tensor tah = vt::Tensor::Contiguous(a_had_h.data(), vt::DType::kF16, hq.device, {m, k});
   vt::Tensor tc = vt::Tensor::Contiguous(out.data(), vt::DType::kF16, hq.device, {m, n});
   vt::Tensor tb =
       vt::Tensor::Contiguous(const_cast<uint16_t*>(f.trellis.data()), vt::DType::kI8,
-                             hq.device, {k / 16, n / 16, 32 * f.bits});
+                             hq.device,
+                             {k / 16, n / 16, 32 * f.bits + (use_half ? 16 : 0)});
   vt::Tensor tsuh = vt::Tensor::Contiguous(const_cast<uint16_t*>(f.suh.data()),
                                            vt::DType::kF16, hq.device, {k});
   vt::Tensor tsvh = vt::Tensor::Contiguous(const_cast<uint16_t*>(f.svh.data()),
@@ -75,7 +79,7 @@ std::vector<uint16_t> CpuArm(const Exl3Fixture& f, vt::Queue& hq,
 
 std::vector<uint16_t> RocmArm(vt::Backend& be, const Exl3Fixture& f,
                               const std::vector<uint16_t>& a, int64_t m, int codebook,
-                              int force_gemv) {
+                              int force_gemv, /*bool half=*/bool use_half = false) {
   vt::Queue dq = be.CreateQueue();
   const int64_t k = f.k, n = f.n;
   const size_t ab = a.size() * sizeof(uint16_t);
@@ -95,14 +99,15 @@ std::vector<uint16_t> RocmArm(vt::Backend& be, const Exl3Fixture& f,
 
   vt::Tensor ta = vt::Tensor::Contiguous(d_a, vt::DType::kF16, dq.device, {m, k});
   vt::Tensor tah = vt::Tensor::Contiguous(d_ah, vt::DType::kF16, dq.device, {m, k});
-  vt::Tensor tb =
-      vt::Tensor::Contiguous(d_b, vt::DType::kI8, dq.device, {k / 16, n / 16, 32 * f.bits});
+  vt::Tensor tb = vt::Tensor::Contiguous(
+      d_b, vt::DType::kI8, dq.device, {k / 16, n / 16, 32 * f.bits + (use_half ? 16 : 0)});
   vt::Tensor tsuh = vt::Tensor::Contiguous(d_suh, vt::DType::kF16, dq.device, {k});
   vt::Tensor tsvh = vt::Tensor::Contiguous(d_svh, vt::DType::kF16, dq.device, {n});
   vt::Tensor tc = vt::Tensor::Contiguous(d_c, vt::DType::kF16, dq.device, {m, n});
   vt::Exl3GemmArgs args;
   args.bits = f.bits;
   args.codebook = codebook;
+  args.half = use_half;
   args.force_gemv = force_gemv;
   vt::Exl3Gemm(dq, tc, ta, tb, tsuh, tsvh, tah, args);
   be.Synchronize(dq);
@@ -625,6 +630,84 @@ TEST_CASE("exl3 rocm gemv: bf16 a/c fold matches the f16 pipeline at every m") {
         CHECK(out_diff == 0);
       }
     }
+  }
+
+  vt::GetBackend(vt::DeviceType::kCPU).DestroyQueue(hq);
+}
+
+// ── HALF-INTEGER rates (K+0.5, mul1) — BACKEND-ROCM frac rates ──────────────
+
+TEST_CASE("exl3 rocm gemv: half-integer (K+0.5) frac tensors decode through Exl3GemmK and the dot arm") {
+  if (!HasRocmExl3()) {
+    MESSAGE(
+        "SKIPPED, no ROCm device: the frac-rate (K+0.5) arms are PENDING. Reproduce with: "
+        "ctest --test-dir build-hip -R test_exl3_rocm_gemv -V");
+    CHECK_FALSE(vt::OpRegistered(vt::OpId::kExl3Gemm, vt::DeviceType::kROCM));
+    return;
+  }
+  vt::Backend& be = vt::GetBackend(vt::DeviceType::kROCM);
+  vt::Queue hq = vt::GetBackend(vt::DeviceType::kCPU).CreateQueue();
+
+  // KA 2 and 3 run the dq8_half fast port; KA 5 exercises the width-generic
+  // scalar arm. The GEMV itself must decline a frac tensor (no frac GEMV arm,
+  // spec ## Owed) — force_gemv=1 pushes past that decline to the DOT arm, and
+  // force_gemv=0 pins the Exl3GemmK transcription, which is byte-exact.
+  for (const int ka : {2, 3, 5}) {
+    for (const int64_t m : {1, 4}) {
+      CAPTURE(ka);
+      CAPTURE(m);
+      const Exl3Fixture f = MakeHalfFixture(256, 128, ka, 0x0DD5u + static_cast<uint32_t>(ka));
+      std::vector<uint16_t> a(static_cast<size_t>(m * f.k));
+      Rng rng;
+      for (auto& v : a) v = vt::F32ToF16(rng.next(1.0f));
+
+      const std::vector<uint16_t> ref = CpuArm(f, hq, a, m, /*codebook=*/2, /*half=*/true);
+      const std::vector<uint16_t> scalar =
+          RocmArm(be, f, a, m, 2, /*force_gemv=*/0, /*half=*/true);
+      const std::vector<uint16_t> dot =
+          RocmArm(be, f, a, m, 2, /*force_gemv=*/1, /*half=*/true);
+
+      size_t scalar_eq = 0;
+      double sq = 0.0, rq = 0.0;
+      for (size_t i = 0; i < ref.size(); ++i) {
+        if (scalar[i] == ref[i]) ++scalar_eq;
+        const double r = vt::F16ToF32(ref[i]);
+        const double g = vt::F16ToF32(dot[i]);
+        sq += (g - r) * (g - r);
+        rq += r * r;
+      }
+      const double rel = std::sqrt(sq / static_cast<double>(ref.size())) /
+                         std::sqrt(rq / static_cast<double>(ref.size()));
+      MESSAGE("KA=", ka, " m=", m, ": Exl3GemmK byte-equal ", scalar_eq, " of ",
+              ref.size(), "; dot arm rel RMS ", rel);
+      CHECK(scalar_eq == ref.size());  // the frac transcription is byte-exact
+      CHECK(rel <= 6.0e-3);            // the dot arm's own bound (f32 accumulation)
+
+      // Decode discrimination: the same frac bytes through the integer-KA
+      // reading must NOT reproduce the frac result — a frac tensor silently
+      // decoded as integer KA is exactly the failure the flag exists to bar.
+      const Exl3Fixture fi = MakeFixture(256, 128, ka, 0x0DD5u + static_cast<uint32_t>(ka));
+      const std::vector<uint16_t> wrong =
+          CpuArm(fi, hq, a, m, /*codebook=*/2, /*half=*/false);
+      int same = 0;
+      for (size_t i = 0; i < ref.size(); ++i)
+        if (wrong[i] == ref[i]) ++same;
+      CHECK(same < static_cast<int>(ref.size()) / 2);
+    }
+  }
+
+  // An out-of-envelope frac call refuses: KA 8 at the seam.
+  {
+    const Exl3Fixture f = MakeHalfFixture(128, 128, 8, 0xBADu);
+    std::vector<uint16_t> a(static_cast<size_t>(f.k), vt::F32ToF16(0.5f));
+    std::string msg;
+    try {
+      (void)CpuArm(f, hq, a, 1, /*codebook=*/2, /*half=*/true);
+      FAIL("exl3 rocm gemv: KA=8 did NOT throw");
+    } catch (const std::exception& e) {
+      msg = e.what();
+    }
+    CHECK(msg.find("K+0.5") != std::string::npos);
   }
 
   vt::GetBackend(vt::DeviceType::kCPU).DestroyQueue(hq);

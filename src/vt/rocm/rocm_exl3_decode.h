@@ -42,6 +42,29 @@ __device__ inline uint16_t Exl3TileCodeword(const uint16_t* tile, int bits, int 
   return static_cast<uint16_t>((merged >> s0) & 0xffffu);
 }
 
+// The HALF-INTEGER twin (BACKEND-ROCM frac rates), same read shape as
+// `Exl3TileCodeword` above and a device transcription of the host
+// `vt::Exl3FracTileCodeword` (cpu_exl3_dequant.cpp). Positions alternate
+// KA / KA+1 state bits with the extra bit on odd positions (mask 0xAAAA), so
+// position t's window ends at ring bit
+//   S(t) = KA*(t+1) + ((t&15)+1)/2 + 8*(t/16)
+// and the ring is tail-biting mod tile_bits = 256*KA + 128 — the FRAC ring
+// length, not a copied +256*bits (that copy is the off-by-128 the spec warns
+// about near the wrap).
+__device__ inline uint16_t Exl3FracTileCodeword(const uint16_t* tile, int ka, int t) {
+  const int tile_bits = 256 * ka + 128;
+  const int words32 = tile_bits / 32;  // 8*KA + 4
+  const int b0 = ka * (t + 1) + ((t & 15) + 1) / 2 + 8 * (t / 16) + tile_bits - 16;
+  const int b1 = b0 + 16;
+  const int i0 = b0 / 32;
+  const int i1 = (b1 - 1) / 32;
+  const int s0 = (i1 + 1) * 32 - b1;
+  const uint32_t a = Exl3TileWord32(tile, i0 % words32);
+  const uint32_t b = Exl3TileWord32(tile, i1 % words32);
+  const uint64_t merged = (static_cast<uint64_t>(a) << 32) | b;
+  return static_cast<uint16_t>((merged >> s0) & 0xffffu);
+}
+
 // Exl3DecodeCodeword (codebook.cuh:56-90). All THREE codebooks, because an AMD
 // box has no reason to see fewer artifacts than an NVIDIA one:
 //   cb 0  3INST, the DEFAULT — a checkpoint that ships neither an `mcg` nor a

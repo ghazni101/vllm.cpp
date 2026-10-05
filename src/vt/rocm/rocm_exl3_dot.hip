@@ -189,6 +189,51 @@ __device__ __forceinline__ uint32_t LoadH2(const half* p) {
   return v;
 }
 
+// ─── the half-integer (K+0.5) decode — exl3_dq.cuh:254-286 `dq8_half` ────────
+//
+// HALF (BACKEND-ROCM frac rates). Positions alternate KA / KA+1 state bits
+// (mask 0xAAAA: ODD positions carry the extra bit), so a position pair consumes
+// bits2 = 2*KA+1 bits and S(t) for odd t — every group END below — is exactly
+// ((t>>1)+1)*bits2. A group of four windows (positions t0..t0+3, t0 even)
+// spans gspan = 16 + (KA+1) + KA + (KA+1) = 18+3*KA ≤ 27 < 32 bits, so one
+// funnel shift assembles the whole span and THREE shifts derive the other
+// three windows: the window ends descend by KA+1, KA, KA+1 going down from the
+// top window. `+ 128*bits2` is one whole frac ring (tile_bits = 256*KA+128 =
+// 128*bits2), keeping every word index non-negative — the same headroom trick
+// as the integer path's +256*bits. Bit-exactness against the scalar
+// Exl3FracTileCodeword reader is gated by tests/vt/test_exl3_rocm.cpp (host
+// golden) and the fixture in tests/vt/test_exl3_dequant.cpp.
+//
+// KA is a template parameter (2 and 3 are the rates observed in the wild;
+// other widths take the scalar Exl3FracTileCodeword arm). Codewords return in
+// the LOW 16 bits of each element, high halves garbage — what
+// Exl3DecodePairCb2Dp4a reads.
+template <int KA>
+__device__ __forceinline__ void Exl3Dq8Half(const uint32_t* tp, int t0,
+                                            uint32_t (&cw)[8]) {
+  constexpr int bits2 = 2 * KA + 1;
+  constexpr int gspan = 18 + 3 * KA;
+  const int W = 4 * bits2;  // u32 words per frac tile (8*KA + 4)
+#pragma unroll
+  for (int g = 0; g < 2; ++g) {
+    const int t = t0 + 4 * g + 3;  // the group's top window (t odd)
+    const int e = ((t >> 1) + 1 + 128) * bits2;  // S(t) + one ring
+    const int hi = (e - 1) >> 5;
+    const int lo = (e - gspan) >> 5;
+    const int s = ((hi + 1) << 5) - e;
+    const uint32_t wa = tp[lo % W];
+    const uint32_t wb = tp[hi % W];
+    // LOWER stream word in the HIGH half — the same (a<<32)|b merge the scalar
+    // reader uses; swapping the operands silently inverts the stream.
+    const uint64_t merged = (static_cast<uint64_t>(wa) << 32) | wb;
+    const uint32_t w = static_cast<uint32_t>((merged >> s) & 0xffffffffu);
+    cw[4 * g + 3] = w & 0xffffu;
+    cw[4 * g + 2] = (w >> (KA + 1)) & 0xffffu;
+    cw[4 * g + 1] = (w >> (KA + 1 + KA)) & 0xffffu;
+    cw[4 * g + 0] = (w >> (3 * KA + 2)) & 0xffffu;
+  }
+}
+
 
 // The m<=8 fused decode+dot kernel. Grid = 8-tile column groups times a
 // host-chosen k-split; block 256 = 8 warps; each warp owns one 16-column
@@ -213,11 +258,12 @@ __device__ __forceinline__ uint32_t LoadH2(const half* p) {
 // eight warp partials through LDS (a plain store when the host k-split is
 // 1, atomicAdd when several blocks each produced a partial).
 // NW: warps per block, 8 throughout — the only instantiation (block 256).
-template <int BITS, int NW = 8, int CBT = -1>
+template <int BITS, int NW = 8, int CBT = -1, bool HALF = false>
 __global__ __launch_bounds__(NW * 32) void Exl3DotKImpl(
     const half* __restrict__ A, const uint16_t* __restrict__ B,
     float* __restrict__ C, int size_m, int size_k, int size_n, int bits_rt, int cb,
-    int ksplit) {
+    int ksplit, int half_rt) {
+  (void)half_rt;  // HALF instantiations fold the flag into the type
   const int bits = BITS > 0 ? BITS : bits_rt;
   const int warp = threadIdx.x >> 5;  // 0..NW-1
   const int lane = threadIdx.x & 31;
@@ -254,7 +300,50 @@ __global__ __launch_bounds__(NW * 32) void Exl3DotKImpl(
     // tile = blockIdx.x % ntiles over a grid of ntiles*ksplit blocks, so
     // every block owns a valid tile; no guard is needed here.
     {
-      if constexpr (BITS == 4 || BITS == 5 || BITS == 6) {
+      if constexpr (HALF) {
+        // The half-integer arm (K+0.5, mul1 — validated at the launch site).
+        // Same lane/column mapping and same epilogue as the integer arms; only
+        // the codeword source differs. KA 2 and 3 run the dq8_half fast port
+        // (Exl3Dq8Half); every other KA takes the width-generic scalar reader
+        // — the correctness floor, not a tuned path.
+        const int Wf = 8 * bits + 4;  // u32 words per frac tile
+        for (int kt = kt0; kt < kt1; ++kt) {
+          half2 wv2[4];
+          if constexpr (BITS == 2 || BITS == 3) {
+            uint32_t cw[8];
+            Exl3Dq8Half<BITS>(B32 + (static_cast<size_t>(kt) * ntiles + tile) * Wf,
+                              8 * lane, cw);
+#pragma unroll
+            for (int q = 0; q < 4; ++q)
+              wv2[q] = Exl3DecodePairCb2Dp4a(cw[2 * q], cw[2 * q + 1]);
+          } else {
+            // Generic KA: one scalar window read per codeword, identical
+            // arithmetic to the host reference Exl3FracTileCodeword. The tile
+            // stride is 16*KA+8 uint16 words.
+            const uint16_t* tp =
+                B + (static_cast<size_t>(kt) * ntiles + tile) * (16 * bits + 8);
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {
+              const uint16_t cwa = Exl3FracTileCodeword(tp, bits, 8 * lane + 2 * q);
+              const uint16_t cwb = Exl3FracTileCodeword(tp, bits, 8 * lane + 2 * q + 1);
+              wv2[q] = Exl3DecodePairCb2Dp4a(cwa, cwb);
+            }
+          }
+
+          const int kbase = kt * 16 + r0;
+#pragma unroll
+          for (int mm = 0; mm < 8; ++mm) {
+            if (mm >= size_m) break;
+            const half* arow = A + (size_t)mm * size_k + kbase;
+            const half2 a01 = __builtin_bit_cast(half2, LoadH2(arow));
+            const half2 a89 = __builtin_bit_cast(half2, LoadH2(arow + 8));
+            acc[mm][0] = amd_mixed_dot(wv2[0], a01, acc[mm][0], false);
+            acc[mm][0] = amd_mixed_dot(wv2[1], a89, acc[mm][0], false);
+            acc[mm][1] = amd_mixed_dot(wv2[2], a01, acc[mm][1], false);
+            acc[mm][1] = amd_mixed_dot(wv2[3], a89, acc[mm][1], false);
+          }
+        }
+      } else if constexpr (BITS == 4 || BITS == 5 || BITS == 6) {
         // Coalesced fetch: the warp reads the tile's words32 u32s exactly
         // once — lane l holds word l, plus word 32+l for bits==6 — and the
         // lane's codeword span is assembled by shuffling its neighbours'
@@ -623,6 +712,12 @@ bool Exl3DotTryLaunchRocm(hipStream_t st, const Tensor& a_had, const Tensor& tre
   if (size_k % 128 != 0 || size_n % 128 != 0) return false;
   if (args.bits < 1 || args.bits > 8) return false;
   if (args.codebook < 0 || args.codebook > 2) return false;
+  // HALF-INTEGER rate (K+0.5): mul1 only, and the KAs the oracle bounds to
+  // [1, 7]. Refused by name rather than dropped into an integer arm — the
+  // arm set below is compile-time, so a frac tensor MUST take a HALF
+  // instantiation or none at all.
+  if (args.half && args.codebook != 2) return false;
+  if (args.half && (args.bits < 1 || args.bits > 7)) return false;
 
   int warp_size = 0;
   CheckD(hipDeviceGetAttribute(&warp_size, hipDeviceAttributeWarpSize, device),
@@ -650,17 +745,28 @@ bool Exl3DotTryLaunchRocm(hipStream_t st, const Tensor& a_had, const Tensor& tre
   const half* a_ptr = a_had.Ptr<half>();
   const uint16_t* b_ptr = trellis.Ptr<uint16_t>();
   int bits = args.bits, cb = args.codebook;
+  int half_flag = args.half ? 1 : 0;
   void* kargs[] = {static_cast<void*>(&a_ptr),  static_cast<void*>(&b_ptr),
                    static_cast<void*>(&raw),    static_cast<void*>(&size_m),
                    static_cast<void*>(&size_k), static_cast<void*>(&size_n),
                    static_cast<void*>(&bits),   static_cast<void*>(&cb),
-                   static_cast<void*>(&ksplit)};
+                   static_cast<void*>(&ksplit), static_cast<void*>(&half_flag)};
   // The templated instantiations fold bits into the type: the checkpoint's
   // 4 and 6 bpw decode with compile-time shifts; every other width launches
-  // Exl3DotK<0>, the runtime-bits arm.
+  // Exl3DotK<0>, the runtime-bits arm. The HALF rows (K+0.5, mul1) compile
+  // the dq8_half fast port for KA 2 and 3 — the rates observed in the wild —
+  // and the width-generic scalar reader for the rest.
   const void* kernel;
   unsigned block_sz = 256;
-  if (bits == 4) {
+  if (args.half) {
+    if (bits == 2) {
+      kernel = reinterpret_cast<const void*>(&Exl3DotKImpl<2, 8, -1, true>);
+    } else if (bits == 3) {
+      kernel = reinterpret_cast<const void*>(&Exl3DotKImpl<3, 8, -1, true>);
+    } else {
+      kernel = reinterpret_cast<const void*>(&Exl3DotKImpl<0, 8, -1, true>);
+    }
+  } else if (bits == 4) {
     kernel = reinterpret_cast<const void*>(&Exl3DotKImpl<4, 8>);
   } else if (bits == 5 && cb == 2) {
     kernel = reinterpret_cast<const void*>(&Exl3DotKImpl<5, 8, 2>);

@@ -1754,9 +1754,14 @@ bool Exl3GemvTryLaunchRocm(hipStream_t st, const Tensor& a_had, const Tensor& tr
                            const Exl3GemmArgs& args, Exl3GemvOutFold* fold) {
   // exl3_gemv.cu:108-116: the free integer tests first, then the env read.
   if (args.force_gemv == 0) return false;
+  // HALF-INTEGER rate (K+0.5, mul1): no frac GEMV arm exists (spec ## Owed).
+  // The decline must come FIRST — bits = KA passes the integer tests below as
+  // e.g. (3, 2), an instantiated arm, and would decode the frac bitstream
+  // through the integer window arithmetic.
+  if (args.half) return false;
   if (!GemvArmInstantiated(args.bits, args.codebook)) return false;
   if (!Exl3GemvHardEligible(size_m, size_k, size_n, args.bits, args.codebook,
-                            /*has_su_sv=*/true))
+                            /*has_su_sv=*/true, /*half=*/args.half))
     return false;
   const int mode = args.force_gemv > 0 ? 2 : Exl3GemvMode();
   if (mode == 0) return false;
@@ -1937,8 +1942,11 @@ bool Exl3GemvM1FusedTryLaunchRocm(hipStream_t st, const void* a_raw,
   // shape like n%64==0 && n%128!=0 was accepted and the group loop left
   // trailing columns of C stale (reviewer finding on 1d04d72dc).
   if (!Exl3GemvHardEligible(1, size_k, size_n, args.bits, args.codebook,
-                            /*has_su_sv=*/true))
+                            /*has_su_sv=*/true, /*half=*/args.half))
     return false;
+  // The m<=8 GEMV decline above names the reason; this fused arm refuses the
+  // frac rates by the same token (no frac GEMV arm, spec ## Owed).
+  if (args.half) return false;
   if (suh_ptr == nullptr || a_raw == nullptr) return false;
   const int mode = args.force_gemv > 0 ? 2 : Exl3GemvMode();
   if (mode == 0) return false;

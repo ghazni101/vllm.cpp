@@ -133,6 +133,15 @@ TEST_CASE("exl3 gemv: the hard constraints refuse before any heuristic runs") {
   CHECK_FALSE(vt::Exl3GemvHardEligible(vt::kExl3GemvMaxM + 1, kW2K, kW2N, 3, 1, true));
   CHECK_FALSE(vt::Exl3GemvHardEligible(1, 2048 + 16, kW2N, 3, 1, true));  // size_k % 128
   CHECK_FALSE(vt::Exl3GemvHardEligible(1, kW2K, 4096 + 16, 3, 1, true));  // size_n % 128
+  // OUR EXTENSION (BACKEND-ROCM frac rates): a HALF-INTEGER rate (K+0.5) is
+  // never GEMV-eligible, no matter what integer shape its KA pretends to be —
+  // (3, 2) below IS an instantiated arm, and the flag is what keeps a frac
+  // tensor out of it. The frac GEMV arm is owed.
+  CHECK(vt::Exl3GemvHardEligible(1, kW2K, kW2N, 3, 2, true));            // integer twin passes
+  CHECK_FALSE(vt::Exl3GemvHardEligible(1, kW2K, kW2N, 3, 2, true, /*half=*/true));
+  CHECK_FALSE(vt::Exl3GemvHardEligible(1, kW2K, kW2N, 2, 2, true, /*half=*/true));
+  CHECK_FALSE(vt::Exl3GemvHardEligible(vt::kExl3GemvMaxM, kW2K, kW2N, 4, 2, true,
+                                       /*half=*/true));
   // The constant itself, so a change to it is a red rather than a silent
   // widening (`exl3_gemv_kernel.cuh:31`).
   CHECK(vt::kExl3GemvMaxM == 8);

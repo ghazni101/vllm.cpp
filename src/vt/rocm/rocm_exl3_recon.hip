@@ -396,6 +396,14 @@ void Exl3ReconstructGemmKernelRocm(Queue& q, Tensor& c, const Tensor& a,
                " is not implemented (0 == 3INST, 1 == MCG, 2 == mul1). Upstream defines "
                "no other value: `decode_3inst<cb>` (codebook.cuh:56-90) has arms for 0, "
                "1 and 2 and falls off the end for anything else.");
+  // HALF-INTEGER rates (K+0.5, mul1) have no reconstruct arm (BACKEND-ROCM,
+  // spec `## Owed`): ReconstructDecodeSliceK would decode the frac bitstream
+  // through the integer-KA window arithmetic — silently wrong — so the frac
+  // tensor refuses here by name and routes to the dot arm / Exl3GemmK.
+  VT_CHECK(!args.half,
+           "vt rocm exl3 recon: half-integer rates (K+0.5, mul1) have no reconstruct "
+           "arm; this is an unimplemented arm, not an invalid tensor "
+           "(BACKEND-ROCM frac rates, ## Owed).");
   // f16 and bf16 are the same width: a bf16 tensor here would be silently
   // reinterpreted by the f16 Hadamards and the f16 hipBLAS GEMM.
   VT_CHECK(a.dtype == DType::kF16,
