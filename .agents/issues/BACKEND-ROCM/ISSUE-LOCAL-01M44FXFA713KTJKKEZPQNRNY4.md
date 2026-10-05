@@ -43,3 +43,21 @@ the checkpoint's own near-tie (' The' vs '1', ~0.1 nat apart) rolling
 echo-ward ~10% of the time at T=1/top_k=20. No implementation defect
 remains: the served-echo issue closes as checkpoint behaviour.
 Resolution: the model, not the kernels.
+
+2026-10-05 late — user-reported loop REPRODUCED and root-caused on the
+serve path itself. Prompt: 'Choose a random business ... single html
+file' (chatcmpl-4 shape). Sampled at the checkpoint's defaults (T=1,
+top_k=20, top_p=0.95) a 221-char 'business ideas' block repeats ~50x
+starting ~616 chars into reasoning. Three decisive controls: (a) the
+SAME prompt at temperature=0 yields 3000 coherent tokens, zero
+repetition — the decode path is not corrupt; (b) the exact 79-token
+templated prompt (special-token ids verified byte-identical) on the
+exllamav3 oracle produces clean output at 2 seeds — but (c) the logits
+at the loop-onset context (229-token continuation ending mid-block)
+agree to ~0.1 nat on every candidate through rank 15 (' house' -1.250
+vs -1.257, ' merchant' -1.738 vs -1.695, ' blending' -2.105 vs -2.038).
+The repeat is the checkpoint's own distribution; the difference between
+a run that loops and a run that does not is the sampled roll, not the
+engine. 2/4 vllm.cpp sampled runs looped, 0/2 oracle — same dice,
+different rolls. Definitive closure: checkpoint sampling attractor.
+Mitigation is client-side sampling params or --generation-config vllm.
