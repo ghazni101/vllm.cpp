@@ -31,8 +31,8 @@ sensitivity rather than corruption. Complementary evidence: the full knob
 isolation ladder (every ROCm arm off, incl. VT_EXL3_GEMV=0 transcription)
 leaves the output byte-identical, and the EXL3 bf16/f16 pipeline is
 byte-exact on every real projection shape at m in {1,33,44,48,64,85,106,127}
-(scratch_lenprobe). Remaining open question — whether vllm.cpp's logit
-distribution materially differs below rank 1 (oracle '1' sits at rank 2,
-vllm.cpp's rank-2 is '\n'); both put ' The' first, so the greedy behaviour
-is the same. The sampled-decode divergence tracked in ISSUE-LOCAL-01M44FXFA
-713KTJKKEZPQNRNY4 is the live part.
+(scratch_lenprobe). The apparent rank-2 difference ('1' vs '\n') was an alignment
+artifact of this probe, not a real delta: vllm.cpp's prompt_logprobs[i]
+predicts token i, and the aligned position-64 distribution puts '1' at
+rank 2 exactly like the oracle (see ISSUE-LOCAL-01M44FXFA713KTJKKEZPQNRNY4,
+now closed with the aligned table).

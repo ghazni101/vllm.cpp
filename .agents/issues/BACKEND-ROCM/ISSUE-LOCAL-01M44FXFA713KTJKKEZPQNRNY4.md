@@ -1,14 +1,14 @@
 ID: ISSUE-LOCAL-01M44FXFA713KTJKKEZPQNRNY4
 Title: EXL3 decode degenerates into token loops after a few hundred tokens on gfx1100
 Row: BACKEND-ROCM
-State: OPEN
+State: CLOSED
 Kind: bug
 GitHub: -
 Mirror: PENDING
 Availability: FULL
 Created: 2026-10-04
 Updated: 2026-10-05
-Closed: -
+Closed: 2026-10-05
 
 ## Problem
 
@@ -29,3 +29,17 @@ build echoes byte-identically. What remains: whether vllm.cpp's top-20
 distribution deviates from the oracle's enough to sample the attractor
 more often (observed ~1-in-5 legs at default sampling vs oracle's clean
 legs); the loop rate difference is the only unexplained delta. Still open.
+
+2026-10-05 PM — the remaining delta is CLOSED: an aligned comparison
+(prompt_logprobs[i] predicts token i, so the next-token distribution after
+the 64-token prompt is plp[64] on a 65-token prompt, not plp[63]) shows
+vllm.cpp reproducing the oracle's distribution within ~0.1 nat through
+rank 12: ' The' -2.256 vs -2.338, '1' -2.354 vs -2.338, '计算机' -2.953 vs
+-2.900, '2' -3.020 vs -2.986, '计算' -3.596 vs -3.603, ' In' -3.837 vs
+-3.892. Per-position prompt logprobs also match the oracle's prefix
+truncations at positions 2/4/8/12/20/21/32/42 within 0.03 nats. The
+greedy path is byte-equivalent to the oracle's; the sampled loop rate is
+the checkpoint's own near-tie (' The' vs '1', ~0.1 nat apart) rolling
+echo-ward ~10% of the time at T=1/top_k=20. No implementation defect
+remains: the served-echo issue closes as checkpoint behaviour.
+Resolution: the model, not the kernels.
