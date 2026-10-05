@@ -61,3 +61,21 @@ a run that loops and a run that does not is the sampled roll, not the
 engine. 2/4 vllm.cpp sampled runs looped, 0/2 oracle — same dice,
 different rolls. Definitive closure: checkpoint sampling attractor.
 Mitigation is client-side sampling params or --generation-config vllm.
+
+2026-10-05 final — RETRACTED: the loop WAS an implementation defect, in
+the sampler, not the checkpoint. The decisive asymmetry: identical
+79-token prompt + identical T=1/top_k=20/top_p=0.95 on the SC 4.00bpw
+checkpoint, exllamav3 x3 seeds clean while vllm.cpp looped on 3 of 4
+seeds (including the user's exact request). Root cause: ExpNoise hashes
+(seed, row, col) with no step dimension, so every decode step reused the
+identical noise vector — a token that won one near-tie kept winning all
+of them, a sampling repetition-pump. Upstream draws a fresh
+q.exponential_() tensor per step. Fix 005e113a8 mixes the per-request
+num_computed_tokens (advancing, deterministic, batch-independent) into
+the row seed. Post-fix on the serve path: seeds 1..5 produce coherent
+1400-token output (the pre-fix 221-char x50 block is gone), seeded
+requests stay byte-identical, and all five sampler tests pass
+(test_ops_sample, test_sampler, test_rejection_sampler,
+test_dspark_sample, test_rocm_sample_scratch). The earlier oracle-logit
+parity evidence stands — the FORWARD was always correct; the defect was
+in what the sampler did with the distribution.
