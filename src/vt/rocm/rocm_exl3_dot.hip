@@ -235,7 +235,9 @@ __global__ __launch_bounds__(NW * 32) void Exl3DotKImpl(
     float acc[8][2] = {};  // acc[m][col-half]: c = l/4 (+8)
     const int r0 = (lane & 3) * 2;
 
-    if (tile < ntiles) {
+    // tile = blockIdx.x % ntiles over a grid of ntiles*ksplit blocks, so
+    // every block owns a valid tile; no guard is needed here.
+    {
       if constexpr (BITS == 4 || BITS == 6) {
         // Coalesced fetch: the warp reads the tile's words32 u32s exactly
         // once — lane l holds word l, plus word 32+l for bits==6 — and the
