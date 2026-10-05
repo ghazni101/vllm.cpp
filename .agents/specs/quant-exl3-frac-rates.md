@@ -131,3 +131,34 @@ falls to the generic path).
 - Frac GEMV m=1 arm (`rocm_exl3_gemv.hip`) and frac reconstruct arm
   (`rocm_exl3_recon.hip`).
 - CUDA frac arm (`cuda_exl3.cu`) and the corresponding CUDA dispatch rows.
+
+## Outcome
+
+Measured 2026-10-05 on gfx1100, HEAD `8cc6aa921` (plus the reconstruct-seam
+repair it carries):
+
+- **Load + decode**: OrcaSAQ-2-27B-EXL3-3.21bpw loads and greedy-decodes
+  coherent output (both gate prompts, 256 and 145 tokens respectively).
+- **Kernel gate**: `ctest -R exl3` — 20/22 pass including the new frac ROCm
+  dot-arm cases. The two failures (`test_deepseek_v4_exl3_loader` codebook
+  subcase, `test_dflash2_exl3_reach`) reproduce identically at base
+  `e6e492238` with `VLLM_CPP_HIP=ON` — pre-existing, not this change; the
+  GroupedConv miss is filed at
+  `.agents/issues/KERNEL-DFLASH2-GROUPED-CONV/ISSUE-LOCAL-01M46WJS3AJGDC1KYHC2KKVTEA.md`.
+- **Token gate, recorded as distributional**: greedy output matches the
+  oracle's golden token-for-token until an FP-order argmax tie (chars ~168
+  and ~61 into the two captures), and the INTEGER-rate sibling
+  `Mia-AiLab/Qwen3.8-27B-EXL3-3.5bpw` — unchanged by this work — diverges from
+  its own oracle golden at char ~158 under identical greedy conditions.
+  Divergence is the two engines' floating-point baseline, not a frac decode
+  defect: kernel-level equivalence is separately proven byte-exact against
+  an independently written packed-words reader (`test_exl3_dequant`,
+  `test_exl3_rocm_gemv` frac cases).
+- **Integer-rate regression check**: `Mia-AiLab/Qwen3.8-27B-SC_3.00bpw`
+  produces its usual clean greedy output at HEAD (spec stop condition).
+
+Rejected alternative: token-exact gating at 256 tokens is unreachable in
+principle here — the oracle and this engine have different GEMM/attention
+accumulation orders, so argmax ties diverge mid-sequence even for integer
+rates; the integer-rate control run is what turns the frac divergence from a
+suspect into the baseline.
