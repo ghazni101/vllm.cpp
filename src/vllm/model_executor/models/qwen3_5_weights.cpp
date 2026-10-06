@@ -1877,6 +1877,10 @@ multimodal::Qwen3VLVisionConfig Qwen3_5FamilyVisionConfig(
   v.num_heads = 16;
   v.depth = 27;
   v.intermediate_size = 4304;
+  // The merger writes straight into the text residual stream, so the tower's
+  // output width IS the text hidden size (2048 on the 35B MoE, 5120 on the 27B
+  // dense) — the ONE field the two arms disagree on.
+  v.out_hidden_size = config.hidden_size;
   v.patch_size = 16;
   v.temporal_patch_size = 2;
   v.spatial_merge_size = 2;
