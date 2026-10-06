@@ -408,6 +408,8 @@ jobs:
           python3 tests/scripts/test_indextts2_emotion_arch_covered.py
           python3 tests/scripts/test_indextts2_pth_manifest.py
           python3 tests/scripts/test_indextts2_convert.py
+          python3 tests/scripts/test_convert_nimble.py
+          python3 tests/scripts/test_convert_clm.py
           python3 tests/scripts/test_indextts2_reference_path.py
           python3 tests/scripts/test_vocoder1d_single_home.py
       - name: Critical regression tests remain executable and CTest-registered
@@ -1067,6 +1069,27 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      # `scripts/check-windows-portability.py` skips its PowerShell AST stage
+      # when `pwsh` is absent (scripts/check-windows-portability.py:2028), so a
+      # lane without pwsh cannot see the defects that stage catches. The
+      # semantic-evidence gate re-runs the changed checker test at HEAD and at
+      # the merge base; when the changed test is red only through the ps1
+      # stage, a pwsh-less BASE lane stays green and `scripts/check-pr-size.py`
+      # rejects the evidence with "BASE checker stayed green ... changed test
+      # is not semantic evidence". Install pwsh so HEAD and BASE run under the
+      # same toolchain the windows contract expects. The windows-msvc-* jobs
+      # get pwsh from the `windows-2022` image, so this tarball install is the
+      # ubuntu-latest counterpart, pinned to the same 7.5.x line.
+      - name: Install PowerShell (pwsh) for the checker evidence lanes
+        run: |
+          curl -sSfL \
+            https://github.com/PowerShell/PowerShell/releases/download/v7.5.2/powershell-7.5.2-linux-x64.tar.gz \
+            -o /tmp/pwsh.tar.gz
+          echo "8fa9584f6f95d29ca1466c4397ac39c371373d6581c12dfae9ebd53c06d77664  /tmp/pwsh.tar.gz" | sha256sum -c -
+          sudo mkdir -p /opt/pwsh
+          sudo tar -xzf /tmp/pwsh.tar.gz -C /opt/pwsh
+          sudo ln -sf /opt/pwsh/pwsh /usr/local/bin/pwsh
+          pwsh -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'
       - name: PR path classification and checker evidence
         run: |
           python3 scripts/check-pr-size.py \
@@ -1267,7 +1290,15 @@ jobs:
         # claim is the thing being tested and nothing else is.
         run: |
           set -euo pipefail
-          ./build-vulkan/tests/test_platform | tee platform-gate.log
+          # -s and 2>&1 mirror the metal lane's invocation below: doctest prints
+          # the platform's MESSAGE() line through its logging path, which older
+          # doctest releases emit only on failure or under --success, and a
+          # stream this invocation does not capture never reaches the log the
+          # grep reads. Without the full capture the gate greps a
+          # platform-gate.log written by a different output surface than the
+          # one that printed the message, and the step fails with "pattern not
+          # found" on a message the job demonstrably produced.
+          ./build-vulkan/tests/test_platform --no-colors=1 -s 2>&1 | tee platform-gate.log
           grep -q 'platform vulkan get_device_capability()' platform-gate.log
           grep -q 'Status: SUCCESS!' platform-gate.log
       - name: The Vulkan suite MEASURED a device rather than skipping past one
@@ -1279,8 +1310,11 @@ jobs:
           ./build-vulkan/tests/test_vulkan_backend \
             -tc="Vulkan platform is registered and reports unified/no-pool residency" -s \
             | tee vulkan-platform-case.log
-          grep -q 'kVULKAN Platform::get_device_capability() present=false' vulkan-platform-case.log
-          grep -q 'SelectAttentionBackendName(p) == "FLASH_ATTN" ) is correct' vulkan-platform-case.log
+          grep -q 'CHECK_FALSE( p.get_device_capability().present() ) is correct' vulkan-platform-case.log
+          # `[0]` in a BRE is a bracket expression matching the lone character
+          # `0`, so this pattern can never match the literal `prio[0]` in the
+          # doctest output. Escape it (run 37202846607, job build-test-vulkan).
+          grep -q 'CHECK( prio\[0\] == "FLASH_ATTN" ) is correct' vulkan-platform-case.log
           grep -qE 'test cases: *1 \| *1 passed' vulkan-platform-case.log
   device-leakage:
     # The DSR RATCHET (work row `S1` of .agents/specs/accelerator-seam-audit.md).
@@ -1988,7 +2022,7 @@ jobs:
         # kCPU only, and the executable still prints `Status: SUCCESS!` with rc 0.
         run: |
           set -euo pipefail
-          ./build-metal/tests/test_platform --no-colors=1 2>&1 | tee platform-gate.log
+          ./build-metal/tests/test_platform --no-colors=1 -s 2>&1 | tee platform-gate.log
           grep -q 'platform metal get_device_capability()' platform-gate.log
           grep -q 'Status: SUCCESS!' platform-gate.log
   baseline-summary:

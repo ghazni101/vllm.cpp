@@ -13,6 +13,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "vllm/config/multimodal.h"
 #include "vllm/model_executor/layers/quantization/compressed_tensors/nvfp4_emulation.h"
 #include "vllm/model_executor/model_loader/nvfp4_dequant.h"
 #include "vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_config.h"
@@ -20,7 +21,7 @@
 #include "vllm/model_executor/layers/quantization/modelopt_mixed_precision.h"
 #include "vllm/model_executor/models/dense_fp8_block_gemm.h"
 #include "vllm/model_executor/models/dense_weight_loaders.h"
-#include "vllm/model_executor/models/interfaces.h"
+#include "vllm/model_executor/models/interfaces.h"  // #607 L3 SkipTowerForModalities
 #include "vllm/platforms/interface.h"
 #include "vt/backend.h"
 #include "vt/dtype.h"
@@ -1183,18 +1184,20 @@ Qwen3_5DenseWeights LoadQwen3_5Dense(const std::vector<SafetensorsFile>& shards,
   // incomplete is a loud refusal naming the first missing tensor, never a
   // quiet text-only model. A text-only checkpoint takes none of this:
   // `has_visual` stays false and the load is byte-identical (spec gate 2).
-  // #607 L3 mirror (interfaces.py:293): `--language-model-only` — or an
-  // engine that zeroed every image/video limit — must NOT pay for the tower,
-  // exactly as the standalone Qwen3-VL arm already skips it. The check runs
-  // before HasQwen3_5DenseVisionTower's read is attempted because a SKIPPED
-  // tower may be un-readable: the 4.00bpw SC checkpoint ships
-  // `model.visual.*` in trellis EXL3, which LoadQwen3VLVisionWeights' BF16
-  // assert would fatal on even though the user never asked for vision.
-  if (HasQwen3_5DenseVisionTower(shards) &&
-      !SkipTowerForModalities(mm_config, {"image", "video"})) {
-    w.visual = LoadQwen3_5DenseVision(shards, config);
-    w.visual_cfg = Qwen3_5DenseVisionConfig(config);
-    w.has_visual = true;
+  //
+  // #607 L3: the engine's modality limits are the ONE input to the skip.
+  // `--language-model-only` and `--limit-mm-per-prompt '{"image":0,"video":0}'`
+  // both land on `mm_config`; a null config (every non-engine caller) loads the
+  // tower as before. The index is probed EITHER WAY, so "left unread" stays
+  // distinguishable from "this checkpoint carries none".
+  if (HasQwen3_5DenseVisionTower(shards)) {
+    if (SkipTowerForModalities(mm_config, {"image", "video"})) {
+      w.vision_skipped = true;
+    } else {
+      w.visual = LoadQwen3_5DenseVision(shards, config);
+      w.visual_cfg = Qwen3_5DenseVisionConfig(config);
+      w.has_visual = true;
+    }
   }
   // MODEL-QWEN35-EXL3 (#2495 items 3 and 5). ONE whole-checkpoint question, and
   // it is asked of the TENSORS rather than of `quantization_config`: exllamav3

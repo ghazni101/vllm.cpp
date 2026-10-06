@@ -30,6 +30,7 @@
 #include <string>
 #include <vector>
 
+#include "vllm/config/multimodal.h"
 #include "vllm/model_executor/models/qwen3_5.h"  // PagedKvCache, GdnStateCache + v1 attention metadata
 #include <functional>
 
@@ -179,6 +180,10 @@ struct Qwen3_5DenseWeights {
   // builder expresses it (`Qwen3_5DenseVisionConfig`); valid iff `has_visual`.
   multimodal::Qwen3VLVisionConfig visual_cfg;
   bool has_visual = false;
+  // #607 L3, the TOWER SKIP: `model.visual.*` was present and deliberately left
+  // unread because every modality the tower serves was at limit 0. Distinct
+  // from a text-only checkpoint, where this and `has_visual` are both false.
+  bool vision_skipped = false;
 };
 
 // True iff the projection named `name` is a W4A4-quantized Linear in the 27B
@@ -332,23 +337,17 @@ Qwen3_5DenseLayerWeights LoadQwen3_5DenseLayer(
     const std::string& backbone_prefix = std::string(kQwen3_5VlBackbonePrefix));
 
 // Full dense-model load across the given shards. Uses config.num_hidden_layers
-// and config.layer_types. Text path only — the vision tower (model.visual.*)
-// and image/video merger are DEFERRED (notes §0.1). The checkpoint's MTP
-// head is intentionally loaded on demand by LoadQwen3_5MTP when speculative
-// decoding is enabled; it is not part of the always-resident target weights.
-//
-// `mm_config` is the engine's multimodal limits, BORROWED for the load (the
-// same borrow ModelSource::multimodal carries). When every modality the tower
-// serves is at zero (`SkipTowerForModalities`, interfaces.py:293 — the
-// `--language-model-only` case), the tower is NOT read: `has_visual` stays
-// false and the load is byte-identical to a text-only checkpoint. An
-// EXL3-quantized tower is exactly the case that needs this — the 4.00bpw SC
-// checkpoint ships `model.visual.*` in trellis format, which
-// LoadQwen3VLVisionWeights must refuse because it reads BF16.
+// and config.layer_types. A checkpoint that carries `model.visual.*` loads the
+// tower through `LoadQwen3_5DenseVision`; `mm_config` is the engine's modality
+// limits, and when every modality the tower serves is at limit 0 the tower is
+// left unread and `vision_skipped` is set instead. A null `mm_config` (every
+// non-engine caller) loads the tower as before. The checkpoint's MTP head is
+// intentionally loaded on demand by LoadQwen3_5MTP when speculative decoding
+// is enabled; it is not part of the always-resident target weights.
 Qwen3_5DenseWeights LoadQwen3_5Dense(const std::vector<SafetensorsFile>& shards,
-                                      const HfConfig& config,
-                                      vt::Queue* load_queue = nullptr,
-                                      const MultiModalConfig* mm_config = nullptr);
+                                     const HfConfig& config,
+                                     vt::Queue* load_queue = nullptr,
+                                     const MultiModalConfig* mm_config = nullptr);
 
 // Host-lifetime helpers for ordinary dense CUDA models. The release function
 // drops only tensors whose authoritative raw/F32 device representation exists;
@@ -490,6 +489,19 @@ class Qwen3_5DenseModel {
   // ForwardDense but stops after the final GemmaRMSNorm (no lm_head) and
   // returns [T, H] f32 hidden states for the kev PointerHead readout.
   static std::vector<float> ForwardDenseHidden(
+      const std::vector<int32_t>& token_ids,
+      const std::vector<int32_t>& positions,
+      const Qwen3_5DenseWeights& weights,
+      const HfConfig& config,
+      vt::Queue& queue);
+
+  // MODEL-NIMBLE: single-sequence forward that returns the LAST position's
+  // logits only, [vocab] f32. Mirrors HF `model(..., logits_to_keep=1)`, which
+  // is what the Nimble reference scorer calls: the final-norm row T-1 is
+  // gathered on-device (the same GatherRows the paged Forward uses for
+  // logits_indices) and only that row goes through DenseLogitsF32D. ForwardDense
+  // would materialize [T, vocab] f32, about 1 GB at T=1000 on a 248320 vocab.
+  static std::vector<float> ForwardDenseLastLogits(
       const std::vector<int32_t>& token_ids,
       const std::vector<int32_t>& positions,
       const Qwen3_5DenseWeights& weights,

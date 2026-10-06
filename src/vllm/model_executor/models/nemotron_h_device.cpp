@@ -1019,7 +1019,7 @@ DBuf DeviceLmHeadD(Dev d, const NemotronHHostWeights& host,
   // value-based gate: that arm computes the SAME logits, while re-uploading
   // 198.18 MB — the whole [131072, 2688] packed operand plus its group scales —
   // on EVERY call, because `LmHeadNvfp4View` hands out a stack temporary and
-  // `ResidentNvfp4` caches on `w.d_packed`, a member of the weight it was given.
+  // `ResidentNvfp4` caches on `w.packed.d_dev`, a member of the weight it was given.
   //
   // The predicate and not the seam's `fallback_gemms` counter, deliberately.
   // `MutableW4A16Stats()` is a plain non-atomic static shared by every consumer
@@ -1766,7 +1766,19 @@ ForwardLogits NemotronHPagedForward(const NemotronHHostWeights& host,
   {
     Tensor tab = ResidentWeight(d, host.embeddings);
     Tensor rt = residual.t();
-    if (input.device_token_ids != nullptr) {
+    if (input.mm.has_value() && input.mm->inputs_embeds.data != nullptr) {
+      // A multimodal step (`NemotronH_Nano_VL_V2`, nano_nemotron_vl.py:1462-
+      // 1481): the wrapper's `embed_mm` already embedded the ids and spliced
+      // the projected image rows, so the residual STARTS from those rows and
+      // the ids are not looked up again (upstream passes `inputs_embeds` and
+      // the language model skips `embed_input_ids`). It is a COPY: the merged
+      // rows are already in the model dtype.
+      const Tensor& e = input.mm->inputs_embeds;
+      VT_CHECK(e.rank == 2 && e.shape[0] == T && e.shape[1] == H && e.dtype == adt,
+               "NemotronH paged forward: the multimodal inputs_embeds must be "
+               "[num_tokens, hidden] in the model dtype");
+      d.b.Copy(d.q, rt.data, e.data, static_cast<size_t>(T * H) * vt::SizeOf(adt));
+    } else if (input.device_token_ids != nullptr) {
       // ★ ENG-ASYNC-SCHED W4 (#1157). `ModelForwardInput::device_token_ids` is
       // non-null exactly when the async runner's device combine has already
       // spliced each DECODE row's sampled token into ITS device buffer and left
