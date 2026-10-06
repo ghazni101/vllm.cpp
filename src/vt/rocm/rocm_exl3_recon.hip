@@ -69,8 +69,24 @@ inline hipStream_t AsStreamR(const Queue& q) { return static_cast<hipStream_t>(q
 constexpr float kInvSqrt128R = 0.088388347648f;
 // Upstream's slice bound (reconstruct.cu / cuda_exl3.cu:2774): the fp16
 // scratch never holds more than this many reconstructed columns at once.
-constexpr int64_t kReconSliceN = 32768;
-
+// It is a memory/throughput trade-off, not a correctness bound — the decode
+// kernel and the GEMM slice loop honour any positive width — so the 24 GiB
+// gfx1100 serves that cannot hold a full 32768-column scratch beside the KV
+// pool get an escape: VT_EXL3_RECON_SLICE_N overrides the width. Values below
+// one decode tile (16) would leave `n_packed` arithmetic pointing past the
+// slice, and anything over int range is not a slice; both refuse by name.
+int64_t ReconSliceN() {
+  static const int64_t n = [] {
+    const int v = EnvIntStrict("VT_EXL3_RECON_SLICE_N", 32768);
+    VT_CHECK(v >= 16,
+             "vt rocm exl3 recon: VT_EXL3_RECON_SLICE_N=" +
+                 std::to_string(v) +
+                 " is below one 16-column decode tile; the smallest legal "
+                 "slice is 16");
+    return static_cast<int64_t>(v);
+  }();
+  return n;
+}
 // ─── step 2: trellis -> dense fp16 weight ────────────────────────────────────
 //
 // One thread per (row, col) output element. The fragment layout means codeword
@@ -431,7 +447,8 @@ void Exl3ReconstructGemmKernelRocm(Queue& q, Tensor& c, const Tensor& a,
   // QUANT-EXL3 W7: an EMPTY w_scratch selects this stream's persistent buffer,
   // resolved before any launch so a refused growth enqueues nothing.
   half* scratch_w = nullptr;
-  int64_t slice_cols = size_n < kReconSliceN ? size_n : kReconSliceN;
+  const int64_t slice_n = ReconSliceN();
+  int64_t slice_cols = size_n < slice_n ? size_n : slice_n;
   Tensor persistent_scratch;
   const Tensor* scratch = &w_scratch;
   if (w_scratch.data == nullptr) {
@@ -445,11 +462,11 @@ void Exl3ReconstructGemmKernelRocm(Queue& q, Tensor& c, const Tensor& a,
   const int64_t tiles_n_packed = trellis.shape[1];  // n/16
   const int64_t n_packed = tiles_n_packed * 16;
 
-  // exl3.py:192-211. Reconstruct + GEMM, in 32768-column slices when the
-  // weight is wider than the scratch bound.
-  for (int64_t n_start = 0; n_start < size_n; n_start += kReconSliceN) {
+  // exl3.py:192-211. Reconstruct + GEMM, in ReconSliceN()-column slices when
+  // the weight is wider than the scratch bound.
+  for (int64_t n_start = 0; n_start < size_n; n_start += slice_n) {
     const int64_t n_slice =
-        (size_n - n_start) < kReconSliceN ? (size_n - n_start) : kReconSliceN;
+        (size_n - n_start) < slice_n ? (size_n - n_start) : slice_n;
 
     dim3 block(16, 16);
     dim3 grid(static_cast<unsigned>((n_slice + 15) / 16),
