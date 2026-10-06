@@ -396,6 +396,13 @@ served token-exact test are valid instruments for this arm. **Owed:** pin the
 dot arm's accumulation the way the GEMV fold pins its epilogue with `__fmul_rn`,
 so the arm's output is build-stable and its hash becomes usable again.
 
+## Now
+
+Merged with origin/main (137 commits) at 79d056c58 for the upstream
+pull request mudler/vllm.cpp#3400. Merged-head verification on gfx1100
+inside rocm-dev:10.0.0: 10/10 focused ctest suites pass and the served
+greedy probe returns the pinned continuation at ~39 tok/s decode.
+
 ## Owed
 
 - The ~10 ms/token of launch overhead inside the captured graph — the
